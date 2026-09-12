@@ -1,0 +1,147 @@
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --ink: #1f2329;
+  --muted: #6b7280;
+  --accent: #2563eb;
+  --border: #e2e5ea;
+  --caret: #111827;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC",
+               "Noto Sans Arabic", "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  padding: 10px 20px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.topbar h1 {
+  font-size: 17px;
+  margin: 0;
+  white-space: nowrap;
+}
+.topbar .sub { color: var(--muted); font-weight: 400; font-size: 14px; }
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.toolbar button {
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--ink);
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.toolbar button:hover { background: #eef2ff; border-color: #c7d2fe; }
+.toolbar button.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.toolbar button.danger:hover { background: #fef2f2; border-color: #fecaca; color: #b91c1c; }
+.toolbar .sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
+
+main {
+  max-width: 960px;
+  margin: 24px auto;
+  padding: 0 20px 60px;
+}
+
+/* ---------- 编辑器 ---------- */
+#editor {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  min-height: 320px;
+  padding: 20px 24px;
+  font-size: 20px;
+  line-height: 1.9;
+  caret-color: var(--caret);
+  outline: none;
+  /* 折行发生在词/字符边界，长阿拉伯文串也能正确软换行 */
+  overflow-wrap: break-word;
+  word-break: normal;
+  /* 让块级方向由每段自己的 dir 属性决定 */
+  unicode-bidi: normal;
+}
+
+#editor:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,.12); }
+
+#editor:empty::before {
+  content: attr(data-placeholder);
+  color: #9ca3af;
+  pointer-events: none;
+}
+
+/* 每个段落是一个块；dir 属性决定该段基准方向 */
+#editor > .para {
+  margin: 0 0 .4em;
+  min-height: 1.9em;         /* 空段落也可点击落光标 */
+  text-align: start;         /* 跟随段落方向对齐 */
+}
+
+/* RTL 段落视觉提示：左侧淡色条 */
+#editor > .para[dir="rtl"] { border-inline-start: 3px solid #fde68a; padding-inline-start: 10px; }
+#editor > .para[dir="ltr"] { border-inline-start: 3px solid #bfdbfe; padding-inline-start: 10px; }
+#editor > .para[dir="auto"] { border-inline-start: 3px solid #e5e7eb; padding-inline-start: 10px; }
+
+/* ---------- 状态栏 ---------- */
+.statusbar {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  font-size: 12.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 说明区 ---------- */
+.help {
+  margin-top: 28px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 22px;
+  font-size: 14px;
+  color: #374151;
+}
+.help h2 { font-size: 15px; margin: 0 0 8px; }
+.help ul { margin: 0; padding-inline-start: 1.2em; line-height: 1.9; }
+.help .kbd-hint { margin: 10px 0 0; color: var(--muted); }
+kbd {
+  background: #f3f4f6;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 12px;
+  font-family: inherit;
+}
+
+@media (max-width: 640px) {
+  #editor { font-size: 17px; padding: 14px 16px; }
+}

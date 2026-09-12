@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>双向文本编辑器 · Bidi Editor</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>双向文本编辑器 <span class="sub">中文 ⇄ العربية</span></h1>
+  <div class="toolbar" role="toolbar" aria-label="段落方向">
+    <button data-dir="auto" title="按每段首个强方向字符自动判定（快捷键 Ctrl/Cmd+Shift+A）">⇄ 自动方向</button>
+    <button data-dir="ltr"  title="强制本段从左到右（Ctrl/Cmd+Shift+L）">→ 从左到右</button>
+    <button data-dir="rtl"  title="强制本段从右到左（Ctrl/Cmd+Shift+R）">← 从右到左</button>
+    <span class="sep"></span>
+    <button id="insert-zh" title="在光标处插入中文示例">插入中文</button>
+    <button id="insert-ar" title="在光标处插入阿拉伯文示例">إدراج نص عربي</button>
+    <span class="sep"></span>
+    <button id="clear" class="danger" title="清空全部内容">清空</button>
+  </div>
+</header>
+
+<main>
+  <!--
+    编辑器本体：contenteditable。
+    关键：每个段落块带 dir 属性（auto/ltr/rtl），
+    浏览器据此对每段执行 Unicode Bidirectional Algorithm (UAX #9)，
+    并原生提供：
+      1) 左右方向键按“视觉阅读顺序”移动光标；
+      2) 选区即屏幕上圈住的范围，删除恰好删掉这些字符；
+      3) 输入插入在光标的视觉位置；
+      4) 折行/缩放后光标仍附着在同一字符旁。
+  -->
+  <div id="editor" contenteditable="true" spellcheck="false"
+       aria-label="双向文本编辑区" data-placeholder="在此输入……中文与 العربية 可同段混排"></div>
+
+  <aside class="statusbar">
+    <span id="st-block">段落: —</span>
+    <span id="st-dir">基准方向: —</span>
+    <span id="st-pos">逻辑偏移: —</span>
+    <span id="st-sel">选区: 0 字符</span>
+  </aside>
+
+  <section class="help">
+    <h2>行为说明（均由浏览器原生双向引擎保证）</h2>
+    <ul>
+      <li><b>←/→ 移动光标</b>：严格按屏幕上的阅读顺序逐字移动，在中阿交界处不会“跳回”。</li>
+      <li><b>Shift+←/→ 或鼠标拖选后按 Delete/Backspace</b>：删除的恰好是屏幕上圈住的字符，不多删反向文字。</li>
+      <li><b>直接输入</b>：新字符出现在光标当前的视觉位置。</li>
+      <li><b>拖窄窗口触发折行</b>：光标仍停留在同一个字符旁边（浏览器维护视觉-逻辑映射）。</li>
+    </ul>
+    <p class="kbd-hint">快捷键：<kbd>Ctrl/⌘+Shift+A</kbd> 自动方向 · <kbd>Ctrl/⌘+Shift+L</kbd> 左到右 · <kbd>Ctrl/⌘+Shift+R</kbd> 右到左</p>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

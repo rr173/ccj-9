@@ -1,0 +1,7 @@
+# docker-compose 只是便利项，根 Dockerfile 单独即可完整运行
+services:
+  bidi-editor:
+    build: .
+    ports:
+      - "8080:80"
+    restart: unless-stopped
