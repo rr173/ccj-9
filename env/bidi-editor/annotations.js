@@ -26,8 +26,54 @@
     items: [],                 // 批注记录
     anchors: Object.create(null), // id -> reanchor 结果
     filterPara: "",            // 段落筛选（"" = 全部）
-    filterStatus: ""           // 状态筛选（"" = 全部）
+    filterStatus: "",          // 状态筛选（"" = 全部）
+    filterBatch: "",           // 批次筛选（"__none" = 无批次；id = 某批次；"" = 全部）
+    batches: [],               // 批次摘要（由 batches.js 通过事件同步）
+    batchById: Object.create(null)
   };
+
+  /* ---------- 批次集成（由 batches.js 在加载/变更后广播） ---------- */
+
+  var BATCH_EVENT = "review-batches-changed";
+
+  function ingestBatches(data) {
+    state.batches = (data && data.batches) || [];
+    state.batchById = Object.create(null);
+    state.batches.forEach(function (b) { state.batchById[b.id] = b; });
+    rebuildBatchFilter();
+    renderList();
+  }
+
+  function batchOf(ann) {
+    // 活数据：批注冗余 batchId 与批次成员表一致（服务端对账）
+    if (ann.batchId && state.batchById[ann.batchId]) return state.batchById[ann.batchId];
+    return null;
+  }
+
+  // 四态工作流的中文标签与样式类
+  var STATUS_LABELS = {
+    open: "待处理",
+    in_progress: "处理中",
+    needs_review: "需复核",
+    resolved: "已解决"
+  };
+  function statusLabel(s) { return STATUS_LABELS[s] || s; }
+  function statusClass(s) {
+    return ({
+      open: "st-open", in_progress: "st-progress",
+      needs_review: "st-review", resolved: "st-resolved"
+    })[s] || "st-open";
+  }
+
+  function batchBadge(batch) {
+    var span = el("span", "ann-batch" + (batch.status === "archived" ? " is-archived" : ""));
+    span.title = batch.status === "archived"
+      ? "属于已归档批次（状态冻结，仅可查看历史）"
+      : "属于审阅批次";
+    span.appendChild(document.createTextNode(batch.status === "archived" ? "📦 " : "🏷 "));
+    span.appendChild(bdi(batch.name));
+    return span;
+  }
 
   /* ---------- 小工具 ---------- */
 
@@ -145,6 +191,8 @@
     }
     return fetch(url, init).then(function (res) {
       var rev = res.headers.get("X-Annotation-Rev");
+      var batchRev = res.headers.get("X-Batch-Rev");
+      if (batchRev != null) noticeBatchRev(parseInt(batchRev, 10));
       return res.text().then(function (text) {
         var data = null;
         try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
@@ -179,15 +227,22 @@
         typeof Highlight === "undefined") return;
     var openH = new Highlight();
     var doneH = new Highlight();
+    var progressH = new Highlight();
+    var reviewH = new Highlight();
     state.items.forEach(function (ann) {
       var a = state.anchors[ann.id];
       if (!a || !a.ok) return;
       var range = Editor.rangeFor(a.paraIndex, a.start, a.end);
       if (!range) return;
-      (ann.status === "resolved" ? doneH : openH).add(range);
+      if (ann.status === "resolved") doneH.add(range);
+      else if (ann.status === "in_progress") progressH.add(range);
+      else if (ann.status === "needs_review") reviewH.add(range);
+      else openH.add(range);
     });
     CSS.highlights.set("review-open", openH);
     CSS.highlights.set("review-resolved", doneH);
+    CSS.highlights.set("review-progress", progressH);
+    CSS.highlights.set("review-needs-review", reviewH);
   }
 
   var reanchorTimer = null;
@@ -208,6 +263,15 @@
   var revLabel = $("review-rev");
   var filterParaSel = $("review-filter-para");
   var filterStatusSel = $("review-filter-status");
+  var filterBatchSel = $("review-filter-batch");
+
+  // 批次集合可能被批次面板或其他页面改动：X-Batch-Rev 变化时通知批次模块刷新
+  function noticeBatchRev(rev) {
+    if (rev == null) return;
+    document.dispatchEvent(new CustomEvent("review-batch-rev", {
+      detail: { rev: rev }
+    }));
+  }
 
   function setNote(text, isError) {
     note.textContent = text || "";
@@ -230,7 +294,30 @@
   function renderAll() {
     revLabel.textContent = "版本 " + (state.rev == null ? "—" : state.rev);
     rebuildParaFilter();
+    rebuildBatchFilter();
     renderList();
+  }
+
+  function rebuildBatchFilter() {
+    if (!filterBatchSel) return;
+    var prev = state.filterBatch;
+    filterBatchSel.innerHTML = "";
+    filterBatchSel.appendChild((function () {
+      var o = el("option", null, "全部批注"); o.value = ""; return o;
+    })());
+    var noneOpt = el("option", null, "未加入批次");
+    noneOpt.value = "__none";
+    filterBatchSel.appendChild(noneOpt);
+    state.batches.forEach(function (b) {
+      var o = el("option", null,
+        (b.status === "archived" ? "📦 " : "🏷 ") + b.name +
+        "（" + b.memberCount + "）");
+      o.value = b.id;
+      filterBatchSel.appendChild(o);
+    });
+    var valid = prev === "" || prev === "__none" || state.batchById[prev];
+    filterBatchSel.value = valid ? prev : "";
+    state.filterBatch = filterBatchSel.value;
   }
 
   function rebuildParaFilter() {
@@ -264,6 +351,11 @@
       if (state.filterStatus && ann.status !== state.filterStatus) return false;
       if (state.filterPara !== "" &&
           displayParaIndex(ann) !== Number(state.filterPara)) return false;
+      if (state.filterBatch === "__none") {
+        if (ann.batchId) return false;
+      } else if (state.filterBatch) {
+        if (ann.batchId !== state.filterBatch) return false;
+      }
       return true;
     });
     if (!items.length) {
@@ -298,9 +390,13 @@
     head.appendChild(document.createTextNode(" "));
     head.appendChild(dirBadge(ann.paraDir));
     head.appendChild(document.createTextNode(" "));
-    head.appendChild(el("span",
-      "ann-status " + (ann.status === "resolved" ? "st-resolved" : "st-open"),
-      ann.status === "resolved" ? "已解决" : "未解决"));
+    head.appendChild(el("span", "ann-status " + statusClass(ann.status),
+      statusLabel(ann.status)));
+    var bInfo = batchOf(ann);
+    if (bInfo) {
+      head.appendChild(document.createTextNode(" "));
+      head.appendChild(batchBadge(bInfo));
+    }
     row.appendChild(head);
 
     var quote = el("div", "ann-quote");
@@ -334,6 +430,15 @@
   filterStatusSel.addEventListener("change", function () {
     state.filterStatus = filterStatusSel.value;
     renderList();
+  });
+  filterBatchSel.addEventListener("change", function () {
+    state.filterBatch = filterBatchSel.value;
+    renderList();
+  });
+
+  // batches.js 加载/变更后把最新批次集合广播过来
+  document.addEventListener(BATCH_EVENT, function (e) {
+    ingestBatches(e.detail);
   });
 
   /* ---------- 新建批注 ---------- */
@@ -444,6 +549,11 @@
       msg = "版本冲突：批注集合已被其他页面更新，本次" + action +
         "已取消，没有覆盖任何新内容。列表已刷新，请重试。";
       loadList(true);
+    } else if (err.status === 409 && (err.code === "annotation_frozen" ||
+                                      err.code === "annotation_in_batch" ||
+                                      err.code === "batch_archived")) {
+      msg = action + "被拒绝：" + err.message;
+      loadList(true);
     } else if (err.status === 428) {
       msg = "缺少版本号，请刷新列表后重试。";
       loadList(true);
@@ -477,9 +587,13 @@
     head.appendChild(document.createTextNode(" "));
     head.appendChild(dirBadge(ann.paraDir));
     head.appendChild(document.createTextNode(" "));
-    head.appendChild(el("span",
-      "ann-status " + (ann.status === "resolved" ? "st-resolved" : "st-open"),
-      ann.status === "resolved" ? "已解决" : "未解决"));
+    head.appendChild(el("span", "ann-status " + statusClass(ann.status),
+      statusLabel(ann.status)));
+    var detailBatch = batchOf(ann);
+    if (detailBatch) {
+      head.appendChild(document.createTextNode(" "));
+      head.appendChild(batchBadge(detailBatch));
+    }
     box.appendChild(head);
 
     if (!anchored) {
@@ -506,6 +620,12 @@
       meta.appendChild(document.createTextNode(" · 由 "));
       meta.appendChild(bdi(ann.resolvedBy || "匿名"));
       meta.appendChild(document.createTextNode(" 解决于 " + formatTime(ann.resolvedAt)));
+    }
+    var db2 = batchOf(ann);
+    if (db2) {
+      meta.appendChild(document.createTextNode(" · 所属批次："));
+      meta.appendChild(bdi(db2.name));
+      if (db2.status === "archived") meta.appendChild(document.createTextNode("（已归档，状态冻结）"));
     }
     box.appendChild(meta);
 
@@ -585,26 +705,41 @@
     });
     if (!anchored) locateBtn.disabled = true;
 
-    var toggleBtn = button(
-      ann.status === "resolved" ? "重新打开" : "标记已解决",
-      ann.status === "resolved" ? null : "primary",
-      function () {
-        errLine.textContent = "";
-        toggleBtn.disabled = true;
-        var next = ann.status === "resolved" ? "open" : "resolved";
-        api("PUT", "/api/annotations/" + ann.id, {
-          body: { status: next, resolvedBy: authorInput.value || undefined },
-          ifMatch: state.rev
-        }).then(function () {
-          close();
-          toast(next === "resolved" ? "批注已标记为已解决" : "批注已重新打开");
-          return loadList(true);
-        }).catch(function (err) {
-          toggleBtn.disabled = false;
-          handleMutationError(err, showError,
-            next === "resolved" ? "标记已解决" : "重新打开");
-        });
+    // —— 工作流状态：待处理 / 处理中 / 需复核 / 已解决（属于已归档批次则冻结）——
+    var statusBox = el("div", "ann-status-box");
+    var frozen = !!(detailBatch && detailBatch.status === "archived");
+    var statusLabelNode = el("span", "muted",
+      frozen ? "该批注属于已归档批次，状态已冻结：" : "设置批注状态：");
+    statusBox.appendChild(statusLabelNode);
+    var statusSel = document.createElement("select");
+    core.ANN_STATUSES.forEach(function (s) {
+      var o = el("option", null, statusLabel(s));
+      o.value = s;
+      if (s === ann.status) o.selected = true;
+      statusSel.appendChild(o);
+    });
+    if (frozen) statusSel.disabled = true;
+    statusBox.appendChild(statusSel);
+    var setStatusBtn = button("更新状态", "primary", function () {
+      errLine.textContent = "";
+      var next = statusSel.value;
+      if (next === ann.status) { showError("该批注已经是“" + statusLabel(next) + "”状态。"); return; }
+      setStatusBtn.disabled = true;
+      api("PUT", "/api/annotations/" + ann.id, {
+        body: { status: next, actor: authorInput.value || undefined },
+        ifMatch: state.rev
+      }).then(function () {
+        close();
+        toast("批注已标记为“" + statusLabel(next) + "”");
+        return loadList(true);
+      }).catch(function (err) {
+        setStatusBtn.disabled = false;
+        handleMutationError(err, showError, "更新批注状态");
       });
+    });
+    if (frozen) setStatusBtn.disabled = true;
+    statusBox.appendChild(setStatusBtn);
+    box.appendChild(statusBox);
 
     var deleteBtn = button("删除", "danger", function () {
       errLine.textContent = "";
@@ -621,10 +756,16 @@
           handleMutationError(err, showError, "删除批注");
         });
     });
+    if (detailBatch) {
+      deleteBtn.disabled = true;
+      deleteBtn.title = detailBatch.status === "archived"
+        ? "已归档批次的批注不能删除"
+        : "请先在批次详情中把该批注移出批次";
+    }
 
     var closeBtn = button("关闭", null, function () { close(); });
     var close = openModal("批注详情", box,
-      { buttons: [locateBtn, deleteBtn, toggleBtn, closeBtn] });
+      { buttons: [locateBtn, deleteBtn, closeBtn] });
   }
 
   /* ---------- 快照批注：查看历史状态 + 恢复到当前 ---------- */
@@ -667,9 +808,15 @@
         h.appendChild(document.createTextNode(" "));
         h.appendChild(dirBadge(ann.paraDir));
         h.appendChild(document.createTextNode(" "));
-        h.appendChild(el("span",
-          "ann-status " + (ann.status === "resolved" ? "st-resolved" : "st-open"),
-          ann.status === "resolved" ? "已解决" : "未解决"));
+        h.appendChild(el("span", "ann-status " + statusClass(ann.status),
+          statusLabel(ann.status)));
+        // 快照时刻所属批次及当时状态（batchInfo 由新快照写入；旧快照仅有冗余名）
+        var bi = ann.batchInfo || (ann.batchName
+          ? { id: ann.batchId, name: ann.batchName, status: "pending" } : null);
+        if (bi) {
+          h.appendChild(document.createTextNode(" "));
+          h.appendChild(batchBadge(bi));
+        }
         item.appendChild(h);
         var q = el("div", "ann-quote");
         q.appendChild(bdi(ann.quote));
@@ -696,7 +843,7 @@
       var restoreBtn = button("恢复这些批注到当前文档", "primary", function () {
         errLine.textContent = "";
         var msg = "将用快照中的 " + anns.length +
-          " 条批注整体替换当前批注集合（含解决状态与回复）。当前未保存进该快照的批注会被移除。确定继续吗？";
+          " 条批注整体替换当前批注集合（含工作流状态、回复与当时的批次标记）。当前未保存进该快照的批注会被移除；未归档批次中已不存在的成员会被自动移出，已归档批次成员缺失时恢复将被拒绝。确定继续吗？";
         if (!window.confirm(msg)) return;
         restoreBtn.disabled = true;
         api("PUT", "/api/annotations",
@@ -741,7 +888,13 @@
 
   window.ReviewUI = {
     openSnapshotAnnotations: openSnapshotAnnotations,
-    reload: loadList
+    openDetail: openDetail,
+    reload: loadList,
+    getItems: function () { return state.items; },
+    // 供批次模块复用
+    statusLabel: statusLabel,
+    statusClass: statusClass,
+    batchEvent: BATCH_EVENT
   };
 
   /* ---------- 启动 ---------- */

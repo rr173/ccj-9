@@ -26,11 +26,23 @@
     QUOTE_MAX_CHARS: 5000,      // 引文（被批注原文）上限（码点）
     ANNOTATION_MAX_COUNT: 500,  // 批注总数上限
     REPLY_MAX_COUNT: 100,       // 单条批注的回复数上限
-    ID_MAX_CHARS: 64            // 记录 id 长度上限
+    ID_MAX_CHARS: 64,           // 记录 id 长度上限
+    BATCH_NAME_MAX_CHARS: 100,  // 批次名称上限（码点）
+    BATCH_DESC_MAX_CHARS: 2000, // 批次说明上限（码点）
+    BATCH_MAX_COUNT: 100,       // 批次总数上限（含已归档）
+    BATCH_LOG_MAX: 5000         // 审阅记录保留条数上限
   };
 
   var DIRS = { auto: true, ltr: true, rtl: true };
-  var STATUS = { open: true, resolved: true };
+
+  // 审阅批次内批注的四态工作流：
+  //   open 待处理（沿用历史值）/ in_progress 处理中 /
+  //   needs_review 需复核 / resolved 已解决
+  var ANN_STATUSES = ["open", "in_progress", "needs_review", "resolved"];
+  var ANN_STATUS_SET = {
+    open: true, in_progress: true, needs_review: true, resolved: true
+  };
+  var BATCH_STATUSES = ["pending", "archived"];
 
   function nowISO() { return new Date().toISOString(); }
 
@@ -187,7 +199,7 @@
     if (!base.ok) {
       return err(base.status, base.code, where + "：" + base.message);
     }
-    var status = STATUS.hasOwnProperty(rec.status) ? rec.status : "open";
+    var status = ANN_STATUS_SET[rec.status] ? rec.status : "open";
 
     var replies = [];
     if (rec.replies != null) {
@@ -226,6 +238,20 @@
       resolvedBy = rb.value;
     }
 
+    // 快照恢复时可携带批次冗余信息（仅用于展示），结构非法则丢弃
+    var batchInfo = null;
+    if (rec.batchInfo && typeof rec.batchInfo === "object" &&
+        typeof rec.batchInfo.id === "string" && validId(rec.batchInfo.id) &&
+        typeof rec.batchInfo.name === "string") {
+      batchInfo = {
+        id: rec.batchInfo.id,
+        name: cpLen(rec.batchInfo.name) > LIMITS.BATCH_NAME_MAX_CHARS
+          ? Array.from(rec.batchInfo.name).slice(0, LIMITS.BATCH_NAME_MAX_CHARS).join("")
+          : rec.batchInfo.name,
+        status: rec.batchInfo.status === "archived" ? "archived" : "pending"
+      };
+    }
+
     return {
       ok: true,
       value: {
@@ -242,6 +268,9 @@
         updatedAt: validISO(rec.updatedAt) ? rec.updatedAt : null,
         resolvedAt: status === "resolved" && validISO(rec.resolvedAt) ? rec.resolvedAt : null,
         resolvedBy: resolvedBy,
+        batchId: null,       // 恢复不会重建活批次归属（服务端按冻结成员另行处理）
+        batchName: null,
+        batchInfo: batchInfo,
         replies: replies
       }
     };
@@ -318,11 +347,170 @@
     return { ok: false, reason: "quote_not_found" };
   }
 
-  /* ---------- 快照嵌入 ----------
-   * 保存快照时把当前批注集合（含解决状态与回复）整体拷贝进去，
-   * 之后查看该历史快照即可看到当时存在的批注及其状态。
+  /* ---------- 审阅批次 ----------
+   * 批次：把当前文档的一组批注命名为一个审阅批次，设负责人、截止时间与说明。
+   * 同一条批注不能同时属于两个“未归档”批次；批次归档后其中批注状态冻结。
    */
-  function snapshotDigest(annotations) {
+
+  var STATUS_LABELS = {
+    open: "待处理",
+    in_progress: "处理中",
+    needs_review: "需复核",
+    resolved: "已解决"
+  };
+
+  function annStatusLabel(status) { return STATUS_LABELS[status] || status; }
+
+  // 合法批注工作流状态（四态）
+  function validAnnStatus(v) {
+    return typeof v === "string" && ANN_STATUS_SET.hasOwnProperty(v);
+  }
+
+  // 截止时间：null/缺省表示不设截止；否则必须是可解析且晚于 now 的 ISO 时间。
+  // 返回 {ok:true,value:null|iso} 或 {ok:false,status,code,message}。
+  function validateDeadline(v, nowMs) {
+    if (v == null || v === "") return { ok: true, value: null };
+    if (typeof v !== "string" || v.length > 64 || isNaN(Date.parse(v))) {
+      return err(400, "invalid_deadline", "截止时间必须是合法的日期时间");
+    }
+    var t = Date.parse(v);
+    var now = nowMs == null ? Date.now() : nowMs;
+    if (t <= now) {
+      return err(400, "deadline_in_past",
+        "截止时间必须晚于当前时间，请选择一个将来的时间");
+    }
+    return { ok: true, value: new Date(t).toISOString() };
+  }
+
+  // 批注 id 列表：必须是非空数组，元素为合法 id 字符串；自动去重并保序。
+  // 返回 {ok:true,value:[ids],duplicates:n} 或错误。
+  function validateAnnotationIds(v) {
+    if (!Array.isArray(v)) {
+      return err(400, "invalid_annotation_ids", "请选择至少一条批注加入批次");
+    }
+    if (!v.length) {
+      return err(400, "empty_batch", "审阅批次不能为空：请至少选择一条批注");
+    }
+    var seen = Object.create(null);
+    var out = [];
+    for (var i = 0; i < v.length; i++) {
+      var id = v[i];
+      if (typeof id !== "string" || !id || id.length > LIMITS.ID_MAX_CHARS) {
+        return err(400, "invalid_annotation_id",
+          "第 " + (i + 1) + " 条批注的标识非法");
+      }
+      if (!seen[id]) { seen[id] = true; out.push(id); }
+    }
+    return { ok: true, value: out };
+  }
+
+  // 新建/更新批次载荷：
+  //   {name, owner?, deadline?(ISO 或 ""), description?, annotationIds?(新建必填)}
+  // partial=true（更新负责人/截止/说明）时不要求名称与成员。
+  function validateBatchPayload(payload, partial, nowMs) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      return err(400, "invalid_body", "请求内容必须是批次对象");
+    }
+    var out = {};
+
+    if (!partial || payload.name !== undefined) {
+      if (typeof payload.name !== "string") {
+        return err(400, "invalid_name", "批次名称必须是文本");
+      }
+      var name = payload.name.trim();
+      if (!name) return err(400, "empty_name", "批次名称不能为空");
+      if (cpLen(name) > LIMITS.BATCH_NAME_MAX_CHARS) {
+        return err(413, "name_too_long",
+          "批次名称不能超过 " + LIMITS.BATCH_NAME_MAX_CHARS + " 个字符");
+      }
+      out.name = name;
+    }
+
+    if (!partial || payload.owner !== undefined) {
+      var owner = validateAuthor(payload.owner);
+      if (!owner.ok) return err(owner.status, owner.code, owner.message);
+      out.owner = owner.value;
+    }
+
+    if (!partial || payload.deadline !== undefined) {
+      var deadline = validateDeadline(payload.deadline, nowMs);
+      if (!deadline.ok) return deadline;
+      out.deadline = deadline.value;
+    }
+
+    if (!partial || payload.description !== undefined) {
+      if (payload.description == null) {
+        out.description = "";
+      } else if (typeof payload.description !== "string") {
+        return err(400, "invalid_description", "批次说明必须是文本");
+      } else {
+        var desc = payload.description.trim();
+        if (cpLen(desc) > LIMITS.BATCH_DESC_MAX_CHARS) {
+          return err(413, "description_too_long",
+            "批次说明不能超过 " + LIMITS.BATCH_DESC_MAX_CHARS + " 个字符");
+        }
+        out.description = desc;
+      }
+    }
+
+    if (!partial) {
+      var ids = validateAnnotationIds(payload.annotationIds);
+      if (!ids.ok) return ids;
+      out.annotationIds = ids.value;
+    }
+    return { ok: true, value: out };
+  }
+
+  // 批次进度：根据成员批注的实时状态实时计算（不缓存）。
+  // annotations: 以成员 id 为键的批注记录映射（值需带 status）。
+  // 返回 {total, counts:{open,in_progress,needs_review,resolved},
+  //       resolved, done, progress(0-100 整数)}。
+  function batchProgress(batch, annotationMap) {
+    var counts = { open: 0, in_progress: 0, needs_review: 0, resolved: 0 };
+    var ids = Array.isArray(batch.memberIds) ? batch.memberIds : [];
+    var live = 0;
+    ids.forEach(function (id) {
+      var a = annotationMap && annotationMap[id];
+      if (!a) return; // 成员已不存在（理论上不发生，防御性跳过）
+      live++;
+      var s = ANN_STATUS_SET[a.status] ? a.status : "open";
+      counts[s]++;
+    });
+    var total = live;
+    var resolved = counts.resolved;
+    var progress = total ? Math.round((resolved / total) * 100) : 0;
+    return {
+      total: total,
+      counts: counts,
+      resolved: resolved,
+      done: resolved === total && total > 0,
+      progress: progress
+    };
+  }
+
+  // 批次是否已过截止时间（未归档且设了 deadline）
+  function batchOverdue(batch, nowMs) {
+    if (!batch || batch.status !== "pending" || !batch.deadline) return false;
+    var now = nowMs == null ? Date.now() : nowMs;
+    return Date.parse(batch.deadline) <= now;
+  }
+
+  /* ---------- 快照嵌入 ----------
+   * 保存快照时把当前批注集合（含工作流状态与回复）整体拷贝进去，
+   * 之后查看该历史快照即可看到当时存在的批注及其状态。
+   *
+   * batchLookup（可选）: Map/普通对象 id -> {id,name,status}，
+   * 用于在每条批注上冗余“快照时刻所属批次”，使快照查看与恢复都能显示
+   * 所属批次及当时状态；缺省字段为 null，兼容旧数据。
+   */
+  function snapshotDigest(annotations, batchLookup) {
+    function batchInfoOf(a) {
+      if (!batchLookup || !a.batchId) return null;
+      var b = batchLookup instanceof Map ? batchLookup.get(a.batchId)
+        : batchLookup[a.batchId];
+      if (!b) return null;
+      return { id: b.id, name: b.name, status: b.status === "archived" ? "archived" : "pending" };
+    }
     return (annotations || []).map(function (a) {
       return {
         id: a.id,
@@ -338,6 +526,9 @@
         updatedAt: a.updatedAt,
         resolvedAt: a.resolvedAt || null,
         resolvedBy: a.resolvedBy || null,
+        batchId: a.batchId || null,
+        batchName: a.batchName || null,
+        batchInfo: batchInfoOf(a),
         replies: (a.replies || []).map(function (r) {
           return { id: r.id, author: r.author, body: r.body, createdAt: r.createdAt };
         })
@@ -355,6 +546,15 @@
     validateAnchor: validateAnchor,
     normalizeAnnotationRecord: normalizeAnnotationRecord,
     reanchor: reanchor,
-    snapshotDigest: snapshotDigest
+    snapshotDigest: snapshotDigest,
+    // —— 审阅批次 ——
+    ANN_STATUSES: ANN_STATUSES,
+    validAnnStatus: validAnnStatus,
+    annStatusLabel: annStatusLabel,
+    validateDeadline: validateDeadline,
+    validateAnnotationIds: validateAnnotationIds,
+    validateBatchPayload: validateBatchPayload,
+    batchProgress: batchProgress,
+    batchOverdue: batchOverdue
   };
 });

@@ -245,3 +245,138 @@ test("snapshotDigest 深拷贝批注集合（含状态与回复）", function ()
   assert.notEqual(digest[0].body, "被改");
   assert.notEqual(digest[0].replies[0].body, "被改");
 });
+
+/* ---------- 审阅批次纯逻辑 ---------- */
+
+test("四态状态合法集", function () {
+  for (const s of ["open", "in_progress", "needs_review", "resolved"]) {
+    assert.equal(core.validAnnStatus(s), true);
+  }
+  assert.equal(core.validAnnStatus("weird"), false);
+  assert.equal(core.annStatusLabel("needs_review"), "需复核");
+});
+
+test("批次名称为空 / 超长必须拒绝", function () {
+  const base = { name: "第一批", annotationIds: ["a1"] };
+  assert.equal(core.validateBatchPayload({ name: "  ", annotationIds: ["a1"] }, false).code,
+    "empty_name");
+  const long = core.validateBatchPayload(
+    { name: "名".repeat(core.LIMITS.BATCH_NAME_MAX_CHARS + 1), annotationIds: ["a1"] },
+    false);
+  assert.equal(long.status, 413);
+  assert.equal(long.code, "name_too_long");
+});
+
+test("截止时间：空值允许，非法与过去时间拒绝，将来时间归一化为 ISO", function () {
+  assert.equal(core.validateDeadline(null).value, null);
+  assert.equal(core.validateDeadline("").value, null);
+  assert.equal(core.validateDeadline("not-a-date").code, "invalid_deadline");
+  const now = Date.parse("2026-09-12T12:00:00.000Z");
+  assert.equal(
+    core.validateDeadline("2026-09-12T11:59:59Z", now).code, "deadline_in_past");
+  const ok = core.validateDeadline("2026-09-12T12:00:01Z", now);
+  assert.equal(ok.ok, true);
+  assert.equal(ok.value, "2026-09-12T12:00:01.000Z");
+});
+
+test("成员 id 列表：空批次拒绝、非法 id 拒绝、自动去重保序", function () {
+  assert.equal(core.validateAnnotationIds([]).code, "empty_batch");
+  assert.equal(core.validateAnnotationIds([""]).code, "invalid_annotation_id");
+  const ok = core.validateAnnotationIds(["a", "b", "a", "c", "b"]);
+  assert.equal(ok.ok, true);
+  assert.deepEqual(ok.value, ["a", "b", "c"]);
+});
+
+test("新建批次载荷：负责人默认匿名、说明默认空串、成员必填", function () {
+  const r = core.validateBatchPayload({
+    name: " 第一批 ",
+    annotationIds: ["x", "y"]
+  }, false);
+  assert.equal(r.ok, true);
+  assert.equal(r.value.name, "第一批");
+  assert.equal(r.value.owner, "匿名");
+  assert.equal(r.value.description, "");
+  assert.equal(r.value.deadline, null);
+  assert.deepEqual(r.value.annotationIds, ["x", "y"]);
+
+  // 非 partial 缺成员 / 空成员 → 拒绝
+  assert.equal(core.validateBatchPayload({ name: "无成员" }, false).code,
+    "invalid_annotation_ids");
+  assert.equal(
+    core.validateBatchPayload({ name: "空成员", annotationIds: [] }, false).code,
+    "empty_batch");
+  // partial（更新信息）不要求成员
+  const p = core.validateBatchPayload({ owner: "新负责人" }, true);
+  assert.equal(p.ok, true);
+  assert.equal(p.value.owner, "新负责人");
+  assert.equal(p.value.annotationIds, undefined);
+});
+
+test("批次进度按成员批注实时状态计算", function () {
+  const batch = { memberIds: ["a", "b", "c", "d"] };
+  const map = {
+    a: { status: "resolved" },
+    b: { status: "resolved" },
+    c: { status: "in_progress" },
+    d: { status: "needs_review" }
+  };
+  const p = core.batchProgress(batch, map);
+  assert.equal(p.total, 4);
+  assert.deepEqual(p.counts,
+    { open: 0, in_progress: 1, needs_review: 1, resolved: 2 });
+  assert.equal(p.resolved, 2);
+  assert.equal(p.progress, 50);
+  assert.equal(p.done, false);
+
+  const allDone = core.batchProgress(
+    { memberIds: ["a", "b"] }, { a: { status: "resolved" }, b: { status: "resolved" } });
+  assert.equal(allDone.progress, 100);
+  assert.equal(allDone.done, true);
+
+  // 空/缺成员防御
+  assert.equal(core.batchProgress({ memberIds: [] }, {}).progress, 0);
+  const missing = core.batchProgress({ memberIds: ["gone"] }, {});
+  assert.equal(missing.total, 0);
+});
+
+test("batchOverdue 只对未归档且过截止的批次成立", function () {
+  const now = Date.parse("2026-09-12T12:00:00Z");
+  assert.equal(core.batchOverdue({ status: "pending", deadline: null }, now), false);
+  assert.equal(core.batchOverdue(
+    { status: "pending", deadline: "2026-09-12T11:00:00Z" }, now), true);
+  assert.equal(core.batchOverdue(
+    { status: "archived", deadline: "2026-09-12T11:00:00Z" }, now), false);
+  assert.equal(core.batchOverdue(
+    { status: "pending", deadline: "2026-09-13T00:00:00Z" }, now), false);
+});
+
+test("snapshotDigest 携带所属批次冗余信息（batchInfo）", function () {
+  const anns = [Object.assign(ann(), {
+    id: "a1", status: "in_progress", batchId: "b1", batchName: "第一批"
+  })];
+  const lookup = new Map([["b1", { id: "b1", name: "第一批", status: "pending" }]]);
+  const d1 = core.snapshotDigest(anns, lookup);
+  assert.deepEqual(d1[0].batchInfo,
+    { id: "b1", name: "第一批", status: "pending" });
+  assert.equal(d1[0].batchId, "b1");
+
+  // 普通对象查找也支持
+  const d2 = core.snapshotDigest(anns, { b1: { id: "b1", name: "第一批", status: "archived" } });
+  assert.equal(d2[0].batchInfo.status, "archived");
+
+  // 无 lookup 时 batchInfo 为 null，兼容旧调用
+  const d3 = core.snapshotDigest(anns);
+  assert.equal(d3[0].batchInfo, null);
+});
+
+test("normalizeAnnotationRecord 接受四态并保留快照批次冗余；非法状态降级 open", function () {
+  const r = core.normalizeAnnotationRecord(
+    ann({ status: "needs_review", batchInfo: { id: "b1", name: "第一批", status: "pending" } }), 0);
+  assert.equal(r.ok, true);
+  assert.equal(r.value.status, "needs_review");
+  assert.deepEqual(r.value.batchInfo, { id: "b1", name: "第一批", status: "pending" });
+  assert.equal(r.value.batchId, null, "恢复不重建活批次归属");
+
+  const downgrade = core.normalizeAnnotationRecord(ann({ status: "bogus" }), 0);
+  assert.equal(downgrade.value.status, "open");
+});

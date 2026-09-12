@@ -54,13 +54,34 @@
       </select></label>
       <label>状态：<select id="review-filter-status" aria-label="按状态筛选">
         <option value="">全部状态</option>
-        <option value="open">未解决</option>
+        <option value="open">待处理</option>
+        <option value="in_progress">处理中</option>
+        <option value="needs_review">需复核</option>
         <option value="resolved">已解决</option>
+      </select></label>
+      <label>批次：<select id="review-filter-batch" aria-label="按审阅批次筛选">
+        <option value="">全部批注</option>
       </select></label>
       <button id="review-refresh">刷新</button>
     </div>
     <div class="snap-note" id="review-note" role="status"></div>
     <div id="review-list" class="review-list"></div>
+  </section>
+
+  <!-- 审阅批次：命名一组批注、负责人/截止/说明、实时进度、归档与审阅记录 -->
+  <section class="batch-panel" id="batch-panel" aria-label="审阅批次">
+    <h2>审阅批次 <span id="batch-rev" class="snap-rev" title="批次集合版本号（乐观锁）">版本 —</span></h2>
+    <div class="review-controls">
+      <button id="batch-add" class="primary">＋ 新建审阅批次</button>
+      <label class="batch-filter-label">显示：<select id="batch-filter-status" aria-label="按批次状态筛选">
+        <option value="">全部批次</option>
+        <option value="pending">进行中</option>
+        <option value="archived">已归档</option>
+      </select></label>
+      <button id="batch-refresh">刷新</button>
+    </div>
+    <div class="snap-note" id="batch-note" role="status"></div>
+    <div id="batch-list" class="batch-list"></div>
   </section>
 
   <!-- 审阅快照：保存 / 列表 / 两两比较 / 恢复前预览 -->
@@ -119,5 +140,6 @@
 <script src="app.js"></script>
 <script src="snapshots.js"></script>
 <script src="annotations.js"></script>
+<script src="batches.js"></script>
 </body>
 </html>

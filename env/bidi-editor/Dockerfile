@@ -1,13 +1,14 @@
-# Node 零依赖服务：静态文件 + 快照/批注 JSON API（/api/snapshots、/api/annotations）
+# Node 零依赖服务：静态文件 + 快照/批注/审阅批次 JSON API
 FROM node:20-alpine
 
 WORKDIR /app
-COPY server.js snapshot-core.js review-core.js app.js snapshots.js annotations.js index.html style.css ./
+COPY server.js snapshot-core.js review-core.js app.js snapshots.js annotations.js batches.js index.html style.css ./
 
-# 快照与批注数据持久化目录（可挂卷覆盖：-v snapdata:/app/data）
+# 快照、批注与审阅批次数据持久化目录（可挂卷覆盖：-v bidi-editor-data:/app/data）
 RUN mkdir -p /app/data
 ENV SNAPSHOTS_FILE=/app/data/snapshots.json
 ENV ANNOTATIONS_FILE=/app/data/annotations.json
+ENV REVIEW_BATCHES_FILE=/app/data/review-batches.json
 ENV PORT=8080
 
 EXPOSE 8080
