@@ -376,3 +376,82 @@ test("decisionDigest 保留状态/投票/执行结果，不含投票流水等冗
   // 摘要里不含 voteHistory
   assert.equal(dg.items[0].voteHistory, undefined);
 });
+
+/* ---------- 执行队列纯逻辑 ---------- */
+
+test("validateScheduledAt：缺时间/非法/过去拒绝，未来通过并规范化 ISO", function () {
+  const now = Date.parse("2026-09-12T12:00:00Z");
+  let r = dc.validateScheduledAt("", now);
+  assert.equal(r.ok, false);
+  assert.equal(r.code, "missing_scheduled_at");
+  r = dc.validateScheduledAt(undefined, now);
+  assert.equal(r.code, "missing_scheduled_at");
+  r = dc.validateScheduledAt("not-a-date", now);
+  assert.equal(r.code, "invalid_scheduled_at");
+  r = dc.validateScheduledAt("2026-09-12T11:59:59Z", now);
+  assert.equal(r.ok, false);
+  assert.equal(r.code, "scheduled_at_in_past");
+  r = dc.validateScheduledAt("2026-09-12T12:00:00Z", now);
+  assert.equal(r.ok, false, "等于当前也算过去");
+  r = dc.validateScheduledAt("2026-09-12T12:00:01Z", now);
+  assert.equal(r.ok, true);
+  assert.equal(r.value, "2026-09-12T12:00:01.000Z");
+  assert.equal(r.ms, Date.parse("2026-09-12T12:00:01Z"));
+});
+
+test("validateRescheduleAt：空表示立即，给值必须未来", function () {
+  const now = Date.parse("2026-09-12T12:00:00Z");
+  assert.equal(dc.validateRescheduleAt("", now).value, null);
+  assert.equal(dc.validateRescheduleAt(null, now).value, null);
+  const r = dc.validateRescheduleAt("2026-09-12T13:00:00Z", now);
+  assert.equal(r.ok, true);
+  assert.equal(r.value, "2026-09-12T13:00:00.000Z");
+  assert.equal(dc.validateRescheduleAt("2026-09-12T11:00:00Z", now).ok, false);
+});
+
+test("taskIsTerminal/taskIsActive 状态判定", function () {
+  assert.equal(dc.taskIsActive({ status: "scheduled" }), true);
+  assert.equal(dc.taskIsActive({ status: "paused" }), true);
+  assert.equal(dc.taskIsActive({ status: "running" }), true);
+  ["succeeded", "partial", "failed", "blocked", "cancelled"].forEach(function (s) {
+    assert.equal(dc.taskIsTerminal({ status: s }), true, s);
+    assert.equal(dc.taskIsActive({ status: s }), false, s);
+  });
+  assert.equal(dc.taskIsTerminal(null), false);
+});
+
+test("taskSummary：输出队列字段，lock 只暴露版本摘要", function () {
+  const t = {
+    id: "t1", decisionId: "d1", decisionName: "草案", batchId: "b1", batchName: "批",
+    status: "scheduled", publishedAt: "p", publishedBy: "负责人",
+    scheduledAt: "2026-09-12T12:00:00.000Z", scheduledAtMs: 1789000000000,
+    attempts: [{ at: "a", kind: "auto", status: "succeeded", counts: { success: 1 } }],
+    successAnnotationIds: ["x", "y"],
+    lock: {
+      at: "p", textRev: "abcdef0123456789",
+      annotationRev: 3, batchRev: 2, decisionRev: 9,
+      paragraphs: [{ dir: "ltr", text: "中文" }]
+    }
+  };
+  const s = dc.taskSummary(t);
+  assert.equal(s.status, "scheduled");
+  assert.deepEqual(s.successAnnotationIds, ["x", "y"]);
+  assert.equal(s.lock.paragraphCount, 1);
+  assert.equal(s.lock.textRev, "abcdef0123456789");
+  assert.equal(s.lock.paragraphs, undefined, "摘要不回传锁定文本全文");
+  assert.equal(s.attempts[0].counts.success, 1);
+});
+
+test("taskDigest：含锁定文本全文与成功条目，供快照嵌入", function () {
+  const t = {
+    id: "t1", decisionId: "d1", decisionName: "n", batchId: "b", batchName: "bn",
+    status: "partial", publishedAt: "p", scheduledAt: "x", scheduledAtMs: 1,
+    attempts: [], successAnnotationIds: ["a2"],
+    lock: { at: "p", textRev: "r", annotationRev: 1, batchRev: 1, decisionRev: 1,
+            paragraphs: [{ dir: "ltr", text: "锁定文本" }] }
+  };
+  const g = dc.taskDigest([t])[0];
+  assert.equal(g.status, "partial");
+  assert.equal(g.lock.paragraphs[0].text, "锁定文本");
+  assert.deepEqual(g.successAnnotationIds, ["a2"]);
+});

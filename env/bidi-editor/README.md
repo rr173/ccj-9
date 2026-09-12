@@ -1,10 +1,12 @@
-# 双向文本编辑器（中文 ⇄ 阿拉伯文同段混排）+ 审阅快照 + 协作批注 + 审阅批次 + 审阅决策
+# 双向文本编辑器（中文 ⇄ 阿拉伯文同段混排）+ 审阅快照 + 协作批注 + 审阅批次 + 审阅决策 + 定时执行队列
 
 一个零依赖 Node 服务 + 网页编辑器，支持同一段落内中文（从左到右）与阿拉伯文（从右到左）混排，
 提供可恢复、可比较、带乐观并发控制的**审阅快照**功能，可锚定到逻辑字符范围、
 支持回复与四态工作流的**协作批注**功能，把一组批注命名编组、
-跟踪负责人/截止时间/实时进度/完整审阅记录的**审阅批次**功能，以及在批次批注上
-逐条拟定保留/替换/删除方案、多人投票、三版本校验后部分执行并可撤销的**审阅决策**功能。
+跟踪负责人/截止时间/实时进度/完整审阅记录的**审阅批次**功能，在批次批注上
+逐条拟定保留/替换/删除方案、多人投票、三版本校验后部分执行并可撤销的**审阅决策**功能，
+以及把达标草案发布到执行队列、锁定版本、到点由服务端自动执行、可暂停/恢复/取消/失败重试的
+**决策发布与定时执行**功能。
 
 ## 双向编辑的需求与实现对照
 
@@ -143,7 +145,46 @@ GET    /api/review-decisions/:id/logs   决策记录，支持 ?from=&to= 时间�
 冲突响应示例：`409 {"error":"version_conflict","message":"…","currentRev":8}`；
 逐条版本冲突在执行/预览响应的 `results` 中给出（HTTP 仍为 200），例如
 `{"annotationId":"…","result":"conflict","reason":"quote_mismatch"}`。
-决策数据默认写到 `./data/review-decisions.json`（`REVIEW_DECISIONS_FILE` 覆盖）。
+决策数据默认写到 `./data/review-decisions.json`（`REVIEW_DECISIONS_FILE` 覆盖，执行队列任务也存于同一文件）。
+
+## 决策发布与定时执行（执行队列）
+
+达到执行条件（`ready`）的草案可由**负责人发布到执行队列**，指定一个**未来的生效时间**；
+发布瞬间锁定当时的**文本、批注与批次版本**，到点后由**服务端自动执行**。
+页面显示队列状态、计划时间与实时剩余时间，可暂停、恢复或取消尚未开始的任务。
+
+| 需求 | 实现方式 |
+|---|---|
+| 只发布“达到执行条件”的草案 | `POST /api/execution-tasks` 仅接受 `ready` 草案；拟定中/投票中 409 `decision_not_ready`，已执行 409 `decision_executed`，已排期重复发布 409 `task_already_scheduled` |
+| 必须指定未来生效时间 | 缺时间 400 `missing_scheduled_at`、非法时间 400 `invalid_scheduled_at`、过去时间 409 `scheduled_at_in_past`、晚于批次截止 409 `scheduled_after_deadline`；错误在弹窗内红字提示，**表单内容原样保留** |
+| 发布时锁定文本/批注/批次版本 | 任务记录 `lock {paragraphs, textRev, annotationRev, batchRev, decisionRev}`；草案三版本基线推进到锁定文本，排期后草案进入 `scheduled`，改方案/投票/手动执行全部 409 `decision_scheduled` |
+| 队列状态/计划时间/剩余时间 | 决策面板顶部显示活动队列，“⏰ 执行队列”可看全部任务；`GET /api/execution-tasks` 返回状态、计划时间、锁定版本与尝试记录；前端每秒刷新剩余时间，到点自动重载 |
+| 暂停/恢复/取消尚未开始的任务 | `POST …/:id/pause`（记录原计划时间，暂停即不触发）、`/resume`（可给新时间；不给则原时间在未来就沿用、已过则立即执行）、`/cancel`（草案退回 `ready` 可重新发布或手动执行）；已开始/已结束任务对应操作 409（`task_not_active`/`task_not_paused`/`task_not_cancellable`） |
+| 到点服务端自动执行 | 服务端按 `DECISION_SCHEDULER_INTERVAL_MS`（默认 1000ms，测试用 100ms）轮询到期任务，执行发布时锁定的文本；仍**逐条**做三版本校验，冲突条目不覆盖新内容，其余条目照常完成 |
+| 部分成功 | 全部成功 `succeeded`；有成功也有冲突 `partial`；零成功 `failed`。后两者草案退回 `ready`，任务终态保留，可“失败重试”；批次归档/草案过期等到点整体不能执行时为 `blocked`（不产生执行记录） |
+| 执行幂等，重启/重复触发不重复处理成功条目 | 任务累计 `successAnnotationIds`；每次尝试只执行“尚未成功”的条目，已成功条目记 `skipped/already_done`，不重复解决批注、不重复合成文本。内存锁防同进程重复触发；重启时遗留的 `running` 任务标记中断（`failed/interrupted`），需人工重试，绝不自动补跑 |
+| 失败重试 | `POST …/:id/retry`：不给时间立即重试（沿用发布锁，仍冲突的条目继续冲突）；可给未来时间重排；可选传回当前段落用最新文本/批注/批次**重新锁定**后重试 |
+| 全部操作留痕且可按时间筛选、与快照关联 | 发布/暂停/恢复/取消/阻断/自动执行（含逐条成功/冲突/跳过）/重试都进决策日志，带 `taskId`；`GET /api/execution-tasks/:id/logs?from=&to=` 按时间筛选；有成功条目时自动保存“执行后文本”快照，任务、执行记录与快照三方互相关联（`taskId/executionId/snapshotId`）；保存任意快照也会嵌入当时的执行队列 |
+| 不能被不恰当地修改 | 已归档批次、已过期草案不能发布/重试；已排期草案只读；已开始/已完成任务不能暂停/恢复/取消；已成功任务不能重试；所有变更必须 `If-Match: <X-Decision-Rev>` 严格相等，多人用旧页面提交一律 409 `version_conflict` 且不写盘 |
+| 重启恢复 | 未来时间的任务重启后继续等待；**停机期间错过**的任务在重启后自动补执行（成功条目仍幂等）；正在执行时崩溃的任务不自动补跑，标记中断后由人工重试 |
+
+### 执行队列 HTTP API 摘要
+
+```
+GET    /api/execution-tasks[?status=]      队列列表（活动任务在前，按计划时间排序）
+POST   /api/execution-tasks                发布 {decisionId, scheduledAt, paragraphs, actor}（If-Match 必需）
+GET    /api/execution-tasks/:id            任务详情（锁定版本/尝试记录/成功条目）
+POST   /api/execution-tasks/:id/pause      暂停（If-Match 必需）
+POST   /api/execution-tasks/:id/resume     恢复 {scheduledAt?}（If-Match 必需）
+POST   /api/execution-tasks/:id/cancel     取消 {reason?}（If-Match 必需；草案退回 ready）
+POST   /api/execution-tasks/:id/retry      失败重试 {scheduledAt?, paragraphs?, actor}（If-Match 必需）
+GET    /api/execution-tasks/:id/logs       队列记录，支持 ?from=&to= 时间筛选
+```
+
+任务状态：`scheduled` 等待生效 / `paused` 已暂停 / `running` 执行中（仅内存）/
+`succeeded` 全部成功 / `partial` 部分成功 / `failed` 零成功 / `blocked` 到点被阻断 /
+`cancelled` 已取消。任务与草案共用决策集合 rev（`X-Decision-Rev`），轮询间隔可用
+`DECISION_SCHEDULER_INTERVAL_MS` 调整。
 
 ### 批次详情中的决策关联
 
@@ -185,7 +226,8 @@ node server.js          # http://localhost:8080
 快照数据默认写到 `./data/snapshots.json`（`SNAPSHOTS_FILE` 覆盖），
 批注数据默认写到 `./data/annotations.json`（`ANNOTATIONS_FILE` 覆盖），
 审阅批次与记录默认写到 `./data/review-batches.json`（`REVIEW_BATCHES_FILE` 覆盖），
-审阅决策与记录默认写到 `./data/review-decisions.json`（`REVIEW_DECISIONS_FILE` 覆盖）。
+审阅决策与执行队列数据默认写到 `./data/review-decisions.json`（`REVIEW_DECISIONS_FILE` 覆盖，
+定时任务与草案同文件）；定时轮询间隔用 `DECISION_SCHEDULER_INTERVAL_MS` 调整（默认 1000 毫秒）。
 
 > 注：直接双击打开 `index.html`（file://）时快照与批注接口不可用，双向编辑功能本身仍可使用。
 
@@ -204,6 +246,7 @@ node --test test/
 - `test/review-batches-api.test.js`：批次创建校验、成员互斥、逐条/批量状态、旧页面批量更新 409、加/移成员、审阅记录按时间筛选、归档冻结、快照嵌入批次、恢复对账、重启持久化
 - `test/decision-core.test.js`：决策草案校验、记名投票与门槛流转、改方案清票、三版本逐条冲突（文本/批注/批次）、按段预览、同段多条从后向前应用、部分成功、撤销基线、快照摘要
 - `test/decisions-api.test.js`：创建校验（归档/过期/重复草案/空方案/缺投票人）、方案填写与提交、两人投票流转、预览不写盘、三版本逐条冲突的部分成功执行、成功批注转已解决、旧决策版本 409、同草案不可重复执行、撤销（执行后变化不覆盖、全局最近一次顺序）、快照嵌入决策、归档冻结、按时间记录、重启持久化
+- `test/execution-tasks-api.test.js`：发布校验（缺/过去/非法时间、非待执行、重复发布、晚于截止、版本冲突）、发布锁定版本、暂停/恢复/取消、到点自动执行与自动快照、逐条冲突的部分成功、失败重试幂等（成功条目不重复处理）、重锁重试成功、重启后未来任务等待与错过任务补执行、队列记录按时间筛选、快照嵌入执行队列
 
 ## Docker 部署
 
@@ -231,8 +274,8 @@ decision-core.js  审阅决策纯逻辑：方案/投票校验、逐条投票统�
 snapshots.js      快照 UI：列表/比较/恢复预览二次确认/版本冲突
 annotations.js    批注 UI：列表筛选（段落/四态/批次）/新建/详情回复/四态状态/冲突处理/快照批注查看与恢复
 batches.js        审阅批次 UI：新建（命名/负责人/截止/说明/勾选批注）、列表与实时进度、详情批量操作、加/移成员、归档、按时间查看审阅记录
-decisions.js      审阅决策 UI：从批次创建草案、逐条填写保留/替换/删除、记名投票、按段执行前预览、部分成功执行结果、撤销最近一次执行、按时间记录、快照决策查看
-server.js         零依赖服务：静态文件 + 快照、批注、审阅批次、审阅决策 JSON API（四集合乐观锁、原子落盘）
+decisions.js      审阅决策 UI：从批次创建草案、逐条填写保留/替换/删除、记名投票、按段执行前预览、部分成功执行结果、撤销最近一次执行、发布到执行队列（计划时间/剩余时间/暂停/恢复/取消/失败重试）、按时间记录、快照决策与队列查看
+server.js         零依赖服务：静态文件 + 快照、批注、审阅批次、审阅决策、执行队列 JSON API（四集合乐观锁、原子落盘、定时执行调度器）
 test/             node:test 单元与集成测试
 Dockerfile        node:20-alpine，EXPOSE 8080，数据卷 /app/data
 ```

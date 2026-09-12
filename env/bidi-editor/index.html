@@ -89,11 +89,13 @@
     <h2>审阅决策 <span id="decision-rev" class="snap-rev" title="决策集合版本号（乐观锁）">版本 —</span></h2>
     <div class="review-controls">
       <button id="decision-add" class="primary">＋ 新建决策草案</button>
+      <button id="decision-tasks">⏰ 执行队列</button>
       <label class="batch-filter-label">显示：<select id="decision-filter-status" aria-label="按草案状态筛选">
         <option value="">全部草案</option>
         <option value="drafting">拟定中</option>
         <option value="voting">投票中</option>
         <option value="ready">待执行</option>
+        <option value="scheduled">已排期</option>
         <option value="executed">已执行</option>
       </select></label>
       <button id="decision-refresh">刷新</button>

@@ -34,6 +34,8 @@
     THRESHOLD_MIN: 1,
     THRESHOLD_MAX: 50,             // 通过人数上限
     DECISION_MAX_COUNT: 200,
+    TASK_MAX_COUNT: 500,
+    TASK_ATTEMPT_MAX: 50,
     ITEM_VOTE_HISTORY_MAX: 200,    // 每条投票流水保留条数
     LOG_MAX: 5000
   };
@@ -46,17 +48,41 @@
   var VOTE_SET = { approve: true, reject: true, abstain: true };
   var VOTE_LABELS = { approve: "通过", reject: "驳回", abstain: "弃权" };
 
-  // drafting 拟定中 / voting 投票中 / ready 待执行 / executed 已执行
+  // drafting 拟定中 / voting 投票中 / ready 待执行 / scheduled 已发布定时执行中 /
+  // executed 已执行（有成功条目固化）
   // 批次归档后草案只读（frozen 由批次状态派生，不单独占状态）
-  var DECISION_STATUSES = ["drafting", "voting", "ready", "executed"];
+  var DECISION_STATUSES = ["drafting", "voting", "ready", "scheduled", "executed"];
   var STATUS_LABELS = {
-    drafting: "拟定中", voting: "投票中", ready: "待执行", executed: "已执行"
+    drafting: "拟定中", voting: "投票中", ready: "待执行",
+    scheduled: "已排期", executed: "已执行"
+  };
+
+  /* 执行队列任务状态：
+   *   scheduled 已排期等待生效（可暂停/恢复/取消）
+   *   paused    已暂停（计时停止，恢复后重排）
+   *   running   服务端正在执行（仅内存守卫，不写盘）
+   *   succeeded 全部条目成功（终态）
+   *   partial   部分成功（终态；冲突/跳过条目可“失败重试”）
+   *   failed    本次没有成功条目（终态；草案退回待执行，可重试）
+   *   blocked   到期但批次归档/草案过期等整体不能执行（终态；需先排除原因）
+   *   cancelled 已取消（终态；草案退回待执行）
+   */
+  var TASK_STATUSES = ["scheduled", "paused", "running",
+                      "succeeded", "partial", "failed", "blocked", "cancelled"];
+  var TASK_TERMINAL = {
+    succeeded: true, partial: true, failed: true, blocked: true, cancelled: true
+  };
+  var TASK_STATUS_LABELS = {
+    scheduled: "等待生效", paused: "已暂停", running: "执行中",
+    succeeded: "全部成功", partial: "部分成功", failed: "执行失败",
+    blocked: "已阻断", cancelled: "已取消"
   };
 
   var RESULT_LABELS = { success: "成功", conflict: "冲突", skipped: "跳过" };
   var REASON_LABELS = {
     not_selected: "本次未选择执行",
     not_approved: "尚未通过投票",
+    already_done: "之前的尝试已成功，幂等跳过",
     annotation_deleted: "批注已被删除",
     annotation_changed: "批注在草案创建后被修改",
     member_removed: "批注已被移出批次",
@@ -332,10 +358,12 @@
     };
   }
 
-  // 投票后重算草案状态：全部条目通过才进入 ready；有驳回或缺票则留在 voting
+  // 投票后重算草案状态：全部条目通过才进入 ready；有驳回或缺票则留在 voting。
+  // scheduled/executed 不由投票重算改变（排期后投票入口已关闭）。
   function recomputeStatus(decision) {
     if (decision.status === "drafting") return decision.status;
     if (decision.status === "executed") return decision.status;
+    if (decision.status === "scheduled") return decision.status;
     var p = decisionProgress(decision);
     return p.ready ? "ready" : "voting";
   }
@@ -373,6 +401,108 @@
     var t = Date.parse(deadline);
     if (isNaN(t)) return false;
     return t <= (nowMs == null ? Date.now() : nowMs);
+  }
+
+  /* ---------- 执行队列（发布定时执行） ---------- */
+
+  // 生效时间必须是合法且严格晚于当前的时间；缺时间/过去时间都明确拒绝。
+  function validateScheduledAt(v, nowMs) {
+    if (v == null || v === "") {
+      return err(400, "missing_scheduled_at",
+        "发布到执行队列必须指定未来的生效时间（当前表单内容已保留）");
+    }
+    var t = Date.parse(v);
+    if (isNaN(t)) {
+      return err(400, "invalid_scheduled_at", "生效时间格式无法识别，请使用合法的日期时间");
+    }
+    var base = nowMs == null ? Date.now() : nowMs;
+    if (t <= base) {
+      return err(409, "scheduled_at_in_past",
+        "生效时间必须晚于当前时间，请选择一个未来的时间（当前表单内容已保留）");
+    }
+    return { ok: true, value: new Date(t).toISOString(), ms: t };
+  }
+
+  // 恢复/重试时给出的新生效时间：给了就必须是未来；不给表示“立即/下次轮询执行”。
+  function validateRescheduleAt(v, nowMs) {
+    if (v == null || v === "") return { ok: true, value: null };
+    return validateScheduledAt(v, nowMs);
+  }
+
+  function taskIsTerminal(task) {
+    return !!(task && TASK_TERMINAL[task.status]);
+  }
+  function taskIsActive(task) {
+    return !!task && (task.status === "scheduled" || task.status === "paused" ||
+                      task.status === "running");
+  }
+
+  function taskSummary(t) {
+    if (!t) return null;
+    return {
+      id: t.id,
+      decisionId: t.decisionId,
+      decisionName: t.decisionName,
+      batchId: t.batchId,
+      batchName: t.batchName,
+      status: t.status,
+      publishedAt: t.publishedAt,
+      publishedBy: t.publishedBy,
+      scheduledAt: t.scheduledAt,
+      scheduledAtMs: t.scheduledAtMs,
+      pausedAt: t.pausedAt || null,
+      pausedBy: t.pausedBy || null,
+      pauseScheduledAt: t.pauseScheduledAt || null,
+      resumedAt: t.resumedAt || null,
+      cancelReason: t.cancelReason || null,
+      cancelledAt: t.cancelledAt || null,
+      finishedAt: t.finishedAt || null,
+      blockReason: t.blockReason || null,
+      lastError: t.lastError || null,
+      attempts: (t.attempts || []).map(function (a) {
+        return {
+          at: a.at, kind: a.kind, scheduledAt: a.scheduledAt || null,
+          status: a.status, counts: a.counts || null,
+          executionId: a.executionId || null,
+          reason: a.reason || null, message: a.message || null
+        };
+      }),
+      lastExecutionId: t.lastExecutionId || null,
+      lastCounts: t.lastCounts || null,
+      successAnnotationIds: (t.successAnnotationIds || []).slice(),
+      snapshotId: t.snapshotId || null,
+      lock: t.lock ? {
+        at: t.lock.at,
+        textRev: t.lock.textRev,
+        annotationRev: t.lock.annotationRev,
+        batchRev: t.lock.batchRev,
+        decisionRev: t.lock.decisionRev,
+        paragraphCount: (t.lock.paragraphs || []).length
+      } : null
+    };
+  }
+
+  // 执行任务（含发布时锁定的文本/批注/批次版本与成功条目集合）快照摘要，
+  // 保存快照时嵌入，与当时的草案/批注状态关联。
+  function taskDigest(tasks) {
+    return (tasks || []).map(function (t) {
+      var s = taskSummary(t);
+      if (t.lock) {
+        s.lock = {
+          at: t.lock.at,
+          textRev: t.lock.textRev,
+          annotationRev: t.lock.annotationRev,
+          batchRev: t.lock.batchRev,
+          decisionRev: t.lock.decisionRev,
+          // 发布时锁定的段落文本：历史快照可见当时将被自动执行的确切文本
+          paragraphs: (t.lock.paragraphs || []).map(function (p) {
+            return { dir: p.dir || "auto", text: p.text };
+          })
+        };
+      }
+      s.successAnnotationIds = (t.successAnnotationIds || []).slice();
+      return s;
+    });
   }
 
   /* ---------- 段落对齐与逐条版本校验 ---------- */
@@ -677,6 +807,9 @@
       applied: ex.applied,
       undone: !!ex.undone,
       undoneAt: ex.undoneAt || null,
+      trigger: ex.trigger || (ex.actor === "系统定时执行" ? "scheduled" : "manual"),
+      taskId: ex.taskId || null,
+      snapshotId: ex.snapshotId || null,
       textRevBefore: ex.textRevBefore,
       textRevAfter: ex.textRevAfter || null,
       annotationRevBefore: ex.annotationRevBefore,
@@ -712,10 +845,12 @@
         updatedAt: d.updatedAt,
         submittedAt: d.submittedAt || null,
         readyAt: d.readyAt || null,
+        scheduledAt: d.scheduledAt || null,
         deadline: d.deadline || null,
         textRev: d.textRev,
         annotationRev: d.annotationRev,
         batchRev: d.batchRev,
+        activeTaskId: d.activeTaskId || null,
         items: (d.items || []).map(itemDigest),
         executions: (d.executions || []).map(executionDigest),
         lastExecutionId: d.lastExecutionId || null
@@ -731,6 +866,9 @@
     VOTE_LABELS: VOTE_LABELS,
     DECISION_STATUSES: DECISION_STATUSES,
     STATUS_LABELS: STATUS_LABELS,
+    TASK_STATUSES: TASK_STATUSES,
+    TASK_TERMINAL: TASK_TERMINAL,
+    TASK_STATUS_LABELS: TASK_STATUS_LABELS,
     ITEM_STATE_LABELS: ITEM_STATE_LABELS,
     RESULT_LABELS: RESULT_LABELS,
     REASON_LABELS: REASON_LABELS,
@@ -756,6 +894,13 @@
     applyVote: applyVote,
     reviseItem: reviseItem,
     isOverdue: isOverdue,
+    // 执行队列
+    validateScheduledAt: validateScheduledAt,
+    validateRescheduleAt: validateRescheduleAt,
+    taskIsTerminal: taskIsTerminal,
+    taskIsActive: taskIsActive,
+    taskSummary: taskSummary,
+    taskDigest: taskDigest,
     // 执行与预览
     mapParagraphs: mapParagraphs,
     evaluateItem: evaluateItem,

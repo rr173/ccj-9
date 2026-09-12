@@ -110,7 +110,11 @@ function publicFull(s) {
     annotationRev: Number.isInteger(s.annotationRev) ? s.annotationRev : null,
     // 快照保存时刻的决策草案（可能为 null：该快照创建于决策功能上线前）
     decisions: Array.isArray(s.decisions) ? s.decisions : null,
-    decisionRev: Number.isInteger(s.decisionRev) ? s.decisionRev : null
+    decisionRev: Number.isInteger(s.decisionRev) ? s.decisionRev : null,
+    // 快照保存时刻的执行队列（可能为 null：该快照创建于定时执行功能上线前）
+    executionTasks: Array.isArray(s.executionTasks) ? s.executionTasks : null,
+    taskId: s.taskId || null,
+    executionId: s.executionId || null
   };
 }
 
@@ -297,7 +301,7 @@ function publicBatchFull(b) {
 
 /* ================= 审阅决策存储 ================= */
 
-const decisionStore = { rev: 0, decisions: [], logs: [] };
+const decisionStore = { rev: 0, decisions: [], logs: [], tasks: [] };
 
 function persistDecisions(cb) {
   const tmp = DECISION_FILE + ".tmp";
@@ -316,6 +320,7 @@ try {
     decisionStore.rev = data.rev;
     decisionStore.decisions = data.decisions;
     decisionStore.logs = Array.isArray(data.logs) ? data.logs : [];
+    decisionStore.tasks = Array.isArray(data.tasks) ? data.tasks : [];
   }
 } catch (e) {
   // 文件不存在/损坏：以空存储启动，损坏文件不覆盖
@@ -325,15 +330,42 @@ function findDecision(id) {
   return decisionStore.decisions.find(function (d) { return d.id === id; });
 }
 
+function findTask(id) {
+  return decisionStore.tasks.find(function (t) { return t.id === id; });
+}
+
+function activeTaskOfDecision(decisionId) {
+  return decisionStore.tasks.find(function (t) {
+    return t.decisionId === decisionId && decision.taskIsActive(t);
+  });
+}
+
+// 执行队列日志：发布/暂停/恢复/取消/自动执行/重试都进同一本决策日志，
+// 带 taskId，既可按草案也可按时间统一筛选。
+function addTaskLog(task, action, detail, extra) {
+  const entry = Object.assign({
+    decisionId: task.decisionId,
+    decisionName: task.decisionName,
+    batchId: task.batchId,
+    batchName: task.batchName,
+    action: action,
+    detail: detail,
+    annotationId: null,
+    taskId: task.id
+  }, extra || {});
+  addDecisionLog(entry);
+  return entry;
+}
+
 function decisionIndexOfBatch(batchId) {
   return decisionStore.decisions
     .filter(function (d) { return d.batchId === batchId; })
     .map(function (d) { return d.id; });
 }
 
-// 决策审阅记录：草案创建/方案修改/投票/提交/执行/撤销全部留痕，可按时间查看。
+// 决策审阅记录：草案创建/方案修改/投票/提交/执行/撤销/执行队列全部留痕，可按时间查看。
 function addDecisionLog(entry) {
-  decisionStore.logs.push({
+  const rec = {
     id: entry.id || crypto.randomUUID(),
     decisionId: entry.decisionId || null,
     decisionName: entry.decisionName || null,
@@ -343,11 +375,16 @@ function addDecisionLog(entry) {
     actor: entry.actor || "匿名",
     action: entry.action,
     detail: entry.detail || null,
-    annotationId: entry.annotationId || null
-  });
+    annotationId: entry.annotationId || null,
+    // 执行队列任务关联（发布/暂停/恢复/取消/自动执行/重试）
+    taskId: entry.taskId || null,
+    snapshotId: entry.snapshotId || null
+  };
+  decisionStore.logs.push(rec);
   if (decisionStore.logs.length > decision.LIMITS.LOG_MAX) {
     decisionStore.logs.splice(0, decisionStore.logs.length - decision.LIMITS.LOG_MAX);
   }
+  return rec;
 }
 
 function decisionItemSummary(it, threshold) {
@@ -370,17 +407,21 @@ function decisionItemSummary(it, threshold) {
 function decisionSummary(d) {
   const p = decision.decisionProgress(d);
   const batch = findBatch(d.batchId);
+  const task = activeTaskOfDecision(d.id);
   return {
     id: d.id, batchId: d.batchId, batchName: d.batchName,
     name: d.name, status: d.status, threshold: d.threshold,
     createdAt: d.createdAt, updatedAt: d.updatedAt,
     submittedAt: d.submittedAt || null, readyAt: d.readyAt || null,
+    scheduledAt: d.scheduledAt || null,
     deadline: d.deadline || null,
     itemCount: d.items.length,
     progress: p,
     frozen: !!(batch && batch.status === "archived"),
     overdue: decision.isOverdue(d.deadline) && d.status !== "executed",
     executed: d.status === "executed",
+    activeTaskId: d.activeTaskId || (task ? task.id : null) || null,
+    task: task ? decision.taskSummary(task) : null,
     lastExecutionId: d.lastExecutionId || null
   };
 }
@@ -395,6 +436,7 @@ function publicDecisions(batchId) {
 
 function publicDecisionFull(d) {
   const batch = findBatch(d.batchId);
+  const task = activeTaskOfDecision(d.id);
   return {
     rev: decisionStore.rev,
     decision: decisionSummary(d),
@@ -403,6 +445,7 @@ function publicDecisionFull(d) {
     annotationRev: d.annotationRev,
     batchRev: d.batchRev,
     textRev: d.textRev,
+    activeTask: task ? decision.taskSummary(task) : null,
     items: d.items.map(function (it) {
       var s = decisionItemSummary(it, d.threshold);
       s.votes = (it.votes || []).slice().sort(function (a, b) {
@@ -413,11 +456,190 @@ function publicDecisionFull(d) {
     executions: (d.executions || []).map(function (ex) {
       return {
         id: ex.id, at: ex.at, actor: ex.actor, applied: ex.applied,
+        trigger: ex.trigger || "manual",
+        taskId: ex.taskId || null,
+        snapshotId: ex.snapshotId || null,
         undone: !!ex.undone, undoneAt: ex.undoneAt || null,
         counts: ex.counts,
         resultCount: (ex.results || []).length
       };
     })
+  };
+}
+
+/* ================= 决策执行引擎（手动执行与定时执行共用） =================
+ *
+ * runDecisionExecution 在调用前已完成：
+ *   - 决策集合 rev 闸门（HTTP 请求由 If-Match 保证；调度器是服务端自身触发）；
+ *   - 批次未归档、草案未过期、状态允许执行（ready）。
+ * 本函数只做：三版本逐条校验 → 标记成功批注为已解决 → 写执行记录与逐条记录。
+ * 不调用 persistDecisions：由调用方决定落盘时机（手动执行要能整体回滚；
+ * 调度器要先持久化再异步处理批注/批次）。返回值包含所有变更前后状态，
+ * 供调用方在写盘失败时精确回滚。
+ */
+function runDecisionExecution(d, currentParas, opts) {
+  opts = opts || {};
+  const batch = findBatch(d.batchId);
+  const now = (opts.at) || new Date().toISOString();
+  const actor = opts.actor || "系统定时执行";
+  const trigger = opts.trigger || "manual"; // manual | scheduled | retry
+  const selected = opts.selectedIds || null;
+  const skipIds = opts.skipAnnotationIds
+    ? new Set(opts.skipAnnotationIds) : null;
+
+  let selectedIds = selected;
+  if (skipIds) {
+    // 幂等重试：已在之前尝试中成功的条目不再参与执行（绝不重复处理成功条目）
+    selectedIds = d.items
+      .map(function (it) { return it.annotationId; })
+      .filter(function (id) { return !skipIds.has(id); });
+  }
+
+  const plan = decision.planExecution(d, currentParas, annMap(),
+    batch ? batch.memberIds : [], selectedIds);
+  // 幂等重试：之前已经成功的条目不再算“本次成功”，标记 already_done 跳过，
+  // 不重复解决批注、不重复合成文本。
+  if (skipIds) {
+    plan.results.forEach(function (r) {
+      if (skipIds.has(r.annotationId)) {
+        r.result = "skipped";
+        r.reason = "already_done";
+        if (r.currentParaIndex === undefined) r.currentParaIndex = null;
+      }
+    });
+    plan.counts = { success: 0, conflict: 0, skipped: 0 };
+    plan.results.forEach(function (r) { plan.counts[r.result]++; });
+  }
+  const afterParas = decision.applyPlan(currentParas, plan.results);
+
+  const successIds = plan.results.filter(function (r) { return r.result === "success"; })
+    .map(function (r) { return r.annotationId; });
+  const annBackups = successIds.map(function (aid) {
+    const a = findAnn(aid);
+    return { ann: a, status: a.status, resolvedAt: a.resolvedAt,
+             resolvedBy: a.resolvedBy, updatedAt: a.updatedAt };
+  });
+  successIds.forEach(function (aid) {
+    const a = findAnn(aid);
+    a.status = "resolved";
+    a.resolvedAt = now;
+    a.resolvedBy = actor;
+    a.updatedAt = now;
+  });
+  if (successIds.length) annStore.rev++;
+  let batchRevBumped = false;
+  if (batch && successIds.some(function (aid) {
+    return batch.memberIds.indexOf(aid) !== -1;
+  })) {
+    batch.updatedAt = now;
+    batchStore.rev++;
+    batchRevBumped = true;
+  }
+
+  const applied = successIds.length > 0;
+  const ex = {
+    id: crypto.randomUUID(),
+    at: now,
+    actor: actor,
+    trigger: trigger,
+    taskId: opts.taskId || null,
+    snapshotId: null, // 定时执行成功后由调用方关联自动保存的快照
+    applied: applied,
+    undone: false,
+    undoneAt: null,
+    textRevBefore: plan.currentTextRev,
+    textRevAfter: decision.textContentRev(afterParas),
+    annotationRevBefore: d.annotationRev,
+    batchRevBefore: d.batchRev,
+    // 成功执行前的段落（供撤销时把编辑区恢复回来）
+    beforeParagraphs: applied ? currentParas : null,
+    counts: plan.counts,
+    results: plan.results.map(function (r) {
+      return {
+        annotationId: r.annotationId,
+        disposition: r.disposition,
+        replacement: r.replacement,
+        result: r.result,
+        reason: r.reason,
+        paraIndex: r.paraIndex,
+        currentParaIndex: r.currentParaIndex == null ? null : r.currentParaIndex,
+        start: r.start, end: r.end,
+        at: now
+      };
+    }),
+    undo: null
+  };
+
+  const prevStatus = d.status;
+  const prevLastExec = d.lastExecutionId;
+  const prevUpdated = d.updatedAt;
+  d.executions.push(ex);
+  d.lastExecutionId = ex.id;
+  d.updatedAt = now;
+  if (applied && opts.markExecuted !== false) {
+    // 一次部分成功也视为该草案已执行：成功部分固化，冲突/跳过条目记录在案
+    d.status = "executed";
+  }
+
+  // 总记录 + 逐条记录；定时执行/重试携带 taskId，可按任务筛选
+  const logEntries = [];
+  const taskIdForLog = trigger === "manual" ? null : (opts.taskId || null);
+  const logAction = trigger === "manual" ? "execute"
+    : trigger === "retry" ? "task_retry_execute" : "task_auto_execute";
+  logEntries.push({
+    decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
+    at: now, actor: actor,
+    action: logAction,
+    detail: (trigger === "manual" ? "执行决策" :
+             trigger === "retry" ? "失败重试执行" : "到达生效时间，服务端自动执行") +
+      "：成功 " + plan.counts.success + " 条、冲突 " + plan.counts.conflict +
+      " 条、跳过 " + plan.counts.skipped + " 条" +
+      (plan.textChanged ? "；检测到文本版本已变化（" +
+        plan.baselineTextRev.slice(0, 8) + " → " + plan.currentTextRev.slice(0, 8) + "）" : "") +
+      (applied ? "" : "（没有可成功执行的条目）") +
+      (opts.taskId ? "；执行队列任务 " + opts.taskId.slice(0, 8) : ""),
+    annotationId: null,
+    taskId: taskIdForLog
+  });
+  plan.results.forEach(function (r) {
+    logEntries.push({
+      decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
+      at: now, actor: actor,
+      action: logAction + "_item_" + r.result,
+      detail: decision.DISPOSITION_LABELS[r.disposition] || r.disposition + "：" +
+        (r.result === "success" ? "执行成功"
+         : r.result === "conflict" ? "冲突（" + (decision.REASON_LABELS[r.reason] || r.reason) + "）"
+         : "跳过（" + (decision.REASON_LABELS[r.reason] || r.reason) + "）"),
+      annotationId: r.annotationId,
+      taskId: taskIdForLog
+    });
+  });
+  logEntries.forEach(addDecisionLog);
+
+  return {
+    ex: ex,
+    plan: plan,
+    afterParas: afterParas,
+    successIds: successIds,
+    annBackups: annBackups,
+    batchRevBumped: batchRevBumped,
+    logEntries: logEntries,
+    rollback: function () {
+      annBackups.forEach(function (bk) {
+        bk.ann.status = bk.status; bk.ann.resolvedAt = bk.resolvedAt;
+        bk.ann.resolvedBy = bk.resolvedBy; bk.ann.updatedAt = bk.updatedAt;
+      });
+      if (successIds.length) annStore.rev--;
+      if (batchRevBumped) batchStore.rev--;
+      d.status = prevStatus; d.lastExecutionId = prevLastExec;
+      d.updatedAt = prevUpdated;
+      const i = d.executions.indexOf(ex);
+      if (i !== -1) d.executions.splice(i, 1);
+      logEntries.forEach(function (le) {
+        const li = decisionStore.logs.indexOf(le);
+        if (li !== -1) decisionStore.logs.splice(li, 1);
+      });
+    }
   };
 }
 
@@ -917,7 +1139,9 @@ function handleSnapshots(req, res, parts) {
         annotationRev: annStore.rev,
         // 关联当前决策草案（状态/投票/执行结果）：历史快照可见当时的决策情况
         decisions: decision.decisionDigest(decisionStore.decisions),
-        decisionRev: decisionStore.rev
+        decisionRev: decisionStore.rev,
+        // 关联执行队列：发布锁定文本、计划时间、任务状态与成功条目一并留档
+        executionTasks: decision.taskDigest(decisionStore.tasks)
       };
       store.snapshots.push(snap);
       store.rev++;
@@ -982,7 +1206,8 @@ function handleSnapshots(req, res, parts) {
       }
       const backup = { name: s.name, updatedAt: s.updatedAt, paragraphs: s.paragraphs,
                        annotations: s.annotations, annotationRev: s.annotationRev,
-                       decisions: s.decisions, decisionRev: s.decisionRev };
+                       decisions: s.decisions, decisionRev: s.decisionRev,
+                       executionTasks: s.executionTasks };
       s.name = check.value.name;
       s.paragraphs = check.value.paragraphs;
       s.updatedAt = new Date().toISOString();
@@ -991,9 +1216,10 @@ function handleSnapshots(req, res, parts) {
         batchStore.batches.map(function (b) { return [b.id, { id: b.id, name: b.name, status: b.status }]; }));
       s.annotations = review.snapshotDigest(annStore.annotations, batchLookup2);
       s.annotationRev = annStore.rev;
-      // 覆盖保存同步刷新决策草案状态、投票与执行结果
+      // 覆盖保存同步刷新决策草案状态、投票、执行结果与执行队列
       s.decisions = decision.decisionDigest(decisionStore.decisions);
       s.decisionRev = decisionStore.rev;
+      s.executionTasks = decision.taskDigest(decisionStore.tasks);
       store.rev++;
       const newRev = store.rev;
       persist(function (err) {
@@ -1002,6 +1228,7 @@ function handleSnapshots(req, res, parts) {
           s.updatedAt = backup.updatedAt;
           s.annotations = backup.annotations; s.annotationRev = backup.annotationRev;
           s.decisions = backup.decisions; s.decisionRev = backup.decisionRev;
+          s.executionTasks = backup.executionTasks;
           store.rev--;
           apiError(res, 500, "persist_failed", "快照保存失败，请重试");
           return;
@@ -1812,6 +2039,13 @@ function handleReviewDecisions(req, res, parts, urlObj) {
         { batchId: batch.id });
       return true;
     }
+    if (d.status === "scheduled") {
+      apiError(res, 409, "decision_scheduled",
+        "草案“" + d.name + "”已发布到执行队列等待定时执行，方案与投票已锁定，" +
+        "不能再修改或投票；请先在执行队列暂停后取消，再调整草案",
+        { activeTaskId: d.activeTaskId || null });
+      return true;
+    }
     if (decision.isOverdue(d.deadline) && d.status !== "executed") {
       apiError(res, 409, "decision_expired",
         "批次已过截止时间（" + d.deadline + "），草案“" + d.name +
@@ -2182,6 +2416,13 @@ function handleReviewDecisions(req, res, parts, urlObj) {
           { lastExecutionId: d.lastExecutionId });
         return;
       }
+      if (d.status === "scheduled") {
+        apiError(res, 409, "decision_scheduled",
+          "草案已发布到执行队列，将由服务端在计划时间自动执行，不能再手动执行；" +
+          "如需立即手动执行，请先在执行队列取消该任务",
+          { activeTaskId: d.activeTaskId || null });
+        return;
+      }
       if (d.status !== "ready") {
         const p = decision.decisionProgress(d);
         apiError(res, 409, "decision_not_ready",
@@ -2214,144 +2455,31 @@ function handleReviewDecisions(req, res, parts, urlObj) {
         selected = ic.value;
       }
 
-      const now = new Date().toISOString();
       const actor = review.validateAuthor(payload.actor).value;
-      const plan = decision.planExecution(d, currentParas, annMap(),
-        batch.memberIds, selected);
-
-      // 合成执行后段落（只含成功条目；冲突/跳过条目不触碰）
-      const afterParas = decision.applyPlan(currentParas, plan.results);
-
-      // 成功条目对应的批注：标记已解决（保留/替换/删除都表示该批注处理完成）
-      const successIds = plan.results.filter(function (r) { return r.result === "success"; })
-        .map(function (r) { return r.annotationId; });
-      const annBackups = successIds.map(function (aid) {
-        const a = findAnn(aid);
-        return { ann: a, status: a.status, resolvedAt: a.resolvedAt,
-                 resolvedBy: a.resolvedBy, updatedAt: a.updatedAt };
-      });
-      successIds.forEach(function (aid) {
-        const a = findAnn(aid);
-        a.status = "resolved";
-        a.resolvedAt = now;
-        a.resolvedBy = actor;
-        a.updatedAt = now;
-      });
-      if (successIds.length) annStore.rev++;
-      // 批次进度随成员状态变化推进批次 rev
-      if (successIds.some(function (aid) { return batch.memberIds.indexOf(aid) !== -1; })) {
-        batch.updatedAt = now;
-        batchStore.rev++;
-      }
-
-      const applied = successIds.length > 0;
-      const ex = {
-        id: crypto.randomUUID(),
-        at: now,
-        actor: actor,
-        applied: applied,
-        undone: false,
-        undoneAt: null,
-        textRevBefore: plan.currentTextRev,
-        textRevAfter: decision.textContentRev(afterParas),
-        annotationRevBefore: d.annotationRev,
-        batchRevBefore: d.batchRev,
-        // 成功执行前的段落（供撤销时把编辑区恢复回来）
-        beforeParagraphs: applied ? currentParas : null,
-        counts: plan.counts,
-        results: plan.results.map(function (r) {
-          return {
-            annotationId: r.annotationId,
-            disposition: r.disposition,
-            replacement: r.replacement,
-            result: r.result,
-            reason: r.reason,
-            paraIndex: r.paraIndex,
-            currentParaIndex: r.currentParaIndex == null ? null : r.currentParaIndex,
-            start: r.start, end: r.end,
-            at: now
-          };
-        }),
-        undo: null
-      };
-
-      const prevStatus = d.status;
-      const prevLastExec = d.lastExecutionId;
-      const prevUpdated = d.updatedAt;
-      d.executions.push(ex);
-      d.lastExecutionId = ex.id;
-      d.updatedAt = now;
-      if (applied) {
-        // 一次部分成功也视为该草案已执行：成功部分固化，冲突/跳过条目记录在案
-        d.status = "executed";
-      }
-
-      const le = {
-        decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
-        at: now, actor: actor,
-        action: "execute",
-        detail: "执行决策：成功 " + plan.counts.success + " 条、冲突 " +
-          plan.counts.conflict + " 条、跳过 " + plan.counts.skipped + " 条" +
-          (plan.textChanged ? "；执行前检测到文本版本已变化（" +
-            plan.baselineTextRev.slice(0, 8) + " → " + plan.currentTextRev.slice(0, 8) + "）" : "") +
-          (applied ? "" : "（没有可成功执行的条目，草案仍为待执行）"),
-        annotationId: null
-      };
-      addDecisionLog(le);
-      // 逐条结果也进记录，可按时间查看每条批注为何成功/冲突/跳过
-      plan.results.forEach(function (r) {
-        addDecisionLog({
-          decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
-          at: now, actor: actor,
-          action: "execute_item_" + r.result,
-          detail: decision.DISPOSITION_LABELS[r.disposition] || r.disposition + "：" +
-            (r.result === "success" ? "执行成功"
-             : r.result === "conflict" ? "冲突（" + (decision.REASON_LABELS[r.reason] || r.reason) + "）"
-             : "跳过（" + (decision.REASON_LABELS[r.reason] || r.reason) + "）"),
-          annotationId: r.annotationId
-        });
+      const result = runDecisionExecution(d, currentParas, {
+        actor: actor, trigger: "manual", selectedIds: selected
       });
       decisionStore.rev++;
 
-      function rollbackAll() {
-        annBackups.forEach(function (bk) {
-          bk.ann.status = bk.status; bk.ann.resolvedAt = bk.resolvedAt;
-          bk.ann.resolvedBy = bk.resolvedBy; bk.ann.updatedAt = bk.updatedAt;
-        });
-        if (successIds.length) annStore.rev--;
-        if (successIds.some(function (aid) { return batch.memberIds.indexOf(aid) !== -1; })) {
-          batchStore.rev--;
-        }
-        d.status = prevStatus; d.lastExecutionId = prevLastExec;
-        d.updatedAt = prevUpdated;
-        const i = d.executions.indexOf(ex);
-        if (i !== -1) d.executions.splice(i, 1);
-        decisionStore.rev--;
-        const logStart = decisionStore.logs.findIndex(function (x) {
-          return x.decisionId === d.id && x.at === now &&
-            (x.action === "execute" || x.action.indexOf("execute_item_") === 0);
-        });
-        if (logStart !== -1) decisionStore.logs.splice(logStart);
-      }
-
       persistDecisions(function (derr) {
         if (derr) {
-          rollbackAll();
+          result.rollback();
+          decisionStore.rev--;
           apiError(res, 500, "persist_failed", "决策执行记录保存失败，全部改动已回滚，请重试");
           return;
         }
         // 决策已落盘后再落批注/批次：失败也不回滚已成功的执行（与批次状态接口同策略），
         // 仅回滚内存中的 rev 推进，刷新后以批注存储为准；执行记录保留。
-        if (successIds.length) {
+        if (result.successIds.length) {
           persistAnnotations(function (aerr) {
             if (aerr) console.error("decision execute annotation persist failed:", aerr);
             persistBatches(function (berr) {
               if (berr) console.error("decision execute batch persist failed:", berr);
-              sendJSON(res, 200, executionResponse(ex, afterParas));
+              sendJSON(res, 200, executionResponse(result.ex, result.afterParas));
             });
           });
         } else {
-          sendJSON(res, 200, executionResponse(ex, afterParas));
+          sendJSON(res, 200, executionResponse(result.ex, result.afterParas));
         }
       });
 
@@ -2534,6 +2662,932 @@ function handleReviewDecisions(req, res, parts, urlObj) {
   apiError(res, 405, "method_not_allowed", "该路径不支持此方法");
 }
 
+/* ================= 决策执行队列 API =================
+ * parts: ["api", "execution-tasks", ":id?", "pause"|"resume"|"cancel"|"retry"|"logs"?]
+ * 锁模型与决策一致：所有变更必须 If-Match 当前 X-Decision-Rev（任务与草案共用
+ * 决策集合 rev），多人用旧页面操作一律 409 version_conflict 且不写盘。
+ */
+function handleExecutionTasks(req, res, parts, urlObj) {
+  const id = parts[2];
+  const sub = parts[3];
+  const validSubs = { pause: true, resume: true, cancel: true, retry: true, logs: true };
+  if (sub && !(id && validSubs[sub] && parts.length === 4)) {
+    apiError(res, 404, "not_found", "接口不存在");
+    return;
+  }
+  if (parts.length > 4) {
+    apiError(res, 404, "not_found", "接口不存在");
+    return;
+  }
+
+  /* ---- 集合级：GET 队列（可 ?status= 过滤） ---- */
+  if (!id) {
+    if (req.method === "GET") {
+      const st = urlObj.searchParams.get("status");
+      sendJSON(res, 200, publicTasks(st));
+      return;
+    }
+    if (req.method === "POST") {
+      // 发布决策草案到执行队列
+      if (checkLock(res, req.headers["if-match"], decisionStore.rev, "审阅决策集合")) return;
+      readBody(req, function (err, raw) {
+        if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+        let payload;
+        try { payload = JSON.parse(raw); }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+
+        if (!payload || typeof payload.decisionId !== "string") {
+          apiError(res, 400, "invalid_body",
+            "发布到执行队列必须指定 decisionId（当前表单内容已保留）");
+          return;
+        }
+        // 生效时间：缺省/过去时间都明确拒绝（错误信息里说明表单已保留）
+        const when = decision.validateScheduledAt(payload.scheduledAt);
+        if (!when.ok) { apiError(res, when.status, when.code, when.message); return; }
+
+        if (decisionStore.tasks.length >= decision.LIMITS.TASK_MAX_COUNT) {
+          apiError(res, 413, "too_many_tasks",
+            "执行队列任务已达 " + decision.LIMITS.TASK_MAX_COUNT + " 个上限");
+          return;
+        }
+
+        const d = findDecision(payload.decisionId);
+        if (!d) {
+          apiError(res, 404, "decision_not_found", "决策草案不存在或已被删除");
+          return;
+        }
+        const batch = findBatch(d.batchId);
+        if (!batch) {
+          apiError(res, 404, "batch_not_found", "草案所属批次已不存在，不能发布");
+          return;
+        }
+        if (batch.status === "archived") {
+          apiError(res, 409, "batch_archived",
+            "批次“" + batch.name + "”已归档，不能发布定时执行");
+          return;
+        }
+        if (decision.isOverdue(d.deadline)) {
+          apiError(res, 409, "decision_expired",
+            "批次已过截止时间，草案已过期，不能发布；请先调整批次截止时间（当前表单内容已保留）");
+          return;
+        }
+        // 只有“待执行”草案可发布；重复发布明确拒绝
+        const existing = activeTaskOfDecision(d.id);
+        if (existing) {
+          apiError(res, 409, "task_already_scheduled",
+            "草案“" + d.name + "”已在执行队列中（状态：" +
+            (decision.TASK_STATUS_LABELS[existing.status] || existing.status) +
+            "），不能重复发布；请先暂停/恢复/取消该任务",
+            { existingTaskId: existing.id, taskStatus: existing.status });
+          return;
+        }
+        if (d.status === "executed") {
+          apiError(res, 409, "decision_executed",
+            "草案已经执行完成，不能再发布到执行队列");
+          return;
+        }
+        if (d.status !== "ready") {
+          const p = decision.decisionProgress(d);
+          apiError(res, 409, "decision_not_ready",
+            "只有达到执行条件的“待执行”草案可以发布，当前状态：" +
+            decision.STATUS_LABELS[d.status] + "（" + p.approved + "/" + p.total +
+            " 条通过投票，当前表单内容已保留）",
+            { progress: p });
+          return;
+        }
+        // 生效时间不得晚于批次截止时间，否则任务到点必被过期阻断
+        if (d.deadline && Date.parse(d.deadline) <= when.ms) {
+          apiError(res, 409, "scheduled_after_deadline",
+            "生效时间晚于批次截止时间（" + d.deadline +
+            "），任务到点会因草案过期被阻断；请选择更早的时间或先调整批次截止时间（当前表单内容已保留）");
+          return;
+        }
+
+        // 锁定发布时刻的文本（客户端回传当前编辑区）、批注与批次版本
+        const vCheck = core.validateSnapshotPayload(
+          Object.assign({ name: "task-lock" }, { paragraphs: payload.paragraphs || [] }));
+        if (!vCheck.ok) {
+          apiError(res, vCheck.status, vCheck.code,
+            "发布时锁定文本无效：" + vCheck.message);
+          return;
+        }
+        const lockParas = vCheck.value.paragraphs;
+        const now = new Date().toISOString();
+        const actor = review.validateAuthor(payload.actor).value;
+        const task = {
+          id: crypto.randomUUID(),
+          decisionId: d.id,
+          decisionName: d.name,
+          batchId: d.batchId,
+          batchName: d.batchName,
+          status: "scheduled",
+          publishedAt: now,
+          publishedBy: actor,
+          scheduledAt: when.value,
+          scheduledAtMs: when.ms,
+          pausedAt: null,
+          pausedBy: null,
+          pauseScheduledAt: null,
+          resumedAt: null,
+          finishedAt: null,
+          cancelledAt: null,
+          cancelReason: null,
+          cancelBy: null,
+          blockReason: null,
+          lastError: null,
+          createdAt: now,
+          updatedAt: now,
+          // 发布即锁定：文本/批注/批次/决策四个版本与当时文本
+          lock: {
+            at: now,
+            paragraphs: lockParas,
+            textRev: decision.textContentRev(lockParas),
+            annotationRev: annStore.rev,
+            batchRev: batchStore.rev,
+            decisionRev: decisionStore.rev
+          },
+          // 定时执行基线更新为锁定文本：执行时按锁定文本对齐并逐条校验
+          textRevBeforePublish: d.textRev,
+          annotationRevBeforePublish: d.annotationRev,
+          batchRevBeforePublish: d.batchRev,
+          baselineParagraphsBeforePublish: d.baselineParagraphs,
+          attempts: [],
+          successAnnotationIds: [],
+          lastCounts: null,
+          lastExecutionId: null,
+          snapshotId: null
+        };
+
+        // 草案三版本基线推进到发布时刻；baselineParagraphs 换成锁定文本
+        d.baselineParagraphs = lockParas;
+        d.textRev = task.lock.textRev;
+        d.annotationRev = annStore.rev;
+        d.batchRev = batchStore.rev;
+        d.items.forEach(function (it) {
+          const a = findAnn(it.annotationId);
+          if (a) it.annotationUpdatedAt = a.updatedAt || a.createdAt || it.annotationUpdatedAt;
+        });
+        const prevStatus = d.status;
+        d.status = "scheduled";
+        d.scheduledAt = now;
+        d.activeTaskId = task.id;
+        d.updatedAt = now;
+
+        decisionStore.tasks.push(task);
+        const le = addTaskLog(task, "task_publish",
+          "发布到执行队列：计划生效时间 " + when.value +
+          "；锁定文本 " + lockParas.length + " 段（版本 " +
+          task.lock.textRev.slice(0, 8) + "）、批注版本 " + task.lock.annotationRev +
+          "、批次版本 " + task.lock.batchRev + "、决策版本 " + task.lock.decisionRev);
+
+        decisionStore.rev++;
+        persistDecisions(function (perr) {
+          if (perr) {
+            // 回滚草案基线与状态、移除任务与记录
+            d.baselineParagraphs = task.baselineParagraphsBeforePublish;
+            d.textRev = task.textRevBeforePublish;
+            d.annotationRev = task.annotationRevBeforePublish;
+            d.batchRev = task.batchRevBeforePublish;
+            d.status = prevStatus;
+            d.scheduledAt = null;
+            d.activeTaskId = null;
+            d.updatedAt = now;
+            decisionStore.tasks.pop();
+            decisionStore.rev--;
+            const li = decisionStore.logs.indexOf(le);
+            if (li !== -1) decisionStore.logs.splice(li, 1);
+            apiError(res, 500, "persist_failed", "发布失败，请重试（表单内容已保留）");
+            return;
+          }
+          sendJSON(res, 201, {
+            rev: decisionStore.rev,
+            task: decision.taskSummary(task),
+            decision: decisionSummary(d)
+          });
+        });
+      });
+      return;
+    }
+    apiError(res, 405, "method_not_allowed", "该路径不支持此方法");
+    return;
+  }
+
+  const task = findTask(id);
+  if (!task) {
+    apiError(res, 404, "task_not_found", "执行队列任务不存在或已被清理");
+    return;
+  }
+  const d = findDecision(task.decisionId);
+  const batch = d ? findBatch(d.batchId) : null;
+
+  /* ---- 只读：任务详情 / 任务记录（按时间筛选） ---- */
+  if (req.method === "GET" && !sub) {
+    sendJSON(res, 200, {
+      rev: decisionStore.rev,
+      task: decision.taskSummary(task),
+      decision: d ? decisionSummary(d) : null
+    });
+    return;
+  }
+  if (sub === "logs" && req.method === "GET") {
+    const params = urlObj.searchParams;
+    let logs = decisionStore.logs.filter(function (l) { return l.taskId === id; });
+    const from = params.get("from");
+    const to = params.get("to");
+    if (from && !isNaN(Date.parse(from))) {
+      logs = logs.filter(function (l) { return Date.parse(l.at) >= Date.parse(from); });
+    }
+    if (to && !isNaN(Date.parse(to))) {
+      logs = logs.filter(function (l) { return Date.parse(l.at) <= Date.parse(to); });
+    }
+    logs = logs.slice().sort(function (a, b) { return b.at.localeCompare(a.at); });
+    sendJSON(res, 200, { rev: decisionStore.rev, taskId: id, logs: logs });
+    return;
+  }
+
+  // 以下均为变更类：必须带决策集合版本
+  if (checkLock(res, req.headers["if-match"], decisionStore.rev, "审阅决策集合")) return;
+
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let payload = {};
+    if (raw) {
+      try { payload = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    }
+    const now = new Date().toISOString();
+    const actor = review.validateAuthor(payload.actor).value;
+
+    function save(ok, rollback) {
+      decisionStore.rev++;
+      persistDecisions(function (perr) {
+        if (perr) {
+          rollback();
+          decisionStore.rev--;
+          apiError(res, 500, "persist_failed", "任务状态保存失败，已回滚，请重试");
+          return;
+        }
+        ok();
+      });
+    }
+    function okResp() {
+      sendJSON(res, 200, {
+        rev: decisionStore.rev,
+        task: decision.taskSummary(task),
+        decision: d ? decisionSummary(d) : null
+      });
+    }
+
+    /* ---- POST .../:id/pause：暂停尚未开始的任务 ---- */
+    if (sub === "pause" && req.method === "POST") {
+      if (task.status === "paused") {
+        apiError(res, 409, "task_not_active", "任务已经是暂停状态");
+        return;
+      }
+      if (task.status !== "scheduled") {
+        apiError(res, 409, "task_not_active",
+          decision.taskIsTerminal(task)
+            ? "任务已经" + (decision.TASK_STATUS_LABELS[task.status] || task.status) +
+              "，不能再暂停"
+            : "任务正在执行中，不能暂停");
+        return;
+      }
+      const backup = {
+        status: task.status, pausedAt: task.pausedAt, pausedBy: task.pausedBy,
+        pauseScheduledAt: task.pauseScheduledAt, updatedAt: task.updatedAt
+      };
+      task.status = "paused";
+      task.pausedAt = now;
+      task.pausedBy = actor;
+      task.pauseScheduledAt = task.scheduledAt;
+      task.updatedAt = now;
+      const le = addTaskLog(task, "task_pause",
+        "暂停任务：原计划生效时间 " + task.scheduledAt + "，恢复后重新计时");
+      save(okResp, function () {
+        task.status = backup.status; task.pausedAt = backup.pausedAt;
+        task.pausedBy = backup.pausedBy;
+        task.pauseScheduledAt = backup.pauseScheduledAt;
+        task.updatedAt = backup.updatedAt;
+        const i = decisionStore.logs.indexOf(le);
+        if (i !== -1) decisionStore.logs.splice(i, 1);
+      });
+      return;
+    }
+
+    /* ---- POST .../:id/resume：恢复暂停的任务（可给新时间） ---- */
+    if (sub === "resume" && req.method === "POST") {
+      if (task.status !== "paused") {
+        apiError(res, 409, "task_not_paused",
+          task.status === "scheduled" ? "任务正在等待生效，无需恢复"
+          : "只有已暂停的任务可以恢复（当前：" +
+            (decision.TASK_STATUS_LABELS[task.status] || task.status) + "）");
+        return;
+      }
+      // 给了新生效时间就必须是未来；没给：原时间仍在未来则沿用，已过则立即（下轮询）执行
+      let nextAt = null;
+      if (payload.scheduledAt != null && payload.scheduledAt !== "") {
+        const wc = decision.validateScheduledAt(payload.scheduledAt);
+        if (!wc.ok) { apiError(res, wc.status, wc.code, wc.message); return; }
+        nextAt = wc;
+      } else if (Date.parse(task.pauseScheduledAt || task.scheduledAt) > Date.now()) {
+        nextAt = { value: task.pauseScheduledAt || task.scheduledAt,
+                   ms: Date.parse(task.pauseScheduledAt || task.scheduledAt) };
+      }
+      if (nextAt && d && d.deadline && Date.parse(d.deadline) <= nextAt.ms) {
+        apiError(res, 409, "scheduled_after_deadline",
+          "恢复后的生效时间晚于批次截止时间（" + d.deadline + "），请选择更早的时间");
+        return;
+      }
+      const backup = {
+        status: task.status, scheduledAt: task.scheduledAt,
+        scheduledAtMs: task.scheduledAtMs, resumedAt: task.resumedAt,
+        pauseScheduledAt: task.pauseScheduledAt, updatedAt: task.updatedAt
+      };
+      task.status = "scheduled";
+      task.resumedAt = now;
+      task.updatedAt = now;
+      let detail;
+      if (nextAt) {
+        task.scheduledAt = nextAt.value;
+        task.scheduledAtMs = nextAt.ms;
+        detail = "恢复任务：新生效时间 " + nextAt.value;
+      } else {
+        // 原计划时间已过：立即进入待执行（scheduledAt 保持过去时间，下轮询即触发）
+        task.scheduledAtMs = Date.now();
+        detail = "恢复任务：原计划时间已过，将立即执行";
+      }
+      const le = addTaskLog(task, "task_resume", detail);
+      save(okResp, function () {
+        task.status = backup.status; task.scheduledAt = backup.scheduledAt;
+        task.scheduledAtMs = backup.scheduledAtMs; task.resumedAt = backup.resumedAt;
+        task.pauseScheduledAt = backup.pauseScheduledAt;
+        task.updatedAt = backup.updatedAt;
+        const i = decisionStore.logs.indexOf(le);
+        if (i !== -1) decisionStore.logs.splice(i, 1);
+      });
+      return;
+    }
+
+    /* ---- POST .../:id/cancel：取消尚未开始的任务 ---- */
+    if (sub === "cancel" && req.method === "POST") {
+      if (task.status !== "scheduled" && task.status !== "paused") {
+        apiError(res, 409, "task_not_cancellable",
+          decision.taskIsTerminal(task)
+            ? "任务已经" + (decision.TASK_STATUS_LABELS[task.status] || task.status) +
+              "，不能取消"
+            : "任务正在执行中，不能取消");
+        return;
+      }
+      if (!d) {
+        apiError(res, 404, "decision_gone", "任务对应的草案已不存在，无法取消");
+        return;
+      }
+      const backup = {
+        status: task.status, cancelledAt: task.cancelledAt,
+        cancelReason: task.cancelReason, cancelBy: task.cancelBy,
+        finishedAt: task.finishedAt, updatedAt: task.updatedAt,
+        dStatus: d.status, dActive: d.activeTaskId, dUpdated: d.updatedAt
+      };
+      task.status = "cancelled";
+      task.cancelledAt = now;
+      task.finishedAt = now;
+      task.cancelReason = typeof payload.reason === "string" ? payload.reason.slice(0, 500) : null;
+      task.cancelBy = actor;
+      task.updatedAt = now;
+      // 取消后草案退回待执行：可重新发布或手动执行
+      d.status = "ready";
+      d.activeTaskId = null;
+      d.updatedAt = now;
+      const le = addTaskLog(task, "task_cancel",
+        "取消尚未开始的定时任务" +
+        (task.cancelReason ? "：" + task.cancelReason : "") +
+        "（草案退回待执行，可重新发布）");
+      save(okResp, function () {
+        task.status = backup.status; task.cancelledAt = backup.cancelledAt;
+        task.cancelReason = backup.cancelReason; task.cancelBy = backup.cancelBy;
+        task.finishedAt = backup.finishedAt; task.updatedAt = backup.updatedAt;
+        d.status = backup.dStatus; d.activeTaskId = backup.dActive;
+        d.updatedAt = backup.dUpdated;
+        const i = decisionStore.logs.indexOf(le);
+        if (i !== -1) decisionStore.logs.splice(i, 1);
+      });
+      return;
+    }
+
+    /* ---- POST .../:id/retry：失败/部分成功/阻断任务的失败重试 ---- */
+    if (sub === "retry" && req.method === "POST") {
+      if (task.status === "scheduled" || task.status === "paused" ||
+          task.status === "running") {
+        apiError(res, 409, "task_not_finished",
+          "任务尚未结束（" + (decision.TASK_STATUS_LABELS[task.status] || task.status) +
+          "），不能重试；可暂停或取消");
+        return;
+      }
+      if (task.status === "succeeded") {
+        apiError(res, 409, "task_succeeded",
+          "任务已全部成功，无需也不能重试（执行过程幂等，成功条目不会重复处理）");
+        return;
+      }
+      if (task.status === "cancelled") {
+        apiError(res, 409, "task_cancelled",
+          "任务已被取消，不能重试；请在草案上重新发布");
+        return;
+      }
+      if (!d) {
+        apiError(res, 404, "decision_gone", "任务对应的草案已不存在，无法重试");
+        return;
+      }
+      if (!batch) {
+        apiError(res, 404, "batch_gone", "所属审阅批次已不存在，无法重试");
+        return;
+      }
+      if (batch.status === "archived") {
+        apiError(res, 409, "batch_archived", "批次已归档，不能重试执行");
+        return;
+      }
+      if (decision.isOverdue(d.deadline)) {
+        apiError(res, 409, "decision_expired",
+          "批次已过截止时间，草案已过期，不能重试；请先调整批次截止时间");
+        return;
+      }
+      if (d.status !== "ready") {
+        apiError(res, 409, "decision_not_ready",
+          "草案当前不是待执行状态（" + decision.STATUS_LABELS[d.status] + "），不能重试");
+        return;
+      }
+      // 可选：用当前编辑区文本重新锁定；不给则沿用发布时锁定的文本。
+      // 只有重新锁定（用户确认以当前文本/批注/批次版本为准）时才推进版本基线；
+      // 普通“立即重试”沿用发布锁，因此仍冲突的条目会继续被判冲突，不会被误执行。
+      const relock = payload.paragraphs != null;
+      let lockParas = task.lock.paragraphs;
+      let lockTextRev = task.lock.textRev;
+      if (relock) {
+        const vc = core.validateSnapshotPayload(
+          Object.assign({ name: "task-retry-lock" }, { paragraphs: payload.paragraphs }));
+        if (!vc.ok) { apiError(res, vc.status, vc.code, "重试锁定文本无效：" + vc.message); return; }
+        lockParas = vc.value.paragraphs;
+        lockTextRev = decision.textContentRev(lockParas);
+      }
+      // 重试时间：不给 → 立即（下轮询）；给了 → 必须未来且不晚于截止
+      let runAt = { value: now, ms: Date.now() };
+      if (payload.scheduledAt != null && payload.scheduledAt !== "") {
+        const wc = decision.validateScheduledAt(payload.scheduledAt);
+        if (!wc.ok) { apiError(res, wc.status, wc.code, wc.message); return; }
+        runAt = wc;
+      }
+      if (d.deadline && Date.parse(d.deadline) <= runAt.ms) {
+        apiError(res, 409, "scheduled_after_deadline",
+          "重试生效时间晚于批次截止时间（" + d.deadline + "），请选择更早的时间");
+        return;
+      }
+
+      const backup = {
+        status: task.status, scheduledAt: task.scheduledAt,
+        scheduledAtMs: task.scheduledAtMs, finishedAt: task.finishedAt,
+        blockReason: task.blockReason, lastError: task.lastError,
+        attemptsLen: task.attempts.length, updatedAt: task.updatedAt,
+        lockParas: task.lock.paragraphs, lockTextRev: task.lock.textRev,
+        lockAnnRev: task.lock.annotationRev, lockBatchRev: task.lock.batchRev,
+        lockAt: task.lock.at,
+        dStatus: d.status, dActive: d.activeTaskId, dUpdated: d.updatedAt,
+        dBaseline: d.baselineParagraphs, dTextRev: d.textRev,
+        dAnnRev: d.annotationRev, dBatchRev: d.batchRev,
+        itemUpdated: d.items.map(function (it) {
+          return { id: it.annotationId, t: it.annotationUpdatedAt };
+        })
+      };
+      task.lock.paragraphs = lockParas;
+      task.lock.textRev = lockTextRev;
+      task.lock.at = now;
+      if (relock) {
+        // 重新锁定：批注/批次版本基线推进到当前（用户已核对当前内容）
+        task.lock.annotationRev = annStore.rev;
+        task.lock.batchRev = batchStore.rev;
+      }
+      task.lock.decisionRev = decisionStore.rev;
+      task.status = "scheduled";
+      task.scheduledAt = runAt.value;
+      task.scheduledAtMs = runAt.ms;
+      task.finishedAt = null;
+      task.blockReason = null;
+      task.updatedAt = now;
+      task.attempts.push({
+        at: now, kind: "retry", scheduledAt: runAt.value,
+        status: "scheduled", reason: null,
+        message: relock ? "用最新文本重新锁定后重试" : "沿用发布时锁定文本重试"
+      });
+      if (task.attempts.length > decision.LIMITS.TASK_ATTEMPT_MAX) {
+        task.attempts.splice(0, task.attempts.length - decision.LIMITS.TASK_ATTEMPT_MAX);
+      }
+      // 执行引擎以草案自身的 baseline/版本为权威：重新锁定时一并推进，
+      // 普通重试保持发布锁不动，仍冲突的条目会继续标冲突。
+      d.baselineParagraphs = lockParas;
+      d.textRev = lockTextRev;
+      if (relock) {
+        d.annotationRev = annStore.rev;
+        d.batchRev = batchStore.rev;
+        d.items.forEach(function (it) {
+          const a = findAnn(it.annotationId);
+          if (a) it.annotationUpdatedAt = a.updatedAt || a.createdAt || it.annotationUpdatedAt;
+        });
+      }
+      d.status = "scheduled";
+      d.activeTaskId = task.id;
+      d.updatedAt = now;
+
+      const remaining = d.items.length - (task.successAnnotationIds || []).length;
+      const le = addTaskLog(task, "task_retry",
+        (runAt.ms <= Date.now() + 1500 ? "立即重试" : "重新排期至 " + runAt.value) +
+        "：剩余 " + remaining + " 条未成功条目将继续执行，已成功的 " +
+        (task.successAnnotationIds || []).length + " 条不会重复处理" +
+        (relock ? "；已用最新文本/批注/批次版本重新锁定（文本版本 " +
+          lockTextRev.slice(0, 8) + "）" : "；沿用发布时锁定文本与版本"));
+      save(okResp, function () {
+        task.lock.paragraphs = backup.lockParas;
+        task.lock.textRev = backup.lockTextRev;
+        task.lock.annotationRev = backup.lockAnnRev;
+        task.lock.batchRev = backup.lockBatchRev;
+        task.lock.at = backup.lockAt;
+        task.status = backup.status; task.scheduledAt = backup.scheduledAt;
+        task.scheduledAtMs = backup.scheduledAtMs;
+        task.finishedAt = backup.finishedAt;
+        task.blockReason = backup.blockReason;
+        task.lastError = backup.lastError;
+        task.attempts.length = backup.attemptsLen;
+        task.updatedAt = backup.updatedAt;
+        d.status = backup.dStatus; d.activeTaskId = backup.dActive;
+        d.updatedAt = backup.dUpdated;
+        d.baselineParagraphs = backup.dBaseline;
+        d.textRev = backup.dTextRev;
+        d.annotationRev = backup.dAnnRev;
+        d.batchRev = backup.dBatchRev;
+        backup.itemUpdated.forEach(function (b) {
+          const it = d.items.find(function (x) { return x.annotationId === b.id; });
+          if (it) it.annotationUpdatedAt = b.t;
+        });
+        const i = decisionStore.logs.indexOf(le);
+        if (i !== -1) decisionStore.logs.splice(i, 1);
+      });
+      return;
+    }
+
+    apiError(res, 405, "method_not_allowed", "该路径不支持此方法");
+  });
+}
+
+/* ================= 决策定时执行调度器 =================
+ *
+ * 轮询 decisionStore.tasks 中 status=scheduled 且到达 scheduledAt 的任务，
+ * 服务端自动执行发布时锁定的文本（仍逐条校验文本/批注/批次版本，冲突条目
+ * 不覆盖新内容，其余条目继续完成）。
+ *
+ * 幂等：
+ *   - runningIds 内存守卫保证同一任务在本进程内不会被重复触发；
+ *   - 每次尝试只处理“尚未成功”的条目（task.successAnnotationIds 之外），
+ *     服务重启或重试都不会重复处理已成功条目；
+ *   - 重启时遗留的 running 任务标记为 interrupted（failed 终态，可重试），
+ *     绝不在启动时自动补跑，避免与落盘到一半的批注状态重复。
+ */
+const SCHEDULER_INTERVAL_MS = Number(process.env.DECISION_SCHEDULER_INTERVAL_MS) || 1000;
+const runningTaskIds = new Set();
+let schedulerTimer = null;
+
+function publicTasks(statusFilter) {
+  var list = decisionStore.tasks.slice()
+    .filter(function (t) { return !statusFilter || t.status === statusFilter; })
+    .sort(function (a, b) {
+      // 未结束的按计划时间正序，其余按结束时间倒序
+      if (decision.taskIsActive(a) !== decision.taskIsActive(b)) {
+        return decision.taskIsActive(a) ? -1 : 1;
+      }
+      var ka = decision.taskIsActive(a) ? a.scheduledAtMs : Date.parse(a.finishedAt || a.updatedAt || 0);
+      var kb = decision.taskIsActive(b) ? b.scheduledAtMs : Date.parse(b.finishedAt || b.updatedAt || 0);
+      return decision.taskIsActive(a) ? ka - kb : kb - ka;
+    })
+    .map(decision.taskSummary);
+  return { rev: decisionStore.rev, tasks: list };
+}
+
+// 定时执行成功后构造一份“执行后文本”快照对象（不立即落盘），
+// 与任务、执行记录关联；由调度器在同一事务内原子持久化。
+function buildExecutionSnapshot(d, task, afterParas, ex, now) {
+  const batchLookup = new Map(
+    batchStore.batches.map(function (b) {
+      return [b.id, { id: b.id, name: b.name, status: b.status }];
+    }));
+  return {
+    id: crypto.randomUUID(),
+    name: "定时执行 " + d.name + "（" + now.replace(/[:T]/g, "-").slice(0, 19) + "）",
+    createdAt: now,
+    updatedAt: now,
+    paragraphs: afterParas,
+    annotations: review.snapshotDigest(annStore.annotations, batchLookup),
+    annotationRev: annStore.rev,
+    // decisions/executionTasks/decisionRev 在决策落盘前一刻统一填充，
+    // 保证快照里记录的就是执行后的决策集合
+    decisions: null,
+    decisionRev: null,
+    executionTasks: null,
+    // 与执行任务关联：任务记录与执行记录都能回溯到这份快照
+    source: "decision_task",
+    taskId: task.id,
+    executionId: ex.id
+  };
+}
+
+// 整体阻断（不产生执行记录）：批次归档/草案过期/草案或批次消失。
+function blockTask(task, d, reasonCode, message, now) {
+  task.status = "blocked";
+  task.blockReason = reasonCode;
+  task.lastError = message;
+  task.finishedAt = now;
+  task.updatedAt = now;
+  if (d) {
+    d.status = "ready";
+    d.activeTaskId = null;
+    d.updatedAt = now;
+  }
+  (task.attempts || (task.attempts = [])).push({
+    at: now, kind: "auto", scheduledAt: task.scheduledAt,
+    status: "blocked", reason: reasonCode, message: message
+  });
+  return addTaskLog(task, "task_blocked",
+    "到达生效时间但任务被阻断：" + message + "（草案退回待执行，可处理后重试）");
+}
+
+// 执行到达生效时间的任务。只在任务仍为 scheduled 且未在执行中时触发。
+function fireDueTask(task) {
+  if (task.status !== "scheduled" || runningTaskIds.has(task.id)) return;
+  const d = findDecision(task.decisionId);
+  const batch = d ? findBatch(d.batchId) : null;
+  const now = new Date().toISOString();
+
+  // 记录本函数可能改动的全部字段，落盘失败时整体回滚，下一轮重新触发
+  const taskBackup = {
+    status: task.status, finishedAt: task.finishedAt, updatedAt: task.updatedAt,
+    blockReason: task.blockReason, lastError: task.lastError,
+    lastCounts: task.lastCounts, lastExecutionId: task.lastExecutionId,
+    successAnnotationIds: (task.successAnnotationIds || []).slice(),
+    snapshotId: task.snapshotId,
+    attemptsLen: Array.isArray(task.attempts) ? task.attempts.length : 0
+  };
+  const decisionBackup = d ? {
+    status: d.status, activeTaskId: d.activeTaskId, updatedAt: d.updatedAt,
+    executionsLen: d.executions.length, lastExecutionId: d.lastExecutionId
+  } : null;
+  let result = null;
+  let extraLogs = []; // 本函数通过 addTaskLog 追加的任务级记录
+
+  function restoreAll() {
+    task.status = taskBackup.status;
+    task.finishedAt = taskBackup.finishedAt;
+    task.updatedAt = taskBackup.updatedAt;
+    task.blockReason = taskBackup.blockReason;
+    task.lastError = taskBackup.lastError;
+    task.lastCounts = taskBackup.lastCounts;
+    task.lastExecutionId = taskBackup.lastExecutionId;
+    task.successAnnotationIds = taskBackup.successAnnotationIds.slice();
+    task.snapshotId = taskBackup.snapshotId;
+    if (Array.isArray(task.attempts)) task.attempts.length = taskBackup.attemptsLen;
+    if (d) {
+      d.status = decisionBackup.status;
+      d.activeTaskId = decisionBackup.activeTaskId;
+      d.updatedAt = decisionBackup.updatedAt;
+      d.lastExecutionId = decisionBackup.lastExecutionId;
+      d.executions.length = decisionBackup.executionsLen;
+    }
+    // runDecisionExecution 自身的执行/逐条记录由 rollback 移除；
+    // blockTask 与终态任务日志在这里按引用移除。
+    extraLogs.forEach(function (le) {
+      const i = decisionStore.logs.indexOf(le);
+      if (i !== -1) decisionStore.logs.splice(i, 1);
+    });
+    if (result) result.rollback();
+    decisionStore.rev--;
+    if (pendingSnapshot) {
+      const i = store.snapshots.indexOf(pendingSnapshot);
+      if (i !== -1) { store.snapshots.splice(i, 1); store.rev--; }
+      pendingSnapshot = null;
+    }
+  }
+
+  // pendingSnapshot：本次执行有成功条目时，要随决策一起落盘的自动快照。
+  // “先快照落盘、再决策落盘”串行完成：快照里嵌入执行后的决策集合
+  // （含任务与执行记录对该快照 id 的引用）。任一步失败都整体回滚，
+  // 下一轮幂等重试，不出现二次 rev 推进或关联缺失。
+  let pendingSnapshot = null;
+  function commit(cb) {
+    function finish() {
+      decisionStore.rev++;
+      persistDecisions(function (err) {
+        if (err) {
+          console.error("scheduled decision persist failed:", err);
+          restoreAll();
+          if (pendingSnapshot) {
+            const i = store.snapshots.indexOf(pendingSnapshot);
+            if (i !== -1) { store.snapshots.splice(i, 1); store.rev--; }
+            pendingSnapshot = null;
+          }
+          if (cb) cb(false);
+          return;
+        }
+        // 决策已落盘后再落批注/批次：失败不回滚已成功执行（与手动执行同策略）
+        persistAnnotations(function (aerr) {
+          if (aerr) console.error("scheduled annotation persist failed:", aerr);
+          persistBatches(function (berr) {
+            if (berr) console.error("scheduled batch persist failed:", berr);
+            if (cb) cb(true);
+          });
+        });
+      });
+    }
+
+    if (pendingSnapshot) {
+      // 先把执行后的决策集合嵌入快照（此时引用的快照 id 已确定）
+      pendingSnapshot.decisions = decision.decisionDigest(decisionStore.decisions);
+      pendingSnapshot.decisionRev = decisionStore.rev + 1;
+      pendingSnapshot.executionTasks = decision.taskDigest(decisionStore.tasks);
+      store.snapshots.push(pendingSnapshot);
+      store.rev++;
+      persist(function (serr) {
+        if (serr) {
+          console.error("scheduled execution snapshot persist failed:", serr);
+          const i = store.snapshots.indexOf(pendingSnapshot);
+          if (i !== -1) { store.snapshots.splice(i, 1); store.rev--; }
+          pendingSnapshot = null;
+          restoreAll();
+          if (cb) cb(false);
+          return;
+        }
+        finish();
+      });
+      return;
+    }
+    finish();
+  }
+
+  runningTaskIds.add(task.id);
+  function release() { runningTaskIds.delete(task.id); }
+
+  // —— 整体阻断检查（不产生执行记录，草案退回待执行）——
+  function block(reasonCode, message) {
+    const le = blockTask(task, d, reasonCode, message, now);
+    if (le) extraLogs.push(le);
+    commit(release);
+  }
+  if (!d) { block("decision_gone", "决策草案已不存在"); return; }
+  if (!batch) { block("batch_gone", "所属审阅批次已不存在"); return; }
+  if (batch.status === "archived") {
+    block("batch_archived", "批次“" + batch.name + "”已归档，定时任务不能执行");
+    return;
+  }
+  if (decision.isOverdue(d.deadline)) {
+    block("decision_expired", "批次截止时间 " + d.deadline + " 已过，草案过期");
+    return;
+  }
+  if (d.status !== "scheduled" || d.activeTaskId !== task.id) {
+    block("decision_state_changed",
+      "草案当前状态为“" + (decision.STATUS_LABELS[d.status] || d.status) +
+      "”，不再等待该任务执行");
+    return;
+  }
+  if (!task.lock || !Array.isArray(task.lock.paragraphs)) {
+    block("lock_missing", "发布时锁定的文本缺失，无法自动执行");
+    return;
+  }
+
+  // —— 逐条三版本校验执行；已成功条目幂等跳过 ——
+  result = runDecisionExecution(d, task.lock.paragraphs, {
+    actor: "系统定时执行",
+    trigger: "scheduled",
+    taskId: task.id,
+    skipAnnotationIds: task.successAnnotationIds || [],
+    // 部分成功时不立即把草案置 executed：由任务终态统一决定，
+    // 保证失败重试仍可继续处理剩余条目。
+    markExecuted: false
+  });
+  const c = result.ex.counts;
+  const successNow = result.successIds.filter(function (id) {
+    return (task.successAnnotationIds || []).indexOf(id) === -1;
+  });
+  task.successAnnotationIds = (task.successAnnotationIds || []).concat(successNow);
+  task.lastCounts = c;
+  task.lastExecutionId = result.ex.id;
+  task.updatedAt = now;
+
+  const totalItems = d.items.length;
+  // 全部条目都必须在本次或之前的尝试中成功，才算 succeeded；
+  // 本次仍有冲突（即使其他条目早已成功）也只能是 partial。
+  const successSet = new Set(task.successAnnotationIds);
+  const allDone = c.conflict === 0 &&
+    d.items.every(function (it) { return successSet.has(it.annotationId); });
+
+  function setTerminal(status) {
+    task.status = status;
+    task.finishedAt = now;
+    task.attempts.push({
+      at: now, kind: "auto", scheduledAt: task.scheduledAt,
+      status: status, counts: c, executionId: result.ex.id, reason: null
+    });
+  }
+  function logTask(action, detail) {
+    const le = {
+      decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
+      at: now, actor: "系统定时执行", action: action, detail: detail,
+      annotationId: null, taskId: task.id
+    };
+    addDecisionLog(le);
+    extraLogs.push(le);
+  }
+
+  if (allDone) {
+    setTerminal("succeeded");
+    d.status = "executed";
+    d.activeTaskId = null;
+    logTask("task_succeeded",
+      "定时执行全部成功：共 " + task.successAnnotationIds.length + " 条；执行记录 " +
+      result.ex.id.slice(0, 8));
+  } else if (task.successAnnotationIds.length > 0) {
+    setTerminal("partial");
+    d.status = "ready";
+    d.activeTaskId = null;
+    logTask("task_partial",
+      "定时执行部分成功：成功 " + task.successAnnotationIds.length + "/" + totalItems +
+      "；本次冲突 " + c.conflict + "、跳过 " + c.skipped +
+      "。冲突条目不覆盖新内容，可处理后失败重试（成功条目不会重复处理）");
+  } else {
+    setTerminal("failed");
+    d.status = "ready";
+    d.activeTaskId = null;
+    logTask("task_failed",
+      "定时执行没有成功条目：冲突 " + c.conflict + "、跳过 " + c.skipped +
+      "（草案退回待执行，可失败重试）");
+  }
+
+  // 有成功条目：先构造自动快照（内存），随后“先快照落盘、再决策落盘”。
+  if (result.ex.applied) {
+    pendingSnapshot = buildExecutionSnapshot(d, task, result.afterParas, result.ex, now);
+    result.ex.snapshotId = pendingSnapshot.id;
+    task.snapshotId = pendingSnapshot.id;
+  }
+
+  commit(function afterCommit(ok) {
+    release();
+  });
+}
+
+function schedulerTick() {
+  if (runningTaskIds.size > 0) return; // 上一个任务仍在落盘，等下一轮
+  const nowMs = Date.now();
+  // 每轮只触发最早到期的一个任务：多个任务同轮触发时其内存改动与
+  // rev 推进会交叉，串行化后回滚与计数都互不影响（其余下轮再触发）。
+  const due = decisionStore.tasks
+    .filter(function (t) {
+      return t.status === "scheduled" && Number(t.scheduledAtMs) <= nowMs;
+    })
+    .sort(function (a, b) { return Number(a.scheduledAtMs) - Number(b.scheduledAtMs); });
+  if (!due.length) return;
+  try {
+    fireDueTask(due[0]);
+  } catch (e) {
+    console.error("scheduled decision fire failed:", e);
+  }
+}
+
+// 重启恢复：running 是上一进程崩溃/被杀时未及落终态的任务，
+// 不自动补跑（可能批注已落盘一半），标记 interrupted 等待人工重试。
+function recoverInterruptedTasks() {
+  let changed = false;
+  decisionStore.tasks.forEach(function (t) {
+    if (t.status === "running") {
+      const now = new Date().toISOString();
+      t.status = "failed";
+      t.finishedAt = now;
+      t.updatedAt = now;
+      t.blockReason = "interrupted";
+      t.lastError = "服务重启时该任务正在执行，已中断，请核对执行记录后失败重试（成功条目不会重复处理）";
+      const d = findDecision(t.decisionId);
+      if (d && d.status === "scheduled") { d.status = "ready"; d.activeTaskId = null; }
+      addTaskLog(t, "task_interrupted",
+        "服务重启时任务正在执行，已自动标记为失败，可失败重试（已成功条目不会重复处理）");
+      changed = true;
+    }
+  });
+  if (changed) {
+    decisionStore.rev++;
+    persistDecisions(function (err) {
+      if (err) console.error("recover interrupted tasks persist failed:", err);
+    });
+  }
+}
+
+function startScheduler() {
+  if (schedulerTimer) return;
+  recoverInterruptedTasks();
+  schedulerTimer = setInterval(schedulerTick, SCHEDULER_INTERVAL_MS);
+  if (schedulerTimer.unref) schedulerTimer.unref();
+}
+
 /* ================= 路由 ================= */
 
 function handleAPI(req, res, pathname, urlObj) {
@@ -2552,6 +3606,10 @@ function handleAPI(req, res, pathname, urlObj) {
   }
   if (parts[1] === "review-decisions" && parts.length <= 4) {
     handleReviewDecisions(req, res, parts, urlObj);
+    return;
+  }
+  if (parts[1] === "execution-tasks" && parts.length <= 4) {
+    handleExecutionTasks(req, res, parts, urlObj);
     return;
   }
   apiError(res, 404, "not_found", "接口不存在");
@@ -2600,6 +3658,9 @@ http.createServer((req, res) => {
 
 // 启动时按批次成员表对账批注上的冗余归属字段（兼容批次功能上线前的旧批注文件）
 syncAnnotationBatchFields();
+
+// 启动决策定时执行调度器：恢复中断任务后按 DECISION_SCHEDULER_INTERVAL_MS 轮询
+startScheduler();
 
 module.exports = {
   core, review, decision,

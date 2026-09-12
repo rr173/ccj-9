@@ -24,8 +24,31 @@
     items: [],
     filterStatus: "",
     lastAnnRev: null,
-    lastBatchRev: null
+    lastBatchRev: null,
+    tasks: []
   };
+
+  // 剩余时间（毫秒）；过去返回 0
+  function remainMs(scheduledAtMs) {
+    return Math.max(0, Number(scheduledAtMs) - Date.now());
+  }
+  function formatRemain(ms) {
+    if (!ms || ms <= 0) return "即将执行";
+    var s = Math.round(ms / 1000);
+    var d = Math.floor(s / 86400); s -= d * 86400;
+    var h = Math.floor(s / 3600); s -= h * 3600;
+    var m = Math.floor(s / 60); s -= m * 60;
+    if (d > 0) return "剩余 " + d + " 天 " + h + " 小时";
+    if (h > 0) return "剩余 " + h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+    return "剩余 " + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+  }
+  // datetime-local 输入框初值：本地时区，step=1
+  function localDTInputValue(d) {
+    d = d || new Date(Date.now() + 60 * 1000);
+    var p = function (n) { return String(n).padStart(2, "0"); };
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+      "T" + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
 
   /* ---------- 小工具 ---------- */
 
@@ -156,9 +179,15 @@
 
   var STATUS_CLASS = {
     drafting: "dc-drafting", voting: "dc-voting",
-    ready: "dc-ready", executed: "dc-executed"
+    ready: "dc-ready", scheduled: "dc-scheduled", executed: "dc-executed"
+  };
+  var TASK_STATUS_CLASS = {
+    scheduled: "tk-scheduled", paused: "tk-paused", running: "tk-running",
+    succeeded: "tk-succeeded", partial: "tk-partial", failed: "tk-failed",
+    blocked: "tk-blocked", cancelled: "tk-cancelled"
   };
   function statusLabel(s) { return core.STATUS_LABELS[s] || s; }
+  function taskStatusLabel(s) { return core.TASK_STATUS_LABELS[s] || s; }
   function dispositionLabel(d) { return d ? core.DISPOSITION_LABELS[d] : "未定"; }
   function voteLabel(v) { return core.VOTE_LABELS[v] || v; }
   var ITEM_STATE_CLASS = {
@@ -189,9 +218,13 @@
 
   function loadList(silent) {
     if (!silent) setNote("正在加载决策草案……");
-    return api("GET", "/api/review-decisions").then(function (r) {
-      state.items = (r.data && r.data.decisions) || [];
-      state.rev = r.rev != null ? r.rev : (r.data && r.data.rev);
+    return Promise.all([
+      api("GET", "/api/review-decisions"),
+      api("GET", "/api/execution-tasks")
+    ]).then(function (rs) {
+      state.items = (rs[0].data && rs[0].data.decisions) || [];
+      state.rev = rs[0].rev != null ? rs[0].rev : (rs[0].data && rs[0].data.rev);
+      state.tasks = (rs[1].data && rs[1].data.tasks) || [];
       render();
       setNote("");
     }).catch(function (err) {
@@ -202,6 +235,10 @@
   function render() {
     revLabel.textContent = "版本 " + (state.rev == null ? "—" : state.rev);
     listBox.innerHTML = "";
+    var activeTasks = state.tasks.filter(function (t) {
+      return t.status === "scheduled" || t.status === "paused" || t.status === "running";
+    });
+    if (activeTasks.length) listBox.appendChild(renderQueue(activeTasks));
     var items = state.items.filter(function (d) {
       return !state.filterStatus || d.status === state.filterStatus;
     });
@@ -214,6 +251,429 @@
       return;
     }
     items.forEach(function (d) { listBox.appendChild(renderCard(d)); });
+  }
+
+  /* ---------- 执行队列 ---------- */
+
+  function renderQueue(tasks) {
+    var box = el("div", "task-queue");
+    var head = el("div", "task-queue-head");
+    head.appendChild(el("span", "task-queue-title", "⏰ 执行队列（" + tasks.length + "）"));
+    head.appendChild(button("查看全部/记录…", "btn-mini", function () { openQueuePanel(); }));
+    box.appendChild(head);
+    tasks.forEach(function (t) { box.appendChild(renderTaskCard(t, true)); });
+    return box;
+  }
+
+  function renderTaskCard(t, compact) {
+    var card = el("div", "task-card task-" + t.status);
+    var row1 = el("div", "task-row task-row-main");
+    var name = el("span", "task-name");
+    name.appendChild(bdi(t.decisionName));
+    row1.appendChild(name);
+    row1.appendChild(el("span", "task-status " + TASK_STATUS_CLASS[t.status],
+      taskStatusLabel(t.status)));
+    if (t.status === "scheduled" || t.status === "paused") {
+      var remain = el("span", "task-remain" + (t.status === "paused" ? " is-paused" : ""));
+      remain.setAttribute("dir", "ltr");
+      remain.dataset.taskRemain = String(t.scheduledAtMs);
+      remain.dataset.taskStatus = t.status;
+      remain.textContent = t.status === "paused" ? "已暂停" : formatRemain(remainMs(t.scheduledAtMs));
+      row1.appendChild(remain);
+    }
+    card.appendChild(row1);
+
+    var meta = el("div", "task-meta");
+    meta.setAttribute("dir", "ltr");
+    meta.textContent = "计划 " + formatTime(t.scheduledAt) +
+      " · 发布 " + formatTime(t.publishedAt) +
+      " · 发布人 " + (t.publishedBy || "匿名");
+    card.appendChild(meta);
+
+    if (t.lock) {
+      var lock = el("div", "task-lock");
+      lock.setAttribute("dir", "ltr");
+      lock.textContent = "已锁定：文本 " + (t.lock.textRev || "—").slice(0, 8) +
+        "（" + t.lock.paragraphCount + " 段）· 批注 v" + t.lock.annotationRev +
+        " · 批次 v" + t.lock.batchRev;
+      card.appendChild(lock);
+    }
+    if (t.status === "partial" || t.status === "failed" || t.status === "blocked" ||
+        t.status === "succeeded") {
+      var r = el("div", "task-meta");
+      r.textContent = (t.status === "succeeded" ? "全部成功" :
+        t.status === "blocked" ? "阻断原因：" + (t.blockReason || "") :
+        "结束于 " + formatTime(t.finishedAt)) +
+        (t.lastCounts ? "（成功 " + t.lastCounts.success + " / 冲突 " +
+          t.lastCounts.conflict + " / 跳过 " + t.lastCounts.skipped + "）" : "");
+      card.appendChild(r);
+    }
+
+    if (!compact) {
+      var acts = el("div", "task-actions");
+      if (t.status === "scheduled") {
+        acts.appendChild(button("暂停", "btn-mini", function () { taskPause(t); }));
+        acts.appendChild(button("取消", "btn-mini danger", function () { taskCancel(t); }));
+      } else if (t.status === "paused") {
+        acts.appendChild(button("恢复…", "btn-mini primary", function () { taskResume(t); }));
+        acts.appendChild(button("取消", "btn-mini danger", function () { taskCancel(t); }));
+      }
+      if (t.status === "partial" || t.status === "failed" || t.status === "blocked") {
+        acts.appendChild(button("失败重试…", "btn-mini primary", function () { taskRetry(t); }));
+      }
+      acts.appendChild(button("队列记录", "btn-mini", function () { openTaskLogs(t); }));
+      acts.appendChild(button("打开草案", "btn-mini", function () { openDetail(t.decisionId); }));
+      card.appendChild(acts);
+    } else {
+      var mini = el("div", "task-actions");
+      if (t.status === "scheduled") {
+        mini.appendChild(button("暂停", "btn-mini", function () { taskPause(t); }));
+        mini.appendChild(button("取消", "btn-mini danger", function () { taskCancel(t); }));
+      } else if (t.status === "paused") {
+        mini.appendChild(button("恢复…", "btn-mini primary", function () { taskResume(t); }));
+        mini.appendChild(button("取消", "btn-mini danger", function () { taskCancel(t); }));
+      }
+      mini.appendChild(button("详情", "btn-mini", function () { openQueuePanel(t.id); }));
+      card.appendChild(mini);
+    }
+    return card;
+  }
+
+  // 每秒刷新剩余时间，到点后静默重新加载（自动执行结果由服务端轮询拿到）
+  setInterval(function () {
+    var nodes = document.querySelectorAll("[data-task-remain]");
+    var due = false;
+    Array.prototype.forEach.call(nodes, function (n) {
+      if (n.dataset.taskStatus === "paused") { n.textContent = "已暂停"; return; }
+      var ms = remainMs(Number(n.dataset.taskRemain));
+      n.textContent = formatRemain(ms);
+      if (ms <= 0) due = true;
+    });
+    if (due && !document.hidden) loadList(true);
+  }, 1000);
+
+  function openQueuePanel(focusTaskId) {
+    var box = el("div", "task-panel-box");
+    var filterBar = el("div", "batch-log-filter");
+    var sel = document.createElement("select");
+    [["", "全部任务"], ["scheduled", "等待生效"], ["paused", "已暂停"],
+     ["succeeded", "全部成功"], ["partial", "部分成功"],
+     ["failed", "失败"], ["blocked", "已阻断"], ["cancelled", "已取消"]]
+      .forEach(function (p) {
+        var o = el("option", null, p[1]); o.value = p[0]; sel.appendChild(o);
+      });
+    filterBar.appendChild(sel);
+    var refreshBtn = button("刷新", null, null);
+    filterBar.appendChild(refreshBtn);
+    box.appendChild(filterBar);
+    var list = el("div", "task-full-list");
+    box.appendChild(list);
+
+    var m = openModal("决策执行队列", box, {
+      buttons: [button("关闭", null, function () { m.close(); })]
+    });
+    function draw() {
+      api("GET", "/api/execution-tasks" + (sel.value ? "?status=" + sel.value : ""))
+        .then(function (r) {
+          var tasks = (r.data && r.data.tasks) || [];
+          list.innerHTML = "";
+          if (!tasks.length) {
+            list.appendChild(el("div", "review-empty", "该状态下没有执行队列任务。"));
+            return;
+          }
+          tasks.forEach(function (t) {
+            var c = renderTaskCard(t, false);
+            if (t.id === focusTaskId) c.classList.add("is-focus");
+            list.appendChild(c);
+          });
+        }).catch(function (e) {
+          list.innerHTML = "";
+          list.appendChild(el("div", "composer-error", "加载执行队列失败：" + e.message));
+        });
+    }
+    sel.addEventListener("change", draw);
+    refreshBtn.addEventListener("click", draw);
+    draw();
+  }
+
+  /* ---------- 发布到执行队列 ---------- */
+
+  function openPublishDialog(decisionId) {
+    var box = el("div", "decision-composer");
+    var errLine = el("div", "composer-error");
+    errLine.setAttribute("role", "alert");
+
+    // 先读草案详情，确保在最新数据上发布
+    api("GET", "/api/review-decisions/" + decisionId).then(function (r) {
+      var data = r.data;
+      var d = data.decision;
+      if (d.status !== "ready") {
+        errLine.textContent = "只有“待执行”草案可以发布，当前状态：" + statusLabel(d.status);
+      }
+      box.appendChild(el("p", "muted",
+        "发布后，草案的方案、批注与批次版本将被锁定，服务端会在你指定的生效时间自动执行。" +
+        "到点时仍会逐条校验文本、批注和批次：冲突条目不会覆盖新内容，其余条目照常完成。" +
+        "执行结果会自动保存快照并和任务关联。"));
+
+      var timeInput = document.createElement("input");
+      timeInput.type = "datetime-local";
+      timeInput.step = "1";
+      timeInput.className = "composer-author";
+      timeInput.value = localDTInputValue();
+      box.appendChild(labeled("生效时间（必须晚于现在）", timeInput));
+
+      if (d.deadline) {
+        box.appendChild(el("p", "muted", "批次截止时间：" + formatTime(d.deadline) +
+          "（生效时间必须更早，否则到点会被过期阻断）"));
+      }
+
+      var actorInput = document.createElement("input");
+      actorInput.type = "text";
+      actorInput.className = "composer-author";
+      actorInput.maxLength = 50;
+      actorInput.placeholder = "发布者署名（可选，默认匿名/系统记录）";
+      actorInput.value = savedActor();
+      box.appendChild(labeled("发布负责人", actorInput));
+
+      box.appendChild(errLine);
+
+      var okBtn;
+      var m = openModal("发布到执行队列：" + d.name, box, {
+        buttons: [
+          button("取消", null, function () { m.close(); }),
+          (okBtn = button("确认发布并锁定", "primary", function () {
+            errLine.textContent = "";
+            if (!timeInput.value) {
+              errLine.textContent = "必须指定未来的生效时间（表单内容已保留）。";
+              return;
+            }
+            var when = new Date(timeInput.value);
+            if (isNaN(when.getTime())) {
+              errLine.textContent = "生效时间格式无法识别。";
+              return;
+            }
+            if (when.getTime() <= Date.now()) {
+              errLine.textContent = "生效时间必须晚于当前时间，请重新选择（表单内容已保留）。";
+              return;
+            }
+            okBtn.disabled = true;
+            api("POST", "/api/execution-tasks", {
+              decisionId: decisionId,
+              scheduledAt: when.toISOString(),
+              paragraphs: Editor.serialize().paragraphs,
+              actor: actorInput.value
+            }, { ifMatch: state.rev }).then(function (rr) {
+              rememberActor(actorInput.value.trim());
+              m.close();
+              toast("已发布到执行队列，计划 " + formatTime(rr.data.task.scheduledAt) +
+                " 自动执行；方案、批注与批次版本已锁定");
+              return loadList(true).then(function () { openQueuePanel(rr.data.task.id); });
+            }).catch(function (e) {
+              okBtn.disabled = false;
+              handleError(e, function (msg) { errLine.textContent = msg; }, "发布");
+            });
+          }))
+        ]
+      });
+      if (d.status !== "ready") okBtn.disabled = true;
+    }).catch(function (e) {
+      box.appendChild(el("div", "composer-error", "读取草案失败：" + e.message));
+      openModal("发布到执行队列", box, {
+        buttons: [button("关闭", null, function () {})]
+      });
+    });
+  }
+
+  function taskAction(t, action, body, label) {
+    return api("POST", "/api/execution-tasks/" + t.id + "/" + action,
+      body || { actor: savedActor() || undefined },
+      { ifMatch: state.rev }).then(function (r) {
+        toast(label + "成功");
+        return loadList(true).then(function () { return r; });
+      });
+  }
+
+  function taskPause(t) {
+    taskAction(t, "pause", null, "暂停").catch(function (e) {
+      toast("暂停失败：" + e.message, "error");
+    });
+  }
+
+  function taskCancel(t) {
+    if (!window.confirm("取消该定时执行任务吗？\n取消后草案回到“待执行”，可重新发布或手动执行。")) return;
+    api("POST", "/api/execution-tasks/" + t.id + "/cancel",
+      { actor: savedActor() || undefined }, { ifMatch: state.rev })
+      .then(function () {
+        toast("任务已取消，草案回到待执行");
+        return loadList(true);
+      }).catch(function (e) {
+        if (e.status === 409 && e.code === "version_conflict") {
+          toast("版本冲突：队列已被其他人更新，已刷新，请重试", "error");
+          loadList(true);
+        } else toast("取消失败：" + e.message, "error");
+      });
+  }
+
+  function taskResume(t) {
+    var box = el("div", "decision-composer");
+    var errLine = el("div", "composer-error");
+    box.appendChild(el("p", "muted",
+      "不填新时间：若原计划时间还在未来则按原时间执行，已过则立即执行。填写新时间则按新时间执行。"));
+    var timeInput = document.createElement("input");
+    timeInput.type = "datetime-local";
+    timeInput.step = "1";
+    timeInput.className = "composer-author";
+    box.appendChild(labeled("新生效时间（可选）", timeInput));
+    box.appendChild(errLine);
+    var okBtn;
+    var m = openModal("恢复任务：" + t.decisionName, box, {
+      buttons: [
+        button("取消", null, function () { m.close(); }),
+        (okBtn = button("恢复", "primary", function () {
+          errLine.textContent = "";
+          var body = { actor: savedActor() || undefined };
+          if (timeInput.value) {
+            var when = new Date(timeInput.value);
+            if (isNaN(when.getTime())) { errLine.textContent = "时间格式无法识别"; return; }
+            if (when.getTime() <= Date.now()) {
+              errLine.textContent = "新生效时间必须晚于当前时间（表单内容已保留）";
+              return;
+            }
+            body.scheduledAt = when.toISOString();
+          }
+          okBtn.disabled = true;
+          api("POST", "/api/execution-tasks/" + t.id + "/resume", body,
+            { ifMatch: state.rev }).then(function () {
+              m.close();
+              toast(body.scheduledAt ? "任务已按新时间恢复" : "任务已恢复");
+              return loadList(true);
+            }).catch(function (e) {
+              okBtn.disabled = false;
+              handleError(e, function (msg) { errLine.textContent = msg; }, "恢复");
+            });
+        }))
+      ]
+    });
+  }
+
+  function taskRetry(t) {
+    var box = el("div", "decision-composer");
+    var errLine = el("div", "composer-error");
+    box.appendChild(el("p", "muted",
+      "失败重试幂等：之前已经成功的条目不会重复处理，只继续完成剩余条目。" +
+      "不选新时间将立即重试；可选择用当前编辑区文本重新锁定。"));
+    var timeInput = document.createElement("input");
+    timeInput.type = "datetime-local";
+    timeInput.step = "1";
+    timeInput.className = "composer-author";
+    box.appendChild(labeled("重新排期时间（可选，不填=立即重试）", timeInput));
+    var relockCb = document.createElement("input");
+    relockCb.type = "checkbox";
+    var relockLabel = el("label", "batch-field");
+    relockLabel.appendChild(relockCb);
+    relockLabel.appendChild(document.createTextNode(" 用当前编辑区文本重新锁定（默认沿用发布时锁定文本）"));
+    box.appendChild(relockLabel);
+    box.appendChild(errLine);
+    var okBtn;
+    var m = openModal("失败重试：" + t.decisionName, box, {
+      buttons: [
+        button("取消", null, function () { m.close(); }),
+        (okBtn = button("重试", "primary", function () {
+          errLine.textContent = "";
+          var body = { actor: savedActor() || undefined };
+          if (timeInput.value) {
+            var when = new Date(timeInput.value);
+            if (isNaN(when.getTime())) { errLine.textContent = "时间格式无法识别"; return; }
+            if (when.getTime() <= Date.now()) {
+              errLine.textContent = "重新排期时间必须晚于当前时间（表单内容已保留）";
+              return;
+            }
+            body.scheduledAt = when.toISOString();
+          }
+          if (relockCb.checked) body.paragraphs = Editor.serialize().paragraphs;
+          okBtn.disabled = true;
+          api("POST", "/api/execution-tasks/" + t.id + "/retry", body,
+            { ifMatch: state.rev }).then(function () {
+              m.close();
+              toast("已提交失败重试，成功条目不会重复处理");
+              return loadList(true);
+            }).catch(function (e) {
+              okBtn.disabled = false;
+              handleError(e, function (msg) { errLine.textContent = msg; }, "失败重试");
+            });
+        }))
+      ]
+    });
+  }
+
+  function openTaskLogs(t) {
+    var box = el("div", "batch-logs");
+    box.appendChild(el("p", "muted",
+      "发布、暂停、恢复、取消、自动执行与失败重试全部记录在案，可按时间筛选。"));
+    var filterBar = el("div", "batch-log-filter");
+    var fromInput = document.createElement("input");
+    fromInput.type = "datetime-local";
+    var toInput = document.createElement("input");
+    toInput.type = "datetime-local";
+    var fromLabel = el("label", "batch-field");
+    fromLabel.appendChild(el("span", "batch-field-label", "从"));
+    fromLabel.appendChild(fromInput);
+    var toLabel = el("label", "batch-field");
+    toLabel.appendChild(el("span", "batch-field-label", "到"));
+    toLabel.appendChild(toInput);
+    filterBar.appendChild(fromLabel);
+    filterBar.appendChild(toLabel);
+    var list = el("div", "batch-log-list");
+    box.appendChild(filterBar);
+    box.appendChild(list);
+
+    function fetchLogs() {
+      var qs = [];
+      if (fromInput.value) qs.push("from=" + encodeURIComponent(new Date(fromInput.value).toISOString()));
+      if (toInput.value) qs.push("to=" + encodeURIComponent(new Date(toInput.value).toISOString()));
+      list.innerHTML = "";
+      list.appendChild(el("div", "muted", "正在加载队列记录……"));
+      api("GET", "/api/execution-tasks/" + t.id + "/logs" + (qs.length ? "?" + qs.join("&") : ""))
+        .then(function (r) {
+          list.innerHTML = "";
+          var logs = (r.data && r.data.logs) || [];
+          if (!logs.length) {
+            list.appendChild(el("div", "review-empty", "该时间范围内没有队列记录。"));
+            return;
+          }
+          logs.forEach(function (l) {
+            var item = el("div", "log-item log-" + l.action);
+            var h = el("div", "log-head");
+            h.setAttribute("dir", "ltr");
+            h.appendChild(el("span", "log-time", formatTime(l.at)));
+            h.appendChild(document.createTextNode(" · "));
+            h.appendChild(el("span", "log-action", TASK_ACTION_LABELS[l.action] || l.action));
+            h.appendChild(document.createTextNode(" · "));
+            var actor = el("span"); actor.appendChild(bdi(l.actor || "匿名"));
+            h.appendChild(actor);
+            item.appendChild(h);
+            if (l.detail) {
+              var det = el("div", "log-detail");
+              det.appendChild(bdi(l.detail));
+              item.appendChild(det);
+            }
+            list.appendChild(item);
+          });
+        }).catch(function (e) {
+          list.innerHTML = "";
+          list.appendChild(el("div", "composer-error", "读取队列记录失败：" + e.message));
+        });
+    }
+    fromInput.addEventListener("change", fetchLogs);
+    toInput.addEventListener("change", fetchLogs);
+    var m = openModal("队列记录：" + t.decisionName, box, {
+      buttons: [
+        button("按时间筛选", null, fetchLogs),
+        button("清除时间范围", null, function () { fromInput.value = ""; toInput.value = ""; fetchLogs(); }),
+        button("关闭", null, function () { m.close(); })
+      ]
+    });
+    fetchLogs();
   }
 
   function renderCard(d) {
@@ -436,6 +896,49 @@
     if (frozen) {
       modal.body.appendChild(el("p", "composer-error",
         "所属批次已归档：草案只读，不能再修改方案、投票、执行或撤销；以下为归档时的完整状态。"));
+    } else if (d.status === "scheduled") {
+      var tInfo = data.activeTask;
+      var schedP = el("p", "dc-scheduled-info");
+      var line1 = el("div", "dc-sched-line");
+      line1.setAttribute("dir", "ltr");
+      line1.textContent = "已发布到执行队列，状态：" +
+        (tInfo ? taskStatusLabel(tInfo.status) : "等待生效") +
+        " · 计划生效 " + (tInfo ? formatTime(tInfo.scheduledAt) : "—");
+      schedP.appendChild(line1);
+      if (tInfo) {
+        var rem = el("div", "dc-sched-remain");
+        rem.setAttribute("dir", "ltr");
+        rem.dataset.taskRemain = String(tInfo.scheduledAtMs);
+        rem.dataset.taskStatus = tInfo.status;
+        rem.textContent = tInfo.status === "paused" ? "任务已暂停" : formatRemain(remainMs(tInfo.scheduledAtMs));
+        schedP.appendChild(rem);
+        if (tInfo.lock) {
+          var lk = el("div", "dc-sched-lock");
+          lk.setAttribute("dir", "ltr");
+          lk.textContent = "发布时已锁定：文本 " + tInfo.lock.textRev.slice(0, 8) +
+            "（" + tInfo.lock.paragraphCount + " 段）· 批注 v" + tInfo.lock.annotationRev +
+            " · 批次 v" + tInfo.lock.batchRev;
+          schedP.appendChild(lk);
+        }
+        var btns = el("div", "dc-sched-actions");
+        if (tInfo.status === "scheduled") {
+          btns.appendChild(button("暂停任务", null, function () { taskPause(tInfo); }));
+          btns.appendChild(button("取消任务", "danger", function () {
+            taskCancel(tInfo).then(function () { refreshDetail(modal); });
+          }));
+        } else if (tInfo.status === "paused") {
+          btns.appendChild(button("恢复任务…", "primary", function () { taskResume(tInfo); }));
+          btns.appendChild(button("取消任务", "danger", function () {
+            taskCancel(tInfo).then(function () { refreshDetail(modal); });
+          }));
+        } else if (tInfo.status === "partial" || tInfo.status === "failed" ||
+                   tInfo.status === "blocked") {
+          btns.appendChild(button("失败重试…", "primary", function () { taskRetry(tInfo); }));
+        }
+        btns.appendChild(button("队列记录", null, function () { openTaskLogs(tInfo); }));
+        schedP.appendChild(btns);
+      }
+      modal.body.appendChild(schedP);
     } else if (d.status === "executed") {
       var exInfo = (data.executions || [])[data.executions.length - 1];
       modal.body.appendChild(el("p", "muted",
@@ -518,8 +1021,17 @@
         addBtn(button("保存方案修改", null, function () {
           saveItems(modal, data, rows, voterInput, showErr, null);
         }));
-        addBtn(button("执行前预览…", "primary", function () {
+        addBtn(button("执行前预览…", null, function () {
           openPreview(modal, data, rows, showErr);
+        }));
+        if (d.status === "ready") {
+          addBtn(button("发布到执行队列…", "primary", function () {
+            openPublishDialog(d.id);
+          }));
+        }
+      } else if (d.status === "scheduled") {
+        if (data.activeTask) addBtn(button("队列记录", null, function () {
+          openTaskLogs(data.activeTask);
         }));
       } else if (d.status === "executed") {
         var last = data.executions[data.executions.length - 1];
@@ -536,6 +1048,9 @@
 
   function renderItemRow(modal, data, it, voterInput, frozen, showErr) {
     var tr = el("tr");
+    // 已发布定时执行（scheduled）与已执行一样：方案与投票在服务端锁定
+    var locked = frozen || data.decision.status === "executed" ||
+                 data.decision.status === "scheduled";
 
     // 批注与位置
     var tdAnn = el("td");
@@ -559,7 +1074,7 @@
         if (it.disposition === pair[0] || (!it.disposition && pair[0] === "")) o.selected = true;
         dispSel.appendChild(o);
       });
-    if (frozen || data.decision.status === "executed") dispSel.disabled = true;
+    if (locked) dispSel.disabled = true;
     selWrap.appendChild(dispSel);
     tdPlan.appendChild(selWrap);
 
@@ -571,7 +1086,7 @@
     replInput.placeholder = "替换为的文本（中阿混排均可）";
     replInput.value = it.disposition === "replace" ? (it.replacement || "") : "";
     if (it.disposition !== "replace") replBox.style.display = "none";
-    if (frozen || data.decision.status === "executed") replInput.disabled = true;
+    if (locked) replInput.disabled = true;
     replBox.appendChild(replInput);
     tdPlan.appendChild(replBox);
     dispSel.addEventListener("change", function () {
@@ -615,7 +1130,7 @@
       var saveOne = button("保存", "btn-mini", function () {
         saveItems(modal, data, [apiRow], voterInput, showErr, saveOne);
       });
-      if (data.decision.status === "executed") saveOne.disabled = true;
+      if (locked) saveOne.disabled = true;
       tdAct.appendChild(saveOne);
       [["approve", "通过", "dc-v-approve"],
        ["reject", "驳回", "dc-v-reject"],
@@ -623,7 +1138,7 @@
         var b = button(cfg[1], "btn-mini " + cfg[2], function () {
           castVote(modal, data, it.annotationId, cfg[0], voterInput, showErr, b);
         });
-        if (data.decision.status === "drafting" || data.decision.status === "executed") b.disabled = true;
+        if (data.decision.status === "drafting" || locked) b.disabled = true;
         if (mine && mine.vote === cfg[0]) b.classList.add("is-mine");
         tdAct.appendChild(b);
       });
@@ -1014,6 +1529,28 @@
     execute_undo: "撤销执行"
   };
 
+  var TASK_ACTION_LABELS = {
+    task_publish: "发布到队列",
+    task_pause: "暂停任务",
+    task_resume: "恢复任务",
+    task_cancel: "取消任务",
+    task_auto_execute: "自动执行",
+    task_auto_execute_item_success: "自动执行·成功",
+    task_auto_execute_item_conflict: "自动执行·冲突",
+    task_auto_execute_item_skipped: "自动执行·跳过",
+    task_retry_execute: "重试执行",
+    task_retry_execute_item_success: "重试执行·成功",
+    task_retry_execute_item_conflict: "重试执行·冲突",
+    task_retry_execute_item_skipped: "重试执行·跳过",
+    task_retry: "失败重试",
+    task_succeeded: "全部成功",
+    task_partial: "部分成功",
+    task_failed: "执行失败",
+    task_blocked: "任务阻断",
+    task_interrupted: "重启中断",
+    task_undo: "撤销自动执行"
+  };
+
   function openLogs(d) {
     var box = el("div", "batch-logs");
     box.appendChild(el("p", "muted",
@@ -1144,13 +1681,40 @@
         (d.executions || []).forEach(function (ex) {
           var exl = el("div", "ann-meta" + (ex.undone ? " is-undone" : ""));
           exl.setAttribute("dir", "ltr");
-          exl.textContent = "执行 " + formatTime(ex.at) + " · 成功 " +
+          exl.textContent = (ex.trigger === "scheduled" ? "定时自动执行 "
+              : ex.trigger === "retry" ? "重试执行 " : "执行 ") +
+            formatTime(ex.at) + " · 成功 " +
             ex.counts.success + " / 冲突 " + ex.counts.conflict + " / 跳过 " +
             ex.counts.skipped + (ex.undone ? " · 已撤销" : "");
           cardEl.appendChild(exl);
         });
         box.appendChild(cardEl);
       });
+
+      // 快照保存时刻的执行队列
+      var tasks = snap.executionTasks;
+      if (Array.isArray(tasks) && tasks.length) {
+        var tTitle = el("div", "snap-section-title",
+          "执行队列（" + tasks.length + "）");
+        box.appendChild(tTitle);
+        tasks.forEach(function (t) {
+          var tc = el("div", "task-card task-" + t.status + " dc-snap-task");
+          var r1 = el("div", "task-row task-row-main");
+          var nm = el("span", "task-name"); nm.appendChild(bdi(t.decisionName));
+          r1.appendChild(nm);
+          r1.appendChild(el("span", "task-status " + (TASK_STATUS_CLASS[t.status] || ""),
+            taskStatusLabel(t.status)));
+          tc.appendChild(r1);
+          var meta = el("div", "task-meta");
+          meta.setAttribute("dir", "ltr");
+          meta.textContent = "计划 " + formatTime(t.scheduledAt) +
+            " · 发布 " + formatTime(t.publishedAt) +
+            (t.finishedAt ? " · 结束 " + formatTime(t.finishedAt) : "") +
+            " · 成功条目 " + (t.successAnnotationIds || []).length;
+          tc.appendChild(meta);
+          box.appendChild(tc);
+        });
+      }
 
       var m = openModal("快照决策：" + (snapshotName || snap.name), box, {
         buttons: [button("关闭", null, function () { m.close(); })]
@@ -1207,6 +1771,8 @@
 
   $("decision-add").addEventListener("click", openComposer);
   $("decision-refresh").addEventListener("click", function () { loadList(); });
+  var tasksBtn = $("decision-tasks");
+  if (tasksBtn) tasksBtn.addEventListener("click", function () { openQueuePanel(); });
 
   document.addEventListener("visibilitychange", function () {
     if (!document.hidden) loadList(true);
@@ -1217,6 +1783,7 @@
     reload: loadList,
     openDetail: openDetail,
     openComposerForBatch: function (batchId) { openComposer(batchId); },
+    openQueue: function () { openQueuePanel(); },
     openSnapshotDecisions: openSnapshotDecisions
   };
 
