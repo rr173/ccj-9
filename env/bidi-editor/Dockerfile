@@ -1,11 +1,17 @@
-# 纯静态站点，用 nginx 伺服；无需构建步骤
-FROM nginx:1.27-alpine
+# Node 零依赖服务：静态文件 + 快照 JSON API（/api/snapshots）
+FROM node:20-alpine
 
-# 站点文件
-COPY index.html style.css app.js /usr/share/nginx/html/
+WORKDIR /app
+COPY server.js snapshot-core.js app.js snapshots.js index.html style.css ./
 
-# 容器内监听 80；时区/字符集默认即可（页面自带 charset=utf-8）
-EXPOSE 80
+# 快照数据持久化目录（可挂卷覆盖：-v snapdata:/app/data）
+RUN mkdir -p /app/data
+ENV SNAPSHOTS_FILE=/app/data/snapshots.json
+ENV PORT=8080
+
+EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=3s \
-  CMD wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1
+  CMD wget -qO- http://127.0.0.1:8080/api/snapshots >/dev/null 2>&1 || exit 1
+
+CMD ["node", "server.js"]

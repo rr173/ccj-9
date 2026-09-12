@@ -30,6 +30,30 @@
     SAMPLES.forEach(function (s) { editor.appendChild(makePara(s.dir, s.text)); });
   }
 
+  /* ---------- 段落编辑时间 ----------
+   * 每段记录最后编辑时刻（ISO 字符串，存 data-edited-at）。
+   * 改方向也算编辑；快照会随文本、方向一起保存它。
+   * 用 WeakMap 缓存上一次文本，避免每次 input 都全量重算。
+   */
+  var textCache = new WeakMap();
+
+  function stampBlock(block, time) {
+    block.setAttribute("data-edited-at", time || new Date().toISOString());
+  }
+
+  function stampEdited(block) {
+    if (!block) return;
+    var now = new Date().toISOString();
+    stampBlock(block, now);
+    textCache.set(block, block.textContent);
+  }
+
+  function blockFromEventTarget(target) {
+    var node = target && target.nodeType ? target : null;
+    if (!node) return null;
+    return blockOf(node);
+  }
+
   /* ---------- 结构规整：保证每个段落都是 div.para[dir] ---------- */
   function normalize() {
     // 裸文本节点包进段落
@@ -38,6 +62,7 @@
         var p = makePara("auto", "");
         editor.replaceChild(p, node);
         p.appendChild(node);
+        stampBlock(p);
       } else if (node.nodeType === Node.TEXT_NODE) {
         editor.removeChild(node);
       }
@@ -50,15 +75,21 @@
           var prev = el.previousElementSibling;
           el.setAttribute("dir", prev ? prev.getAttribute("dir") || "auto" : "auto");
         }
+        if (!el.getAttribute("data-edited-at")) stampBlock(el);
       } else if (el.tagName !== "DIV") {
         // 浏览器偶尔产生 <p>/<br> 等，统一换成 div.para
         var p = makePara("auto", "");
         while (el.firstChild) p.appendChild(el.firstChild);
         editor.replaceChild(p, el);
+        stampBlock(p);
       }
     });
     // 永远保留至少一个可落光标的段落
-    if (!editor.children.length) editor.appendChild(makePara("auto", ""));
+    if (!editor.children.length) {
+      var empty = makePara("auto", "");
+      editor.appendChild(empty);
+      stampBlock(empty);
+    }
   }
 
   /* ---------- 选区工具 ---------- */
@@ -93,7 +124,10 @@
       var b = sel && blockOf(sel.anchorNode);
       blocks = b ? [b] : [editor.children[0]];
     }
-    blocks.forEach(function (b) { b.setAttribute("dir", dir); });
+    blocks.forEach(function (b) {
+      b.setAttribute("dir", dir);
+      stampEdited(b); // 改方向也是一次编辑
+    });
     updateStatus();
     editor.focus();
   }
@@ -180,7 +214,9 @@
   });
   document.getElementById("clear").addEventListener("click", function () {
     editor.innerHTML = "";
-    editor.appendChild(makePara("auto", ""));
+    var p = makePara("auto", "");
+    editor.appendChild(p);
+    stampEdited(p);
     editor.focus();
     updateStatus();
   });
@@ -200,12 +236,102 @@
     insertTextAtCaret(text.replace(/\r\n?/g, "\n"));
   });
 
-  editor.addEventListener("input", function () { normalize(); updateStatus(); });
+  editor.addEventListener("input", function (e) {
+    normalize();
+    // 只更新真正发生文本变化的段落；跨段输入（如回车）覆盖涉及的块
+    var blocks = [];
+    var hit = blockFromEventTarget(e.target);
+    if (hit) blocks.push(hit);
+    blocksInSelection().forEach(function (b) { if (blocks.indexOf(b) === -1) blocks.push(b); });
+    blocks.forEach(function (b) {
+      var text = b.textContent;
+      if (textCache.get(b) !== text) {
+        stampBlock(b);
+        textCache.set(b, text);
+      }
+    });
+    updateStatus();
+  });
   document.addEventListener("selectionchange", function () {
     if (document.activeElement === editor) updateStatus();
   });
 
+  /* ---------- 对外 API：供 snapshots.js 调用 ---------- */
+
+  // 序列化为快照载荷：{name? , paragraphs:[{dir,text,editedAt}]}
+  function serialize() {
+    normalize();
+    var paragraphs = [];
+    Array.prototype.forEach.call(editor.children, function (el) {
+      var dir = el.getAttribute("dir") || "auto";
+      paragraphs.push({
+        dir: dir,
+        text: el.textContent,
+        editedAt: el.getAttribute("data-edited-at") || new Date().toISOString()
+      });
+      textCache.set(el, el.textContent);
+    });
+    return { paragraphs: paragraphs };
+  }
+
+  function setCaretAtFirstBlockStart() {
+    var block = editor.children[0];
+    var range = document.createRange();
+    // 直接定位到块首（空块/复杂内联节点都成立）
+    range.setStart(block, 0);
+    range.collapse(true);
+    var sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+
+  // 用快照内容整体替换编辑区。
+  // 返回 {ok:true, paragraphCount} 或 {ok:false, message}。
+  // ★ 校验不通过时绝不触碰 DOM，取消确认走的是根本不调用本函数，
+  //   因此“取消时编辑区不能变化”在两层都有保证。
+  function restore(payload) {
+    if (window.SnapshotCore) {
+      var check = window.SnapshotCore.validateSnapshotPayload(
+        Object.assign({ name: "restore-check" }, payload));
+      if (!check.ok) return { ok: false, message: check.message };
+    } else if (!payload || !Array.isArray(payload.paragraphs) || !payload.paragraphs.length) {
+      return { ok: false, message: "快照内容无效" };
+    }
+
+    var frag = document.createDocumentFragment();
+    payload.paragraphs.forEach(function (p) {
+      frag.appendChild(makePara(p.dir, p.text));
+      var b = frag.lastChild;
+      stampBlock(b, p.editedAt);
+    });
+    editor.innerHTML = "";
+    editor.appendChild(frag);
+    normalize();
+    Array.prototype.forEach.call(editor.children, function (el) {
+      textCache.set(el, el.textContent);
+    });
+
+    // 光标同步到恢复结果：第一块开头（确定且可预期的位置）
+    editor.focus();
+    setCaretAtFirstBlockStart();
+    updateStatus();
+    return { ok: true, paragraphCount: editor.children.length };
+  }
+
+  window.Editor = {
+    serialize: serialize,
+    restore: restore,
+    focus: function () { editor.focus(); },
+    updateStatus: updateStatus
+  };
+
   /* ---------- 启动 ---------- */
   loadSamples();
+  normalize();
+  var bootTime = new Date().toISOString();
+  Array.prototype.forEach.call(editor.children, function (el) {
+    stampBlock(el, bootTime);
+    textCache.set(el, el.textContent);
+  });
   updateStatus();
 })();

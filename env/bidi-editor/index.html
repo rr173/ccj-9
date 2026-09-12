@@ -17,6 +17,7 @@
     <button id="insert-zh" title="在光标处插入中文示例">插入中文</button>
     <button id="insert-ar" title="在光标处插入阿拉伯文示例">إدراج نص عربي</button>
     <span class="sep"></span>
+    <button id="snapshot-save-quick" class="snap" title="把当前所有段落的文本、方向和编辑时间保存为快照">📸 保存快照</button>
     <button id="clear" class="danger" title="清空全部内容">清空</button>
   </div>
 </header>
@@ -42,6 +43,43 @@
     <span id="st-sel">选区: 0 字符</span>
   </aside>
 
+  <!-- 审阅快照：保存 / 列表 / 两两比较 / 恢复前预览 -->
+  <section class="snap-panel" id="snapshot-panel" aria-label="审阅快照">
+    <h2>审阅快照</h2>
+    <div class="snap-controls">
+      <input type="text" id="snapshot-name" maxlength="100"
+             placeholder="快照名称（必填，最长 100 字符）" aria-label="快照名称">
+      <button id="snapshot-save" class="primary">保存当前内容</button>
+      <button id="snapshot-refresh">刷新列表</button>
+      <span id="snapshot-rev" class="snap-rev" title="集合版本号（乐观锁）">版本 —</span>
+    </div>
+    <div class="snap-note" id="snapshot-note" role="status"></div>
+
+    <div class="snap-comparebar">
+      <label>较旧快照：<select id="compare-old" aria-label="较旧快照"></select></label>
+      <label>较新快照：<select id="compare-new" aria-label="较新快照"></select></label>
+      <button id="snapshot-compare" disabled>比较所选两个快照</button>
+    </div>
+
+    <div class="snap-list-wrap">
+      <table class="snap-table">
+        <thead>
+          <tr>
+            <th class="c-check"></th>
+            <th>名称</th>
+            <th class="c-num">段落</th>
+            <th class="c-num">字符</th>
+            <th>保存时间</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="snapshot-rows">
+          <tr class="snap-empty"><td colspan="6">尚无快照。输入名称后点击“保存当前内容”。</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
   <section class="help">
     <h2>行为说明（均由浏览器原生双向引擎保证）</h2>
     <ul>
@@ -54,6 +92,9 @@
   </section>
 </main>
 
+<div id="toast-box" class="toast-box" aria-live="polite"></div>
+<script src="snapshot-core.js"></script>
 <script src="app.js"></script>
+<script src="snapshots.js"></script>
 </body>
 </html>

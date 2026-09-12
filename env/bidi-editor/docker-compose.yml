@@ -1,7 +1,12 @@
-# docker-compose 只是便利项，根 Dockerfile 单独即可完整运行
+# docker compose 只是便利项，根 Dockerfile 单独即可完整运行
 services:
   bidi-editor:
     build: .
     ports:
-      - "8080:80"
+      - "8080:8080"
+    volumes:
+      - snapdata:/app/data      # 快照 JSON 持久化，容器重建后仍在
     restart: unless-stopped
+
+volumes:
+  snapdata:
