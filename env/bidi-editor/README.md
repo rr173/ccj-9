@@ -1,7 +1,8 @@
-# 双向文本编辑器（中文 ⇄ 阿拉伯文同段混排）+ 审阅快照
+# 双向文本编辑器（中文 ⇄ 阿拉伯文同段混排）+ 审阅快照 + 协作批注
 
 一个零依赖 Node 服务 + 网页编辑器，支持同一段落内中文（从左到右）与阿拉伯文（从右到左）混排，
-并提供可恢复、可比较、带乐观并发控制的**审阅快照**功能。
+提供可恢复、可比较、带乐观并发控制的**审阅快照**功能，以及可锚定到逻辑字符范围、
+支持回复与解决状态流转的**协作批注**功能。
 
 ## 双向编辑的需求与实现对照
 
@@ -41,6 +42,40 @@ DELETE /api/snapshots/:id        删除（必须 If-Match: <rev>）
 
 冲突响应示例：`409 {"error":"version_conflict","message":"…","currentRev":7}`。
 
+## 协作批注功能
+
+审阅者在编辑器中选中一段文字即可创建批注。每条批注记录：**引文（原文）、段落方向、
+字符起止位置（逻辑码点，半开区间 `[start,end)`）、创建时间**、署名与正文。
+
+| 需求 | 实现方式 |
+|---|---|
+| 编辑/换行/方向切换后批注仍指向原字符 | 锚点 = 段落号 + 逻辑码点区间 + 引文快照。每次文档变化后 `ReviewCore.reanchor` 在**码点数组**上重定位：原位校验 → 段内就近查找 → 全文查找；引文被删则标记“锚点失效”。方向切换与折行不改变文本，锚点天然不动 |
+| 批注显示原文/方向/起止/时间 | 列表与详情均展示；引文包 `<bdi>` 隔离，位置标签固定 `dir="ltr"`，RTL 段落里数字不翻转 |
+| 回复、标记已解决、重新打开 | 详情弹窗内完成；解决时记录解决人与时间，重开时清除 |
+| 解决状态与快照关联 | 保存/覆盖快照时，服务端把当前批注集合（含状态与回复）整体嵌入快照记录（`annotations` + `annotationRev`）；查看历史快照可看到当时的批注及状态，且可从快照**恢复批注集合**（整体替换，带乐观锁） |
+| 多页面同时编辑：提交/解决批注必须检测版本 | 批注集合有独立单调版本号 `rev`，响应带 `X-Annotation-Rev`；**所有**变更（新建、回复、解决、删除、恢复）必须 `If-Match: <rev>` 严格相等，否则 `409 version_conflict` 不写盘——旧页面无法覆盖别人的新批注或新状态 |
+| 锚点失效/范围为空/内容为空/超限要明确提示且保留输入 | 前端先用 `review-core.js` 本地校验，失败时错误显示在弹窗内、表单内容原样保留；提交前再次校验锚点有效性；服务端用同一模块复核（空内容 400、空范围 400、引文与范围不一致 400、正文 >1000 字符 413、引文 >5000 字符 413、批注总数 >500 413、回复 >100 条/批注 413） |
+| 按段落和状态筛选的审阅列表 | 段落下拉（随文档段落增减实时更新）+ 状态（未解决/已解决）筛选；列表项实时显示重定位后的位置或“锚点失效” |
+| RTL 下批注位置与回复按逻辑顺序对应 | 位置一律逻辑码点偏移（不读屏幕布局）；回复按创建时间排序；文本一律 `<bdi>` 隔离 |
+
+编辑器内的高亮使用 **CSS Custom Highlight API**（`::highlight(review-open/resolved)`），
+不向 contenteditable DOM 注入任何节点，因此不会破坏光标、选区与撤销栈；
+浏览器不支持时静默降级，列表功能不受影响。
+
+### 批注 HTTP API 摘要
+
+```
+GET    /api/annotations                全量列表（含回复）+ 当前 rev
+POST   /api/annotations                新建批注（If-Match 必需）
+PUT    /api/annotations                整体替换（从快照恢复，If-Match 必需）
+POST   /api/annotations/:id/replies    追加回复（If-Match 必需）
+PUT    /api/annotations/:id            标记已解决 / 重新打开（If-Match 必需）
+DELETE /api/annotations/:id            删除（If-Match 必需）
+```
+
+冲突响应示例：`409 {"error":"version_conflict","message":"…","currentRev":3}`。
+批注数据默认写到 `./data/annotations.json`（可用 `ANNOTATIONS_FILE` 覆盖）。
+
 ### 差异位置为什么不会被 RTL 标反
 
 - 差异算法（LCS）在 `snapshot-core.js` 中以**码点数组**为输入，偏移即数组下标，
@@ -62,9 +97,10 @@ DELETE /api/snapshots/:id        删除（必须 If-Match: <rev>）
 node server.js          # http://localhost:8080
 ```
 
-快照数据默认写到 `./data/snapshots.json`（可用环境变量 `SNAPSHOTS_FILE` 覆盖）。
+快照数据默认写到 `./data/snapshots.json`（`SNAPSHOTS_FILE` 覆盖），
+批注数据默认写到 `./data/annotations.json`（`ANNOTATIONS_FILE` 覆盖）。
 
-> 注：直接双击打开 `index.html`（file://）时快照接口不可用，双向编辑功能本身仍可使用。
+> 注：直接双击打开 `index.html`（file://）时快照与批注接口不可用，双向编辑功能本身仍可使用。
 
 ## 测试
 
@@ -75,7 +111,9 @@ node --test test/
 ```
 
 - `test/core.test.js`：校验规则、字符级逻辑位置差异（含阿拉伯文与中阿混排用例）、段落对齐
-- `test/api.test.js`：真实起服务跑 CRUD、409 乐观锁、413/400 拒绝、重启持久化
+- `test/api.test.js`：真实起服务跑快照 CRUD、409 乐观锁、413/400 拒绝、重启持久化
+- `test/review-core.test.js`：批注校验、锚点重定位（编辑/跨段移动/方向切换/emoji/失效）、记录规范化
+- `test/annotations-api.test.js`：批注 CRUD 与回复、解决/重开、双页面 409 冲突、快照嵌入批注状态、从快照恢复、重启持久化
 
 ## Docker 部署
 
@@ -94,12 +132,14 @@ docker compose up -d
 ## 文件结构
 
 ```
-index.html        页面结构（编辑器为 contenteditable；快照面板与弹窗容器）
-style.css         编辑器样式 + 快照面板/弹窗/差异高亮（bdi 隔离、LTR 位置标签）
-app.js            段落方向、编辑时间戳、纯文本粘贴、状态栏、序列化/恢复 API（window.Editor）
-snapshot-core.js  纯逻辑：校验 + LCS 差异（浏览器与 Node 共用，无 DOM 依赖）
+index.html        页面结构（编辑器为 contenteditable；审阅面板、快照面板与弹窗容器）
+style.css         编辑器样式 + 审阅/快照面板/弹窗/差异高亮（bdi 隔离、LTR 位置标签、批注高亮）
+app.js            段落方向、编辑时间戳、纯文本粘贴、状态栏、序列化/恢复、码点锚点 API（window.Editor）
+snapshot-core.js  快照纯逻辑：校验 + LCS 差异（浏览器与 Node 共用，无 DOM 依赖）
+review-core.js    批注纯逻辑：校验 + 锚点重定位（浏览器与 Node 共用，无 DOM 依赖）
 snapshots.js      快照 UI：列表/比较/恢复预览二次确认/版本冲突
-server.js         零依赖服务：静态文件 + 快照 JSON API（乐观锁、原子落盘）
+annotations.js    批注 UI：列表筛选/新建/详情回复/解决重开/冲突处理/快照批注查看与恢复
+server.js         零依赖服务：静态文件 + 快照与批注 JSON API（双集合乐观锁、原子落盘）
 test/             node:test 单元与集成测试
 Dockerfile        node:20-alpine，EXPOSE 8080，数据卷 /app/data
 ```

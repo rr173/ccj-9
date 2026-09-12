@@ -1,12 +1,21 @@
-/* 零依赖开发服务器：静态文件 + 审阅快照 JSON API
+/* 零依赖开发服务器：静态文件 + 审阅快照 JSON API + 协作批注 JSON API
  * 运行：node server.js [port]
  *
- * 快照存储：同目录 data/snapshots.json（可用 SNAPSHOTS_FILE 覆盖）。
+ * 存储：
+ *   快照 data/snapshots.json   （SNAPSHOTS_FILE 覆盖）
+ *   批注 data/annotations.json （ANNOTATIONS_FILE 覆盖）
  *
- * 乐观并发（多页面/多人同时操作同一快照）：
- *   集合有单调递增的 rev；所有响应带 X-Snapshot-Rev。
- *   PUT/DELETE /api/snapshots/:id 必须带 If-Match: <rev>，
- *   服务端 rev 已大于该值 -> 409 version_conflict，拒绝覆盖/删除。
+ * 乐观并发（多页面/多人同时操作）：
+ *   快照集合与批注集合各有单调递增的 rev；
+ *   快照响应带 X-Snapshot-Rev，批注响应带 X-Annotation-Rev；
+ *   所有变更类请求（含新建/回复/解决批注）必须带 If-Match: <对应集合 rev>，
+ *   服务端要求严格相等，否则 409 version_conflict 且不写盘 ——
+ *   旧页面无法覆盖别人新提交的批注、回复或文字。
+ *
+ * 快照与批注的关联：
+ *   保存/覆盖快照时，服务端把当前批注集合（含解决状态与回复）整体嵌入
+ *   快照记录（annotations 字段 + annotationRev），查看历史快照即可看到
+ *   当时存在的批注及其状态。
  */
 "use strict";
 
@@ -15,11 +24,14 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const core = require("./snapshot-core");
+const review = require("./review-core");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
 const DATA_FILE = process.env.SNAPSHOTS_FILE ||
   path.join(ROOT, "data", "snapshots.json");
+const ANN_FILE = process.env.ANNOTATIONS_FILE ||
+  path.join(ROOT, "data", "annotations.json");
 const REQUEST_BODY_LIMIT = 4 * 1024 * 1024; // 传输字节上限（校验逻辑另有字符上限）
 
 const MIME = {
@@ -58,10 +70,13 @@ try {
 }
 
 function summary(s) {
+  const anns = Array.isArray(s.annotations) ? s.annotations : [];
   return {
     id: s.id, name: s.name, createdAt: s.createdAt, updatedAt: s.updatedAt,
     paragraphCount: s.paragraphs.length,
-    charCount: s.paragraphs.reduce(function (n, p) { return n + core.cpLen(p.text); }, 0)
+    charCount: s.paragraphs.reduce(function (n, p) { return n + core.cpLen(p.text); }, 0),
+    annotationCount: anns.length,
+    openAnnotationCount: anns.filter(function (a) { return a.status !== "resolved"; }).length
   };
 }
 function publicStore() {
@@ -71,7 +86,10 @@ function publicFull(s) {
   return {
     id: s.id, name: s.name, rev: store.rev,
     createdAt: s.createdAt, updatedAt: s.updatedAt,
-    paragraphs: s.paragraphs
+    paragraphs: s.paragraphs,
+    // 快照保存时刻的批注集合（可能为 null：该快照创建于批注功能上线前）
+    annotations: Array.isArray(s.annotations) ? s.annotations : null,
+    annotationRev: Number.isInteger(s.annotationRev) ? s.annotationRev : null
   };
 }
 
@@ -84,6 +102,39 @@ function findName(name, exceptId) {
   });
 }
 
+/* ================= 批注存储 ================= */
+
+const annStore = { rev: 0, annotations: [] };
+
+function persistAnnotations(cb) {
+  const tmp = ANN_FILE + ".tmp";
+  fs.mkdir(path.dirname(ANN_FILE), { recursive: true }, function () {
+    fs.writeFile(tmp, JSON.stringify(annStore), function (err) {
+      if (err) { cb(err); return; }
+      fs.rename(tmp, ANN_FILE, cb);
+    });
+  });
+}
+
+try {
+  const rawAnn = fs.readFileSync(ANN_FILE, "utf8");
+  const dataAnn = JSON.parse(rawAnn);
+  if (Number.isInteger(dataAnn.rev) && Array.isArray(dataAnn.annotations)) {
+    annStore.rev = dataAnn.rev;
+    annStore.annotations = dataAnn.annotations;
+  }
+} catch (e) {
+  // 同快照存储：损坏文件不覆盖
+}
+
+function findAnn(id) {
+  return annStore.annotations.find(function (a) { return a.id === id; });
+}
+
+function publicAnnotations() {
+  return { rev: annStore.rev, annotations: annStore.annotations };
+}
+
 /* ================= HTTP 工具 ================= */
 
 function sendJSON(res, status, body, headers) {
@@ -91,6 +142,7 @@ function sendJSON(res, status, body, headers) {
   const h = Object.assign({
     "Content-Type": "application/json; charset=utf-8",
     "X-Snapshot-Rev": String(store.rev),
+    "X-Annotation-Rev": String(annStore.rev),
     "Cache-Control": "no-store"
   }, headers || {});
   res.writeHead(status, h);
@@ -120,14 +172,258 @@ function readBody(req, cb) {
   req.on("error", cb);
 }
 
-/* ================= API 处理 ================= */
+// 乐观锁检查：返回 null 表示通过；否则已发送错误响应并返回 true
+function checkLock(res, expected, currentRev, label) {
+  if (expected === undefined) {
+    apiError(res, 428, "precondition_required",
+      label + "必须携带 If-Match 版本号");
+    return true;
+  }
+  const their = parseInt(expected, 10);
+  if (!Number.isInteger(their) || their !== currentRev) {
+    apiError(res, 409, "version_conflict",
+      label + "已被其他页面更新（当前版本 " + currentRev +
+      "），本次操作已取消，请刷新后重试，避免覆盖较新内容",
+      { currentRev: currentRev });
+    return true;
+  }
+  return false;
+}
 
-function handleAPI(req, res, pathname) {
-  const parts = pathname.split("/").filter(Boolean); // ["api", "snapshots", ":id?"]
-  if (parts[1] !== "snapshots" || parts.length > 3) {
+/* ================= 批注 API ================= */
+
+function handleAnnotations(req, res, parts) {
+  // parts: ["api", "annotations", ":id?", "replies"?]
+  const id = parts[2];
+  const sub = parts[3];
+
+  if (sub && !(id && sub === "replies" && parts.length === 4)) {
     apiError(res, 404, "not_found", "接口不存在");
     return;
   }
+  if (parts.length > 4) {
+    apiError(res, 404, "not_found", "接口不存在");
+    return;
+  }
+
+  /* ---- GET /api/annotations：全量列表（含回复），读不需要锁 ---- */
+  if (!id && req.method === "GET") {
+    sendJSON(res, 200, publicAnnotations());
+    return;
+  }
+
+  /* ---- POST /api/annotations：新建批注（必须 If-Match） ---- */
+  if (!id && req.method === "POST") {
+    if (checkLock(res, req.headers["if-match"], annStore.rev,
+      "批注集合")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload;
+      try { payload = JSON.parse(raw); }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+
+      const check = review.validateNewAnnotation(payload);
+      if (!check.ok) { apiError(res, check.status, check.code, check.message); return; }
+      if (annStore.annotations.length >= review.LIMITS.ANNOTATION_MAX_COUNT) {
+        apiError(res, 413, "too_many_annotations",
+          "批注总数已达 " + review.LIMITS.ANNOTATION_MAX_COUNT + " 条上限");
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const ann = Object.assign(check.value, {
+        id: crypto.randomUUID(),
+        status: "open",
+        createdAt: now,
+        updatedAt: now,
+        resolvedAt: null,
+        resolvedBy: null,
+        replies: []
+      });
+      annStore.annotations.push(ann);
+      annStore.rev++;
+      persistAnnotations(function (err) {
+        if (err) { annStore.annotations.pop(); annStore.rev--;
+          apiError(res, 500, "persist_failed", "批注保存失败，请重试"); return; }
+        sendJSON(res, 201, { rev: annStore.rev, annotation: ann });
+      });
+    });
+    return;
+  }
+
+  /* ---- PUT /api/annotations：整体替换（从快照恢复批注集合） ---- */
+  if (!id && req.method === "PUT") {
+    if (checkLock(res, req.headers["if-match"], annStore.rev,
+      "批注集合")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload;
+      try { payload = JSON.parse(raw); }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+
+      if (!payload || !Array.isArray(payload.annotations)) {
+        apiError(res, 400, "invalid_body", "请求必须包含 annotations 数组");
+        return;
+      }
+      if (payload.annotations.length > review.LIMITS.ANNOTATION_MAX_COUNT) {
+        apiError(res, 413, "too_many_annotations",
+          "批注总数超过 " + review.LIMITS.ANNOTATION_MAX_COUNT + " 条上限");
+        return;
+      }
+      // 全部校验通过后才替换：任何一条非法都不写存储
+      const normalized = [];
+      const seen = new Set();
+      for (let i = 0; i < payload.annotations.length; i++) {
+        const c = review.normalizeAnnotationRecord(payload.annotations[i], i);
+        if (!c.ok) { apiError(res, c.status, c.code, c.message); return; }
+        const rec = c.value;
+        // id 缺失或重复：重新生成，保证集合内唯一
+        if (!rec.id || seen.has(rec.id)) rec.id = crypto.randomUUID();
+        seen.add(rec.id);
+        const now = new Date().toISOString();
+        if (!rec.createdAt) rec.createdAt = now;
+        if (!rec.updatedAt) rec.updatedAt = rec.createdAt;
+        rec.replies.forEach(function (r) {
+          if (!r.id) r.id = crypto.randomUUID();
+          if (!r.createdAt) r.createdAt = rec.createdAt;
+        });
+        normalized.push(rec);
+      }
+
+      const backup = annStore.annotations;
+      annStore.annotations = normalized;
+      annStore.rev++;
+      persistAnnotations(function (err) {
+        if (err) { annStore.annotations = backup; annStore.rev--;
+          apiError(res, 500, "persist_failed", "批注恢复失败，请重试"); return; }
+        sendJSON(res, 200, publicAnnotations());
+      });
+    });
+    return;
+  }
+
+  if (!id) {
+    apiError(res, 405, "method_not_allowed", "该路径不支持此方法");
+    return;
+  }
+
+  /* ---- POST /api/annotations/:id/replies：追加回复 ---- */
+  if (sub === "replies") {
+    if (req.method !== "POST") {
+      apiError(res, 405, "method_not_allowed", "该路径不支持此方法");
+      return;
+    }
+    if (checkLock(res, req.headers["if-match"], annStore.rev,
+      "批注集合")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload;
+      try { payload = JSON.parse(raw); }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+
+      const check = review.validateReply(payload);
+      if (!check.ok) { apiError(res, check.status, check.code, check.message); return; }
+
+      const ann = findAnn(id);
+      if (!ann) { apiError(res, 404, "annotation_not_found", "批注不存在或已被删除"); return; }
+      if (ann.replies.length >= review.LIMITS.REPLY_MAX_COUNT) {
+        apiError(res, 413, "too_many_replies",
+          "该批注的回复数已达 " + review.LIMITS.REPLY_MAX_COUNT + " 条上限");
+        return;
+      }
+      const now = new Date().toISOString();
+      const reply = {
+        id: crypto.randomUUID(),
+        author: check.value.author,
+        body: check.value.body,
+        createdAt: now
+      };
+      const prevUpdated = ann.updatedAt;
+      ann.replies.push(reply);
+      ann.updatedAt = now;
+      annStore.rev++;
+      persistAnnotations(function (err) {
+        if (err) { ann.replies.pop(); ann.updatedAt = prevUpdated; annStore.rev--;
+          apiError(res, 500, "persist_failed", "回复保存失败，请重试"); return; }
+        sendJSON(res, 201, { rev: annStore.rev, annotation: ann });
+      });
+    });
+    return;
+  }
+
+  /* ---- PUT /api/annotations/:id：标记已解决 / 重新打开 ---- */
+  if (req.method === "PUT") {
+    if (checkLock(res, req.headers["if-match"], annStore.rev,
+      "批注集合")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload;
+      try { payload = JSON.parse(raw); }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+
+      if (!payload || (payload.status !== "resolved" && payload.status !== "open")) {
+        apiError(res, 400, "invalid_status",
+          "状态必须是 resolved（已解决）或 open（重新打开）");
+        return;
+      }
+      const ann = findAnn(id);
+      if (!ann) { apiError(res, 404, "annotation_not_found", "批注不存在或已被删除"); return; }
+
+      const backup = {
+        status: ann.status, resolvedAt: ann.resolvedAt,
+        resolvedBy: ann.resolvedBy, updatedAt: ann.updatedAt
+      };
+      const now = new Date().toISOString();
+      ann.status = payload.status;
+      if (payload.status === "resolved") {
+        ann.resolvedAt = now;
+        const who = review.validateAuthor(payload.resolvedBy);
+        ann.resolvedBy = who.ok ? who.value : "匿名";
+      } else {
+        ann.resolvedAt = null;
+        ann.resolvedBy = null;
+      }
+      ann.updatedAt = now;
+      annStore.rev++;
+      persistAnnotations(function (err) {
+        if (err) {
+          ann.status = backup.status; ann.resolvedAt = backup.resolvedAt;
+          ann.resolvedBy = backup.resolvedBy; ann.updatedAt = backup.updatedAt;
+          annStore.rev--;
+          apiError(res, 500, "persist_failed", "状态更新失败，请重试");
+          return;
+        }
+        sendJSON(res, 200, { rev: annStore.rev, annotation: ann });
+      });
+    });
+    return;
+  }
+
+  /* ---- DELETE /api/annotations/:id ---- */
+  if (req.method === "DELETE") {
+    if (checkLock(res, req.headers["if-match"], annStore.rev,
+      "批注集合")) return;
+    const idx = annStore.annotations.findIndex(function (a) { return a.id === id; });
+    if (idx === -1) {
+      apiError(res, 404, "annotation_not_found", "批注不存在或已被删除");
+      return;
+    }
+    const removed = annStore.annotations.splice(idx, 1)[0];
+    annStore.rev++;
+    persistAnnotations(function (err) {
+      if (err) { annStore.annotations.splice(idx, 0, removed); annStore.rev--;
+        apiError(res, 500, "persist_failed", "删除失败，请重试"); return; }
+      sendJSON(res, 200, { ok: true, rev: annStore.rev });
+    });
+    return;
+  }
+
+  apiError(res, 405, "method_not_allowed", "该路径不支持此方法");
+}
+
+/* ================= 快照 API ================= */
+
+function handleSnapshots(req, res, parts) {
   const id = parts[2];
 
   if (!id && req.method === "GET") {
@@ -159,7 +455,10 @@ function handleAPI(req, res, pathname) {
         name: check.value.name,
         createdAt: now,
         updatedAt: now,
-        paragraphs: check.value.paragraphs
+        paragraphs: check.value.paragraphs,
+        // 关联当前批注集合：查看该历史快照时能看到当时的批注及解决状态
+        annotations: review.snapshotDigest(annStore.annotations),
+        annotationRev: annStore.rev
       };
       store.snapshots.push(snap);
       store.rev++;
@@ -222,16 +521,22 @@ function handleAPI(req, res, pathname) {
           { existing: summary(dup) });
         return;
       }
-      const backup = { name: s.name, updatedAt: s.updatedAt, paragraphs: s.paragraphs };
+      const backup = { name: s.name, updatedAt: s.updatedAt, paragraphs: s.paragraphs,
+                       annotations: s.annotations, annotationRev: s.annotationRev };
       s.name = check.value.name;
       s.paragraphs = check.value.paragraphs;
       s.updatedAt = new Date().toISOString();
+      // 覆盖保存同样刷新快照关联的批注状态
+      s.annotations = review.snapshotDigest(annStore.annotations);
+      s.annotationRev = annStore.rev;
       store.rev++;
       const newRev = store.rev;
       persist(function (err) {
         if (err) {
           s.name = backup.name; s.paragraphs = backup.paragraphs;
-          s.updatedAt = backup.updatedAt; store.rev--;
+          s.updatedAt = backup.updatedAt;
+          s.annotations = backup.annotations; s.annotationRev = backup.annotationRev;
+          store.rev--;
           apiError(res, 500, "persist_failed", "快照保存失败，请重试");
           return;
         }
@@ -262,6 +567,21 @@ function handleAPI(req, res, pathname) {
   }
 
   apiError(res, 405, "method_not_allowed", "该路径不支持此方法");
+}
+
+/* ================= 路由 ================= */
+
+function handleAPI(req, res, pathname) {
+  const parts = pathname.split("/").filter(Boolean); // ["api", ...]
+  if (parts[1] === "snapshots" && parts.length <= 3) {
+    handleSnapshots(req, res, parts);
+    return;
+  }
+  if (parts[1] === "annotations" && parts.length <= 4) {
+    handleAnnotations(req, res, parts);
+    return;
+  }
+  apiError(res, 404, "not_found", "接口不存在");
 }
 
 /* ================= 静态文件 ================= */
@@ -300,7 +620,7 @@ http.createServer((req, res) => {
     res.end(data);
   });
 }).listen(PORT, () => {
-  console.log(`Bidi editor running at http://localhost:${PORT} (snapshots: ${DATA_FILE})`);
+  console.log(`Bidi editor running at http://localhost:${PORT} (snapshots: ${DATA_FILE}, annotations: ${ANN_FILE})`);
 });
 
-module.exports = { core, store: store };
+module.exports = { core, review, store: store, annStore: annStore };

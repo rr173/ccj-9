@@ -189,7 +189,7 @@
     if (!state.items.length) {
       var tr = el("tr", "snap-empty");
       var td = el("td");
-      td.colSpan = 6;
+      td.colSpan = 7;
       td.textContent = "尚无快照。输入名称后点击“保存当前内容”。";
       tr.appendChild(td);
       rowsBody.appendChild(tr);
@@ -218,11 +218,18 @@
 
       tr.appendChild(el("td", "c-num", String(s.paragraphCount)));
       tr.appendChild(el("td", "c-num", String(s.charCount)));
+      // 快照保存时刻关联的批注数（未解决/总数）
+      var annText = (s.annotationCount == null) ? "—"
+        : (s.openAnnotationCount + "/" + s.annotationCount);
+      tr.appendChild(el("td", "c-num", annText));
       tr.appendChild(el("td", "c-time", formatTime(s.updatedAt)));
 
       var tdAct = el("td", "snap-actions");
       tdAct.appendChild(button("覆盖保存", "btn-mini", function () { overwriteSnapshot(s); }));
       tdAct.appendChild(button("恢复…", "btn-mini", function () { beginRestore(s); }));
+      tdAct.appendChild(button("批注", "btn-mini", function () {
+        if (window.ReviewUI) window.ReviewUI.openSnapshotAnnotations(s.id, s.name);
+      }));
       tdAct.appendChild(button("删除", "btn-mini danger", function () { deleteSnapshot(s); }));
       tr.appendChild(tdAct);
       rowsBody.appendChild(tr);

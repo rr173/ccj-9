@@ -129,7 +129,17 @@
       stampEdited(b); // 改方向也是一次编辑
     });
     updateStatus();
+    emitChange(); // 方向切换不改变文本，但批注面板要刷新段落方向显示
     editor.focus();
+  }
+
+  /* ---------- 变更订阅：批注模块据此重定位锚点 ---------- */
+  var changeListeners = [];
+  function subscribe(fn) { changeListeners.push(fn); }
+  function emitChange() {
+    changeListeners.forEach(function (f) {
+      try { f(); } catch (e) { /* 监听器异常不影响编辑 */ }
+    });
   }
 
   /* ---------- 状态栏 ---------- */
@@ -219,6 +229,7 @@
     stampEdited(p);
     editor.focus();
     updateStatus();
+    emitChange();
   });
 
   // 快捷键：Ctrl/Cmd+Shift+A/L/R
@@ -251,12 +262,121 @@
       }
     });
     updateStatus();
+    emitChange(); // 文本/结构变化：批注锚点需要重定位
   });
   document.addEventListener("selectionchange", function () {
     if (document.activeElement === editor) updateStatus();
   });
 
-  /* ---------- 对外 API：供 snapshots.js 调用 ---------- */
+  /* ---------- 对外 API：供 snapshots.js / annotations.js 调用 ---------- */
+
+  // 码点（逻辑字符）工具：与 snapshot-core / review-core 的计数方式一致，
+  // 完全不读屏幕布局，RTL 段落下位置依然按内存顺序计算。
+  function cpOf(s) { return Array.from(s); }
+
+  // (node, offset) 在 block 拼接文本中的码点逻辑偏移
+  function logicalCpOffset(block, node, offset) {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      // offset 是子节点下标：累加其前面所有子节点的文本
+      var sum = 0;
+      for (var i = 0; i < offset && i < node.childNodes.length; i++) {
+        sum += cpOf(node.childNodes[i].textContent).length;
+      }
+      return sum;
+    }
+    var total = 0;
+    var walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+    var n;
+    while ((n = walker.nextNode())) {
+      if (n === node) {
+        return total + cpOf(n.textContent.slice(0, offset)).length;
+      }
+      total += cpOf(n.textContent).length;
+    }
+    return total;
+  }
+
+  // 码点偏移 → DOM (文本节点, UTF-16 偏移)
+  function locateCp(block, cpIndex) {
+    var walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT);
+    var n, remain = cpIndex;
+    while ((n = walker.nextNode())) {
+      var cps = cpOf(n.textContent);
+      if (remain <= cps.length) {
+        var u16 = 0;
+        for (var i = 0; i < remain; i++) u16 += cps[i].length;
+        return { node: n, offset: u16 };
+      }
+      remain -= cps.length;
+    }
+    return { node: block, offset: block.childNodes.length };
+  }
+
+  // 当前段落数组：[{dir, text, el}]
+  function getParagraphs() {
+    normalize();
+    return Array.prototype.map.call(editor.children, function (el) {
+      return { dir: el.getAttribute("dir") || "auto", text: el.textContent, el: el };
+    });
+  }
+
+  // 把当前选区读成批注锚点（码点逻辑位置）。
+  // 返回 {paraIndex, start, end, quote, paraDir}；
+  // 选区不在编辑器内返回 null；跨段落返回 {error:"cross_paragraph"}。
+  function getSelectionAnchor() {
+    var sel = getSelection();
+    if (!sel || !editor.contains(sel.anchorNode) || !editor.contains(sel.focusNode)) {
+      return null;
+    }
+    var b1 = blockOf(sel.anchorNode);
+    var b2 = blockOf(sel.focusNode);
+    if (!b1) return null; // 落点不在任何段落内：视为无有效选区
+    if (b1 !== b2) return { error: "cross_paragraph" };
+    var range = sel.getRangeAt(0);
+    var start = logicalCpOffset(b1, range.startContainer, range.startOffset);
+    var end = logicalCpOffset(b1, range.endContainer, range.endOffset);
+    if (end < start) { var t = start; start = end; end = t; }
+    var idx = Array.prototype.indexOf.call(editor.children, b1);
+    var quote = cpOf(b1.textContent).slice(start, end).join("");
+    return {
+      paraIndex: idx,
+      start: start,
+      end: end,
+      quote: quote,
+      paraDir: b1.getAttribute("dir") || "auto"
+    };
+  }
+
+  // 由码点逻辑范围构造 DOM Range（不改动当前选区）
+  function rangeFor(paraIndex, start, end) {
+    var block = editor.children[paraIndex];
+    if (!block) return null;
+    var len = cpOf(block.textContent).length;
+    start = Math.max(0, Math.min(start, len));
+    end = Math.max(start, Math.min(end, len));
+    var s = locateCp(block, start);
+    var e = locateCp(block, end);
+    var range = document.createRange();
+    range.setStart(s.node, s.offset);
+    range.setEnd(e.node, e.offset);
+    return range;
+  }
+
+  // 把选区移动到指定段落的码点逻辑范围（批注“定位到原文”）
+  function selectRange(paraIndex, start, end) {
+    var range = rangeFor(paraIndex, start, end);
+    if (!range) return false;
+    var block = editor.children[paraIndex];
+    editor.focus();
+    var sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    if (block && block.scrollIntoView) {
+      block.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+    updateStatus();
+    return true;
+  }
 
   // 序列化为快照载荷：{name? , paragraphs:[{dir,text,editedAt}]}
   function serialize() {
@@ -315,6 +435,7 @@
     editor.focus();
     setCaretAtFirstBlockStart();
     updateStatus();
+    emitChange(); // 恢复后批注锚点需要按新文本重定位
     return { ok: true, paragraphCount: editor.children.length };
   }
 
@@ -322,7 +443,14 @@
     serialize: serialize,
     restore: restore,
     focus: function () { editor.focus(); },
-    updateStatus: updateStatus
+    updateStatus: updateStatus,
+    // —— 协作审阅（annotations.js）使用的锚点接口 ——
+    getParagraphs: getParagraphs,
+    getSelectionAnchor: getSelectionAnchor,
+    rangeFor: rangeFor,
+    selectRange: selectRange,
+    subscribe: subscribe,
+    cpLen: function (s) { return cpOf(s).length; }
   };
 
   /* ---------- 启动 ---------- */

@@ -17,6 +17,7 @@
     <button id="insert-zh" title="在光标处插入中文示例">插入中文</button>
     <button id="insert-ar" title="在光标处插入阿拉伯文示例">إدراج نص عربي</button>
     <span class="sep"></span>
+    <button id="annotation-add" class="review" title="选中一段文字后点击，对该逻辑字符范围创建批注">💬 添加批注</button>
     <button id="snapshot-save-quick" class="snap" title="把当前所有段落的文本、方向和编辑时间保存为快照">📸 保存快照</button>
     <button id="clear" class="danger" title="清空全部内容">清空</button>
   </div>
@@ -42,6 +43,25 @@
     <span id="st-pos">逻辑偏移: —</span>
     <span id="st-sel">选区: 0 字符</span>
   </aside>
+
+  <!-- 协作审阅：批注列表（按段落/状态筛选）、新建、详情与回复 -->
+  <section class="review-panel" id="review-panel" aria-label="协作审阅">
+    <h2>协作审阅 <span id="review-rev" class="snap-rev" title="批注集合版本号（乐观锁）">版本 —</span></h2>
+    <div class="review-controls">
+      <button id="annotation-add-panel" class="primary">＋ 对选中文字添加批注</button>
+      <label>段落：<select id="review-filter-para" aria-label="按段落筛选">
+        <option value="">全部段落</option>
+      </select></label>
+      <label>状态：<select id="review-filter-status" aria-label="按状态筛选">
+        <option value="">全部状态</option>
+        <option value="open">未解决</option>
+        <option value="resolved">已解决</option>
+      </select></label>
+      <button id="review-refresh">刷新</button>
+    </div>
+    <div class="snap-note" id="review-note" role="status"></div>
+    <div id="review-list" class="review-list"></div>
+  </section>
 
   <!-- 审阅快照：保存 / 列表 / 两两比较 / 恢复前预览 -->
   <section class="snap-panel" id="snapshot-panel" aria-label="审阅快照">
@@ -69,12 +89,13 @@
             <th>名称</th>
             <th class="c-num">段落</th>
             <th class="c-num">字符</th>
+            <th class="c-num" title="快照保存时刻关联的批注：未解决/总数">批注</th>
             <th>保存时间</th>
             <th>操作</th>
           </tr>
         </thead>
         <tbody id="snapshot-rows">
-          <tr class="snap-empty"><td colspan="6">尚无快照。输入名称后点击“保存当前内容”。</td></tr>
+          <tr class="snap-empty"><td colspan="7">尚无快照。输入名称后点击“保存当前内容”。</td></tr>
         </tbody>
       </table>
     </div>
@@ -94,7 +115,9 @@
 
 <div id="toast-box" class="toast-box" aria-live="polite"></div>
 <script src="snapshot-core.js"></script>
+<script src="review-core.js"></script>
 <script src="app.js"></script>
 <script src="snapshots.js"></script>
+<script src="annotations.js"></script>
 </body>
 </html>
