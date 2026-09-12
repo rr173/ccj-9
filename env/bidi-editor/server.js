@@ -19,7 +19,15 @@ const MIME = {
 };
 
 http.createServer((req, res) => {
-  let urlPath = decodeURIComponent(req.url.split("?")[0]);
+  let urlPath;
+  try {
+    urlPath = decodeURIComponent(req.url.split("?")[0]);
+  } catch (e) {
+    // 非法百分号编码（如 %zz）只让本次请求失败，不能拖垮整个服务
+    res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("400 Bad Request: malformed URL encoding");
+    return;
+  }
   if (urlPath === "/") urlPath = "/index.html";
 
   // 防目录穿越
