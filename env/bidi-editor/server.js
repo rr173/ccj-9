@@ -376,7 +376,7 @@ function addDecisionLog(entry) {
     action: entry.action,
     detail: entry.detail || null,
     annotationId: entry.annotationId || null,
-    // 执行队列任务关联（发布/暂停/恢复/取消/自动执行/重试）
+    // 执行队列任务关联（发布/暂停/恢复/取消/自动执行/重试/依赖/审批）
     taskId: entry.taskId || null,
     snapshotId: entry.snapshotId || null
   };
@@ -385,6 +385,201 @@ function addDecisionLog(entry) {
     decisionStore.logs.splice(0, decisionStore.logs.length - decision.LIMITS.LOG_MAX);
   }
   return rec;
+}
+
+/* ---------- 决策集合统一提交（可带关联快照） ----------
+ * 调用前所有内存改动（含 decisionStore.rev 之外的领域对象、日志）已完成；
+ * 本函数负责 rev++、先快照落盘（若有）再决策落盘，失败时整体回滚。
+ * 回滚由调用方提供 domainRollback：恢复领域对象并移除本次新增日志。
+ */
+function commitDecisionStore(opts, cb) {
+  const domainRollback = opts.domainRollback || function () {};
+  const pendingSnapshot = opts.snapshot || null;
+  function restoreAll() {
+    domainRollback();
+    decisionStore.rev--;
+    if (pendingSnapshot) {
+      const i = store.snapshots.indexOf(pendingSnapshot);
+      if (i !== -1) { store.snapshots.splice(i, 1); store.rev--; }
+    }
+  }
+  function finish() {
+    decisionStore.rev++;
+    persistDecisions(function (err) {
+      if (err) {
+        restoreAll();
+        if (cb) cb(false, err);
+        return;
+      }
+      if (cb) cb(true);
+    });
+  }
+  if (pendingSnapshot) {
+    pendingSnapshot.decisions = decision.decisionDigest(decisionStore.decisions);
+    pendingSnapshot.decisionRev = decisionStore.rev + 1;
+    pendingSnapshot.executionTasks = decision.taskDigest(decisionStore.tasks);
+    store.snapshots.push(pendingSnapshot);
+    store.rev++;
+    persist(function (serr) {
+      if (serr) {
+        const i = store.snapshots.indexOf(pendingSnapshot);
+        if (i !== -1) { store.snapshots.splice(i, 1); store.rev--; }
+        restoreAll();
+        if (cb) cb(false, serr);
+        return;
+      }
+      finish();
+    });
+    return;
+  }
+  finish();
+}
+
+/* ---------- 执行前审批快照 ----------
+ * 配置审批的任务（发布时或之后配置时）自动保存一份“执行前审批”文本快照，
+ * 之后的审批通过/拒绝/撤回记录都关联这份快照，满足“审批记录关联对应快照”。
+ */
+function buildApprovalSnapshot(task, now, reason) {
+  const d = findDecision(task.decisionId);
+  const paras = (task.lock && Array.isArray(task.lock.paragraphs))
+    ? task.lock.paragraphs : (d && d.baselineParagraphs) || [];
+  const batchLookup = new Map(
+    batchStore.batches.map(function (b) {
+      return [b.id, { id: b.id, name: b.name, status: b.status }];
+    }));
+  return {
+    id: crypto.randomUUID(),
+    name: "执行前审批 " + task.decisionName + "（" +
+      now.replace(/[:T]/g, "-").slice(0, 19) + "）",
+    createdAt: now,
+    updatedAt: now,
+    paragraphs: paras,
+    annotations: review.snapshotDigest(annStore.annotations, batchLookup),
+    annotationRev: annStore.rev,
+    // decisions/executionTasks/decisionRev 在提交前一刻统一填充
+    decisions: null,
+    decisionRev: null,
+    executionTasks: null,
+    source: "task_approval",
+    taskId: task.id,
+    approvalReason: reason || "configured"
+  };
+}
+
+/* ---------- 前置门控级联 ----------
+ * 重新计算所有活动任务的门控，把变化写回任务（持久化，服务重启后据此恢复），
+ * 并对“阻断 / 解除阻断 / 等待负责人确认继续”产生队列日志。
+ *
+ * 幂等：门控状态未变化时不写任何字段、不产生日志、不推进 rev；
+ * 同一事务内可重复调用。返回 {changed, logs, prev} 供事务回滚。
+ */
+function reconcileTaskGates(actor) {
+  const gates = decision.computeGates(decisionStore.tasks);
+  const logs = [];
+  const prev = [];
+  let changed = false;
+  const now = new Date().toISOString();
+
+  decisionStore.tasks.forEach(function (t) {
+    const gate = gates[t.id];
+    if (!gate) return; // 终态任务不参与门控
+    const oldState = t.gateState || null;
+    const oldReason = t.gateReason || null;
+    if (oldState === gate.state && oldReason === (gate.reason || null)) return;
+
+    prev.push({
+      task: t,
+      gateState: t.gateState, gateReason: t.gateReason,
+      gateDependencyState: t.gateDependencyState, gateAt: t.gateAt,
+      gateDependencies: t.gateDependencies, gateBlockingDependency: t.gateBlockingDependency,
+      gateContinueConfirmations: t.gateContinueConfirmations
+    });
+    decision.persistGateOnTask(t, gate);
+    changed = true;
+
+    const blocking = gate.blockingDependency;
+    const snapRef = blocking
+      ? (blocking.snapshotId || null)
+      : (t.approvalSnapshotId || null);
+    let le = null;
+    if (gate.state === "blocked") {
+      le = addTaskLog(t, "task_dependency_blocked",
+        "前置条件未通过，任务被阻断：" + describeDependencyBlock(gate) +
+        "；排除原因（重试/修改前置任务配置）后将自动解除阻断，不会在计划时间误执行",
+        { snapshotId: snapRef, actor: actor || "系统" });
+    } else if (oldState === "blocked" &&
+               (gate.state === "waiting" || gate.state === "can_continue" ||
+                gate.state === "approvals" || gate.state === "ready")) {
+      le = addTaskLog(t, "task_dependency_unblocked",
+        "前置阻断已解除，当前：" + (decision.GATE_STATE_LABELS[gate.state] || gate.state),
+        { snapshotId: snapRef, actor: actor || "系统" });
+    } else if (gate.state === "can_continue") {
+      le = addTaskLog(t, "task_dependency_can_continue",
+        "前置任务“" + (blocking ? blocking.decisionName : "—") +
+        "”仅部分成功，任务暂不自动执行；请由负责人确认后继续（到点不会误执行）",
+        { snapshotId: snapRef, actor: actor || "系统" });
+    }
+    // waiting/approvals/rejected/ready 的日常流转直接体现在任务门控字段与
+    // 队列/详情的“等待原因”上，不逐条刷屏；审批通过/拒绝/撤回另有专门记录。
+    if (le) logs.push(le);
+  });
+
+  return {
+    changed: changed,
+    logs: logs,
+    prev: prev,
+    rollback: function () {
+      prev.forEach(function (p) {
+        p.task.gateState = p.gateState;
+        p.task.gateReason = p.gateReason;
+        p.task.gateDependencyState = p.gateDependencyState;
+        p.task.gateAt = p.gateAt;
+        p.task.gateDependencies = p.gateDependencies;
+        p.task.gateBlockingDependency = p.gateBlockingDependency;
+        p.task.gateContinueConfirmations = p.gateContinueConfirmations;
+      });
+      logs.forEach(function (le) {
+        const i = decisionStore.logs.indexOf(le);
+        if (i !== -1) decisionStore.logs.splice(i, 1);
+      });
+    }
+  };
+}
+
+function describeDependencyBlock(gate) {
+  const b = gate.blockingDependency;
+  if (!b) return "前置任务状态异常";
+  const name = b.decisionName || b.taskId.slice(0, 8);
+  if (b.reason === "dependency_cancelled" ||
+      (b.via == null && b.status === "cancelled")) {
+    return "前置任务“" + name + "”已取消";
+  }
+  if (b.reason === "dependency_blocked" ||
+      (b.via == null && b.status === "blocked")) {
+    return "前置任务“" + name + "”已阻断";
+  }
+  if (b.via) {
+    return "前置链上的任务未通过（经 " + name + "）";
+  }
+  return "前置任务“" + name + "”状态为“" +
+    (decision.TASK_STATUS_LABELS[b.status] || b.status) + "”";
+}
+
+// 门控状态 → 人类可读等待原因（日志与队列展示共用口径）
+function describeGateForLog(gate) {
+  if (gate.state === "ready") return "前置条件已满足";
+  if (gate.state === "approvals") {
+    return "等待执行前审批（已通过 " + gate.approval.approved + "/" +
+      gate.approval.minApprovals + "）";
+  }
+  if (gate.state === "rejected") return "执行前审批被拒绝";
+  if (gate.state === "can_continue") {
+    return "前置任务“" + (gate.blockingDependency ? gate.blockingDependency.decisionName : "—") +
+      "”仅部分成功，需负责人确认继续";
+  }
+  if (gate.state === "waiting") return describeDependencyBlock(gate) + "，等待其完成或重试";
+  if (gate.state === "blocked") return describeDependencyBlock(gate);
+  return gate.state;
 }
 
 function decisionItemSummary(it, threshold) {
@@ -404,7 +599,7 @@ function decisionItemSummary(it, threshold) {
   };
 }
 
-function decisionSummary(d) {
+function decisionSummary(d, gates) {
   const p = decision.decisionProgress(d);
   const batch = findBatch(d.batchId);
   const task = activeTaskOfDecision(d.id);
@@ -421,31 +616,33 @@ function decisionSummary(d) {
     overdue: decision.isOverdue(d.deadline) && d.status !== "executed",
     executed: d.status === "executed",
     activeTaskId: d.activeTaskId || (task ? task.id : null) || null,
-    task: task ? decision.taskSummary(task) : null,
+    task: task ? decision.taskSummary(task, gates ? gates[task.id] : null) : null,
     lastExecutionId: d.lastExecutionId || null
   };
 }
 
 function publicDecisions(batchId) {
+  var gates = decision.computeGates(decisionStore.tasks);
   var list = decisionStore.decisions.slice()
     .filter(function (d) { return !batchId || d.batchId === batchId; })
     .sort(function (a, b) { return (b.createdAt || "").localeCompare(a.createdAt || ""); })
-    .map(decisionSummary);
+    .map(function (d) { return decisionSummary(d, gates); });
   return { rev: decisionStore.rev, decisions: list };
 }
 
 function publicDecisionFull(d) {
   const batch = findBatch(d.batchId);
   const task = activeTaskOfDecision(d.id);
+  const gates = decision.computeGates(decisionStore.tasks);
   return {
     rev: decisionStore.rev,
-    decision: decisionSummary(d),
+    decision: decisionSummary(d, gates),
     batchFrozen: !!(batch && batch.status === "archived"),
     batchStatus: batch ? batch.status : null,
     annotationRev: d.annotationRev,
     batchRev: d.batchRev,
     textRev: d.textRev,
-    activeTask: task ? decision.taskSummary(task) : null,
+    activeTask: task ? decision.taskSummary(task, gates[task.id]) : null,
     items: d.items.map(function (it) {
       var s = decisionItemSummary(it, d.threshold);
       s.votes = (it.votes || []).slice().sort(function (a, b) {
@@ -2662,15 +2859,225 @@ function handleReviewDecisions(req, res, parts, urlObj) {
   apiError(res, 405, "method_not_allowed", "该路径不支持此方法");
 }
 
+/* ================= 执行前审批（通过 / 拒绝 / 撤回） =================
+ * 记名、同审批人最后一次未撤回决定为准（并发模型与草案逐条投票一致，
+ * 不需要 If-Match）；任一审批人拒绝即否决，撤回拒绝后自动恢复审批进度。
+ */
+function taskApprovalResp(task) {
+  const g = decision.computeGates(decisionStore.tasks);
+  return {
+    rev: decisionStore.rev,
+    task: decision.taskSummary(task, g[task.id]),
+    decision: findDecision(task.decisionId)
+      ? decisionSummary(findDecision(task.decisionId), g) : null
+  };
+}
+
+// 记录审批动作并在“达到门槛/被拒绝”切换时补充一条门控记录；全部关联审批快照。
+function commitApproval(task, actorName, decisionVote, res, existingDecision) {
+  const now = new Date().toISOString();
+  const tallyBefore = decision.approvalTally(task.approval, task.approvalDecisions);
+  const backup = (task.approvalDecisions || []).slice();
+  let rec;
+  if (existingDecision && existingDecision.withdrawnAt) {
+    // 撤回后再次决定：复用该条，清空撤回时间（保留完整动作流水）
+    rec = existingDecision;
+    rec.decision = decisionVote;
+    rec.at = now;
+    rec.withdrawnAt = null;
+  } else if (existingDecision && existingDecision.decision === decisionVote) {
+    // 幂等：同一审批人重复相同决定，不写流水不推进版本
+    sendJSON(res, 200, taskApprovalResp(task));
+    return;
+  } else {
+    rec = { approver: actorName, decision: decisionVote, at: now, withdrawnAt: null };
+    task.approvalDecisions.push(rec);
+  }
+  task.updatedAt = now;
+
+  const logs = [];
+  logs.push(addTaskLog(task,
+    decisionVote === "approve" ? "task_approved" : "task_rejected",
+    decisionVote === "approve"
+      ? "审批人“" + actorName + "”通过执行前审批（当前 " +
+        (tallyBefore.approved + (decisionVote === "approve" ? 1 : 0)) +
+        "/" + task.approval.minApprovals + "）"
+      : "审批人“" + actorName + "”拒绝执行前审批：任务在计划时间不会执行",
+    { actor: actorName, snapshotId: task.approvalSnapshotId || null }));
+
+  const tallyAfter = decision.approvalTally(task.approval, task.approvalDecisions);
+  if (tallyBefore.state !== tallyAfter.state) {
+    if (tallyAfter.state === "approved") {
+      logs.push(addTaskLog(task, "task_approval_met",
+        "执行前审批已达门槛（" + tallyAfter.approved + "/" +
+        task.approval.minApprovals + "，无拒绝）；前置依赖满足后任务将在计划时间执行",
+        { actor: actorName, snapshotId: task.approvalSnapshotId || null }));
+    } else if (tallyAfter.state === "rejected") {
+      logs.push(addTaskLog(task, "task_approval_rejected",
+        "执行前审批被拒绝，任务已被审批门控阻断（撤回拒绝并补足通过后可继续）",
+        { actor: actorName, snapshotId: task.approvalSnapshotId || null }));
+    } else if (tallyBefore.state === "rejected" && tallyAfter.state === "pending") {
+      logs.push(addTaskLog(task, "task_approval_reopened",
+        "拒绝已撤回，执行前审批重新进入等待状态",
+        { actor: actorName, snapshotId: task.approvalSnapshotId || null }));
+    }
+  }
+  const gatesRes = reconcileTaskGates(actorName);
+
+  decisionStore.rev++;
+  persistDecisions(function (err) {
+    if (err) {
+      task.approvalDecisions = backup;
+      gatesRes.rollback();
+      decisionStore.rev--;
+      apiError(res, 500, "persist_failed", "审批结果保存失败，已回滚，请重试");
+      return;
+    }
+    sendJSON(res, 200, taskApprovalResp(task));
+  });
+}
+
+function handleApprovalDecision(req, res, task, payload, now, actorField) {
+  if (!task.approval) {
+    apiError(res, 409, "approval_not_configured",
+      "该任务没有配置执行前审批，无需审批；可在任务配置中添加审批人");
+    return;
+  }
+  if (task.status !== "scheduled" && task.status !== "paused") {
+    apiError(res, 409, "task_not_pending_approval",
+      decision.taskIsTerminal(task)
+        ? "任务已经" + (decision.TASK_STATUS_LABELS[task.status] || task.status) +
+          "，不能再审批"
+        : "任务正在执行中，不能再审批");
+    return;
+  }
+  const vote = payload && payload.decision;
+  if (vote !== "approve" && vote !== "reject") {
+    apiError(res, 400, "invalid_approval_decision",
+      "审批决定必须是 approve（通过）或 reject（拒绝）");
+    return;
+  }
+  const nameChk = decision.validateApproverName(
+    payload && payload.approver != null ? payload.approver : actorField);
+  if (!nameChk.ok) { apiError(res, nameChk.status, nameChk.code, nameChk.message); return; }
+  const name = nameChk.value;
+  if (task.approval.approvers.indexOf(name) === -1) {
+    apiError(res, 403, "not_approver",
+      "“" + name + "”不是该任务的指定审批人；审批人：" +
+      task.approval.approvers.join("、"));
+    return;
+  }
+  const mine = (task.approvalDecisions || []).filter(function (x) {
+    return x.approver === name;
+  }).pop();
+  if (mine && !mine.withdrawnAt && mine.decision === vote) {
+    sendJSON(res, 200, taskApprovalResp(task)); // 幂等：重复相同审批
+    return;
+  }
+  commitApproval(task, name, vote, res, mine);
+}
+
+// 撤回本人最近一次审批决定（approve/reject 都可撤回）
+function handleApprovalWithdraw(req, res, taskId, rawApprover) {
+  const task = findTask(taskId);
+  if (!task) { apiError(res, 404, "task_not_found", "执行队列任务不存在或已被清理"); return; }
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let payload = {};
+    if (raw) {
+      try { payload = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    }
+    if (!task.approval) {
+      apiError(res, 409, "approval_not_configured", "该任务没有配置执行前审批");
+      return;
+    }
+    if (task.status !== "scheduled" && task.status !== "paused") {
+      apiError(res, 409, "task_not_pending_approval",
+        "任务已经开始或结束，审批不能撤回");
+      return;
+    }
+    const nameChk = decision.validateApproverName(
+      payload.approver != null ? payload.approver : rawApprover);
+    if (!nameChk.ok) { apiError(res, nameChk.status, nameChk.code, nameChk.message); return; }
+    const name = nameChk.value;
+    if (task.approval.approvers.indexOf(name) === -1) {
+      apiError(res, 403, "not_approver",
+        "“" + name + "”不是该任务的指定审批人；审批人：" +
+        task.approval.approvers.join("、"));
+      return;
+    }
+    const mine = (task.approvalDecisions || []).filter(function (x) {
+      return x.approver === name;
+    }).pop();
+    if (!mine || mine.withdrawnAt) {
+      apiError(res, 409, "approval_not_found",
+        "“" + name + "”当前没有可撤回的审批决定");
+      return;
+    }
+    const tallyBefore = decision.approvalTally(task.approval, task.approvalDecisions);
+    const backupDecisions = (task.approvalDecisions || []).slice();
+    const now = new Date().toISOString();
+    const prevWithdrawn = mine.withdrawnAt;
+    const prevAt = mine.at;
+    mine.withdrawnAt = now;
+    task.updatedAt = now;
+
+    const logs = [];
+    logs.push(addTaskLog(task, "task_approval_withdrawn",
+      "审批人“" + name + "”撤回" +
+      (mine.decision === "approve" ? "通过" : "拒绝") + "决定",
+      { actor: name, snapshotId: task.approvalSnapshotId || null }));
+    const tallyAfter = decision.approvalTally(task.approval, task.approvalDecisions);
+    if (tallyBefore.state !== tallyAfter.state) {
+      if (tallyAfter.state === "pending") {
+        logs.push(addTaskLog(task,
+          tallyBefore.state === "rejected" ? "task_approval_reopened" : "task_approval_reset",
+          tallyBefore.state === "rejected"
+            ? "拒绝已撤回，执行前审批重新进入等待状态"
+            : "撤回后通过人数不足门槛，继续等待执行前审批",
+          { actor: name, snapshotId: task.approvalSnapshotId || null }));
+      }
+    }
+    const gatesRes = reconcileTaskGates(name);
+    decisionStore.rev++;
+    persistDecisions(function (perr) {
+      if (perr) {
+        mine.withdrawnAt = prevWithdrawn;
+        mine.at = prevAt;
+        task.approvalDecisions = backupDecisions;
+        gatesRes.rollback();
+        decisionStore.rev--;
+        apiError(res, 500, "persist_failed", "撤回保存失败，已回滚，请重试");
+        return;
+      }
+      sendJSON(res, 200, taskApprovalResp(task));
+    });
+  });
+}
+
 /* ================= 决策执行队列 API =================
- * parts: ["api", "execution-tasks", ":id?", "pause"|"resume"|"cancel"|"retry"|"logs"?]
- * 锁模型与决策一致：所有变更必须 If-Match 当前 X-Decision-Rev（任务与草案共用
- * 决策集合 rev），多人用旧页面操作一律 409 version_conflict 且不写盘。
+ * parts: ["api", "execution-tasks", ":id?",
+ *         "pause"|"resume"|"cancel"|"retry"|"logs"|"config"|"approvals"|"continue"?]
+ * 另有 ["api","execution-tasks",":id","approvals",":approver","withdraw"]（撤回审批）。
+ * 锁模型与决策一致：配置/暂停/恢复/取消/重试等变更必须 If-Match 当前
+ * X-Decision-Rev（任务与草案共用决策集合 rev），多人用旧页面操作一律
+ * 409 version_conflict 且不写盘；逐条审批/撤回按“审批人最后一次决定”
+ * 收敛（与草案投票同一并发模型），不需要 If-Match。
  */
 function handleExecutionTasks(req, res, parts, urlObj) {
   const id = parts[2];
   const sub = parts[3];
-  const validSubs = { pause: true, resume: true, cancel: true, retry: true, logs: true };
+  const validSubs = {
+    pause: true, resume: true, cancel: true, retry: true, logs: true,
+    config: true, approvals: true, continue: true
+  };
+  // 审批撤回：…/:id/approvals/:approver/withdraw（parts 共 6 段）
+  if (parts.length === 6 && id && parts[3] === "approvals" &&
+      parts[5] === "withdraw" && req.method === "POST") {
+    handleApprovalWithdraw(req, res, id, parts[4], urlObj);
+    return;
+  }
   if (sub && !(id && validSubs[sub] && parts.length === 4)) {
     apiError(res, 404, "not_found", "接口不存在");
     return;
@@ -2704,6 +3111,15 @@ function handleExecutionTasks(req, res, parts, urlObj) {
         // 生效时间：缺省/过去时间都明确拒绝（错误信息里说明表单已保留）
         const when = decision.validateScheduledAt(payload.scheduledAt);
         if (!when.ok) { apiError(res, when.status, when.code, when.message); return; }
+
+        // 执行前审批配置（可选）：1~3 名互不重复的审批人 + 最少通过人数
+        const apChk = decision.validateApprovalConfig(payload);
+        if (!apChk.ok) { apiError(res, apChk.status, apChk.code, apChk.message); return; }
+        // 前置任务（可选）：先归一化，再在完整任务图上拒绝自依赖/循环/不存在
+        const depChk0 = decision.normalizeDependencyIds(payload.dependencies);
+        if (!depChk0.ok) { apiError(res, depChk0.status, depChk0.code, depChk0.message); return; }
+        const depChk = decision.validateTaskDependencies(null, depChk0.value, decisionStore.tasks);
+        if (!depChk.ok) { apiError(res, depChk.status, depChk.code, depChk.message); return; }
 
         if (decisionStore.tasks.length >= decision.LIMITS.TASK_MAX_COUNT) {
           apiError(res, 413, "too_many_tasks",
@@ -2815,7 +3231,15 @@ function handleExecutionTasks(req, res, parts, urlObj) {
           successAnnotationIds: [],
           lastCounts: null,
           lastExecutionId: null,
-          snapshotId: null
+          snapshotId: null,
+          // 前置任务与执行前审批
+          dependencyIds: depChk.value,
+          approval: apChk.value,
+          approvalDecisions: [],
+          continueConfirmed: Object.create(null),
+          approvalSnapshotId: null,
+          gateState: null,
+          gateReason: null
         };
 
         // 草案三版本基线推进到发布时刻；baselineParagraphs 换成锁定文本
@@ -2834,16 +3258,44 @@ function handleExecutionTasks(req, res, parts, urlObj) {
         d.updatedAt = now;
 
         decisionStore.tasks.push(task);
+
+        // 发布瞬间计算门控（依赖/审批），并把级联结果写入相关活动任务
+        const gatesPub = reconcileTaskGates(actor);
+
+        // 配置了执行前审批：自动保存“执行前审批”快照，审批动作都关联它
+        let approvalSnapshot = null;
+        if (apChk.value) {
+          approvalSnapshot = buildApprovalSnapshot(task, now, "publish");
+          task.approvalSnapshotId = approvalSnapshot.id;
+        }
+
+        const depNames = depChk.value.map(function (pid) {
+          const dt = findTask(pid);
+          return "“" + (dt ? dt.decisionName : pid.slice(0, 8)) + "”";
+        });
         const le = addTaskLog(task, "task_publish",
           "发布到执行队列：计划生效时间 " + when.value +
           "；锁定文本 " + lockParas.length + " 段（版本 " +
           task.lock.textRev.slice(0, 8) + "）、批注版本 " + task.lock.annotationRev +
-          "、批次版本 " + task.lock.batchRev + "、决策版本 " + task.lock.decisionRev);
+          "、批次版本 " + task.lock.batchRev + "、决策版本 " + task.lock.decisionRev +
+          (depNames.length ? "；前置任务 " + depNames.join("、") : "；无前置任务") +
+          (apChk.value ? "；执行前审批 " + apChk.value.approvers.join("、") +
+            "（至少 " + apChk.value.minApprovals + " 人通过）" : ""),
+          approvalSnapshot ? { snapshotId: approvalSnapshot.id } : null);
 
-        decisionStore.rev++;
-        persistDecisions(function (perr) {
-          if (perr) {
-            // 回滚草案基线与状态、移除任务与记录
+        // 门控不是 ready 时，日志立即说明等待原因（到点未满足前置条件不会误执行）
+        const tg = decision.taskGate(task, decisionStore.tasks);
+        let glePub = null;
+        if (tg.state !== "ready") {
+          glePub = addTaskLog(task, "task_gate_waiting",
+            "任务已排期但前置条件未满足，当前等待原因：" +
+            describeGateForLog(tg) + "；条件满足后只自动放行一次",
+            { snapshotId: task.approvalSnapshotId || null, actor: actor });
+        }
+
+        commitDecisionStore({
+          snapshot: approvalSnapshot,
+          domainRollback: function () {
             d.baselineParagraphs = task.baselineParagraphsBeforePublish;
             d.textRev = task.textRevBeforePublish;
             d.annotationRev = task.annotationRevBeforePublish;
@@ -2852,17 +3304,24 @@ function handleExecutionTasks(req, res, parts, urlObj) {
             d.scheduledAt = null;
             d.activeTaskId = null;
             d.updatedAt = now;
-            decisionStore.tasks.pop();
-            decisionStore.rev--;
-            const li = decisionStore.logs.indexOf(le);
-            if (li !== -1) decisionStore.logs.splice(li, 1);
+            const idx = decisionStore.tasks.indexOf(task);
+            if (idx !== -1) decisionStore.tasks.splice(idx, 1);
+            gatesPub.rollback();
+            [le, glePub].forEach(function (x) {
+              if (!x) return;
+              const li = decisionStore.logs.indexOf(x);
+              if (li !== -1) decisionStore.logs.splice(li, 1);
+            });
+          }
+        }, function (ok) {
+          if (!ok) {
             apiError(res, 500, "persist_failed", "发布失败，请重试（表单内容已保留）");
             return;
           }
           sendJSON(res, 201, {
             rev: decisionStore.rev,
-            task: decision.taskSummary(task),
-            decision: decisionSummary(d)
+            task: decision.taskSummary(task, decision.taskGate(task, decisionStore.tasks)),
+            decision: decisionSummary(d, decision.computeGates(decisionStore.tasks))
           });
         });
       });
@@ -2882,10 +3341,11 @@ function handleExecutionTasks(req, res, parts, urlObj) {
 
   /* ---- 只读：任务详情 / 任务记录（按时间筛选） ---- */
   if (req.method === "GET" && !sub) {
+    const g = decision.computeGates(decisionStore.tasks);
     sendJSON(res, 200, {
       rev: decisionStore.rev,
-      task: decision.taskSummary(task),
-      decision: d ? decisionSummary(d) : null
+      task: decision.taskSummary(task, g[task.id]),
+      decision: d ? decisionSummary(d, g) : null
     });
     return;
   }
@@ -2905,6 +3365,22 @@ function handleExecutionTasks(req, res, parts, urlObj) {
     return;
   }
 
+  // 执行前审批（通过/拒绝）按审批人记名，同草案投票：不要求 If-Match，
+  // 同一审批人重复操作以最后一次决定为准，与配置修改的清空语义各自收敛。
+  if (sub === "approvals" && req.method === "POST") {
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload = {};
+      if (raw) {
+        try { payload = JSON.parse(raw) || {}; }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      }
+      handleApprovalDecision(req, res, task, payload,
+        new Date().toISOString(), review.validateAuthor(payload.actor).value);
+    });
+    return;
+  }
+
   // 以下均为变更类：必须带决策集合版本
   if (checkLock(res, req.headers["if-match"], decisionStore.rev, "审阅决策集合")) return;
 
@@ -2918,11 +3394,15 @@ function handleExecutionTasks(req, res, parts, urlObj) {
     const now = new Date().toISOString();
     const actor = review.validateAuthor(payload.actor).value;
 
-    function save(ok, rollback) {
+    // 变更类通用提交：先把级联门控（依赖状态变化可能影响其他任务）写回，
+    // 再统一 rev++ 落盘；失败时调用方回滚业务字段、门控字段并移除日志。
+    function save(ok, rollback, gateRec) {
+      const gatesRes = gateRec || reconcileTaskGates(actor);
       decisionStore.rev++;
       persistDecisions(function (perr) {
         if (perr) {
           rollback();
+          gatesRes.rollback();
           decisionStore.rev--;
           apiError(res, 500, "persist_failed", "任务状态保存失败，已回滚，请重试");
           return;
@@ -2931,10 +3411,11 @@ function handleExecutionTasks(req, res, parts, urlObj) {
       });
     }
     function okResp() {
+      const g = decision.computeGates(decisionStore.tasks);
       sendJSON(res, 200, {
         rev: decisionStore.rev,
-        task: decision.taskSummary(task),
-        decision: d ? decisionSummary(d) : null
+        task: decision.taskSummary(task, g[task.id]),
+        decision: d ? decisionSummary(d, g) : null
       });
     }
 
@@ -3071,6 +3552,178 @@ function handleExecutionTasks(req, res, parts, urlObj) {
         const i = decisionStore.logs.indexOf(le);
         if (i !== -1) decisionStore.logs.splice(i, 1);
       });
+      return;
+    }
+
+    /* ---- PUT/POST .../:id/config：修改前置任务与审批配置 ----
+     * 仅 scheduled/paused（尚未开始）可改；改审批人/门槛清空已有审批决定，
+     * 改依赖在完整任务图上拒绝自依赖/循环/不存在；全部按当前决策版本并发校验。
+     */
+    if (sub === "config" && (req.method === "POST" || req.method === "PUT")) {
+      if (task.status !== "scheduled" && task.status !== "paused") {
+        apiError(res, 409, "task_config_locked",
+          decision.taskIsTerminal(task)
+            ? "任务已经" + (decision.TASK_STATUS_LABELS[task.status] || task.status) +
+              "，前置任务与审批配置不能再修改"
+            : "任务正在执行中，配置不能再修改");
+        return;
+      }
+      // 依赖配置（字段缺省表示不改；显式 null/[] 表示清空）
+      let nextDeps = null;
+      if (payload.dependencies !== undefined) {
+        const dn = decision.normalizeDependencyIds(payload.dependencies);
+        if (!dn.ok) { apiError(res, dn.status, dn.code, dn.message); return; }
+        const dc2 = decision.validateTaskDependencies(task.id, dn.value,
+          decisionStore.tasks);
+        if (!dc2.ok) { apiError(res, dc2.status, dc2.code, dc2.message); return; }
+        nextDeps = dc2.value;
+      }
+      // 审批配置（字段缺省表示不改；显式 null 表示取消审批要求）
+      let nextApproval;
+      let approvalTouched = false;
+      if (payload.approval !== undefined) {
+        const ac = decision.validateApprovalConfig(payload);
+        if (!ac.ok) { apiError(res, ac.status, ac.code, ac.message); return; }
+        nextApproval = ac.value;
+        approvalTouched = true;
+      }
+
+      const prevDeps = (task.dependencyIds || []).slice();
+      const prevApproval = task.approval
+        ? { approvers: task.approval.approvers.slice(),
+            minApprovals: task.approval.minApprovals } : null;
+      const prevDecisions = (task.approvalDecisions || []).slice();
+      const prevSnapId = task.approvalSnapshotId || null;
+      let prevContinue = null;
+      const depsChanged = nextDeps &&
+        (nextDeps.length !== prevDeps.length ||
+         nextDeps.some(function (x, i) { return x !== prevDeps[i]; }));
+      const approvalSame = approvalTouched &&
+        JSON.stringify(nextApproval || null) === JSON.stringify(prevApproval);
+      if (!depsChanged && (!approvalTouched || approvalSame)) {
+        // 幂等：配置与当前一致，不写盘不推进版本
+        okResp();
+        return;
+      }
+      // 改审批配置：旧审批人名单/门槛作废，已有审批决定全部清空（重新审批）
+      let approvalSnapshot = null;
+      if (approvalTouched && !approvalSame) {
+        task.approval = nextApproval;
+        task.approvalDecisions = [];
+        if (nextApproval) {
+          approvalSnapshot = buildApprovalSnapshot(task, now,
+            prevApproval ? "config_change" : "configured");
+          task.approvalSnapshotId = approvalSnapshot.id;
+        } else {
+          task.approvalSnapshotId = null;
+        }
+      }
+      if (depsChanged) {
+        task.dependencyIds = nextDeps;
+        // 前置关系整体重设：旧的“确认继续”记录不再适用，避免对新前置生效
+        prevContinue = Object.assign({}, task.continueConfirmed || {});
+        task.continueConfirmed = Object.create(null);
+      }
+      task.updatedAt = now;
+
+      function depNames(ids) {
+        return ids.map(function (pid) {
+          const dt = findTask(pid);
+          return "“" + (dt ? dt.decisionName : pid.slice(0, 8)) + "”";
+        }).join("、");
+      }
+      const logsCfg = [];
+      if (depsChanged) {
+        logsCfg.push(addTaskLog(task, "task_dependencies_changed",
+          "前置任务配置修改：" +
+          (nextDeps.length ? depNames(nextDeps) : "无前置任务") +
+          "（原配置：" + (prevDeps.length ? depNames(prevDeps) : "无前置任务") + "）"));
+      }
+      if (approvalTouched && !approvalSame) {
+        logsCfg.push(addTaskLog(task, "task_approval_configured",
+          nextApproval
+            ? "执行前审批配置：审批人 " + nextApproval.approvers.join("、") +
+              "，至少 " + nextApproval.minApprovals + " 人通过；此前审批记录已重置"
+            : "已取消执行前审批要求",
+          approvalSnapshot ? { snapshotId: approvalSnapshot.id } : null));
+      }
+      const gatesRes = reconcileTaskGates(actor);
+      const tg = decision.taskGate(task, decisionStore.tasks);
+      if (tg.state !== "ready") {
+        logsCfg.push(addTaskLog(task, "task_gate_waiting",
+          "配置修改后前置条件尚未满足，当前等待原因：" + describeGateForLog(tg),
+          { snapshotId: task.approvalSnapshotId || null, actor: actor }));
+      }
+
+      commitDecisionStore({
+        snapshot: approvalSnapshot,
+        domainRollback: function () {
+          task.dependencyIds = prevDeps;
+          task.approval = prevApproval;
+          task.approvalDecisions = prevDecisions;
+          task.approvalSnapshotId = prevSnapId;
+          if (depsChanged) task.continueConfirmed = prevContinue || Object.create(null);
+          task.updatedAt = now;
+          gatesRes.rollback();
+          logsCfg.forEach(function (le) {
+            const i = decisionStore.logs.indexOf(le);
+            if (i !== -1) decisionStore.logs.splice(i, 1);
+          });
+        }
+      }, function (ok) {
+        if (!ok) {
+          apiError(res, 500, "persist_failed", "配置保存失败，已回滚，请重试");
+          return;
+        }
+        okResp();
+      });
+      return;
+    }
+
+    /* ---- POST .../:id/continue：负责人确认“前置部分成功”后继续 ---- */
+    if (sub === "continue" && req.method === "POST") {
+      if (task.status !== "scheduled") {
+        apiError(res, 409, "task_not_active",
+          "只有等待生效的任务可以确认继续（当前：" +
+          (decision.TASK_STATUS_LABELS[task.status] || task.status) + "）");
+        return;
+      }
+      const gate = decision.taskGate(task, decisionStore.tasks);
+      const partials = gate.dependencies.filter(function (r) {
+        return r.gate === "can_continue";
+      });
+      if (!partials.length) {
+        apiError(res, 409, "gate_not_needs_continue",
+          gate.state === "ready" ? "前置条件已满足，任务会按计划时间自动执行，无需确认"
+          : "当前没有需要确认的部分成功前置（等待原因：" +
+            (decision.GATE_STATE_LABELS[gate.state] || gate.state) + "）");
+        return;
+      }
+      const prevConfirmed = Object.assign({}, task.continueConfirmed || {});
+      const doneNow = [];
+      partials.forEach(function (r) {
+        if (!(task.continueConfirmed || {})[r.taskId]) {
+          task.continueConfirmed = task.continueConfirmed || Object.create(null);
+          task.continueConfirmed[r.taskId] = { at: now, by: actor };
+          doneNow.push(r);
+        }
+      });
+      task.updatedAt = now;
+      const le = addTaskLog(task, "task_dependency_continue",
+        "负责人确认继续：接受前置任务部分成功的结果" +
+        (doneNow.map(function (r) {
+          return "“" + (r.decisionName || r.taskId.slice(0, 8)) + "”";
+        }).join("、")) +
+        "；其余前置条件满足后任务将在计划时间执行（仅放行一次）");
+      const gatesRes = reconcileTaskGates(actor);
+      save(function () {
+        okResp();
+      }, function () {
+        task.continueConfirmed = prevConfirmed;
+        task.updatedAt = now;
+        const i = decisionStore.logs.indexOf(le);
+        if (i !== -1) decisionStore.logs.splice(i, 1);
+      }, gatesRes);
       return;
     }
 
@@ -3263,9 +3916,13 @@ function publicTasks(statusFilter) {
       var ka = decision.taskIsActive(a) ? a.scheduledAtMs : Date.parse(a.finishedAt || a.updatedAt || 0);
       var kb = decision.taskIsActive(b) ? b.scheduledAtMs : Date.parse(b.finishedAt || b.updatedAt || 0);
       return decision.taskIsActive(a) ? ka - kb : kb - ka;
-    })
-    .map(decision.taskSummary);
-  return { rev: decisionStore.rev, tasks: list };
+    });
+  // 一次性计算整张任务图门控（含活动任务间的传递阻断）
+  const gates = decision.computeGates(decisionStore.tasks);
+  return {
+    rev: decisionStore.rev,
+    tasks: list.map(function (t) { return decision.taskSummary(t, gates[t.id]); })
+  };
 }
 
 // 定时执行成功后构造一份“执行后文本”快照对象（不立即落盘），
@@ -3318,6 +3975,10 @@ function blockTask(task, d, reasonCode, message, now) {
 // 执行到达生效时间的任务。只在任务仍为 scheduled 且未在执行中时触发。
 function fireDueTask(task) {
   if (task.status !== "scheduled" || runningTaskIds.has(task.id)) return;
+  // 到点未满足前置条件（依赖未成功/需确认继续/审批未达门槛/被拒绝）绝不执行；
+  // 等待原因与审批进度由 schedulerTick 的门控对账提前持久化并展示。
+  const gate = decision.taskGate(task, decisionStore.tasks);
+  if (gate.state !== "ready") return;
   const d = findDecision(task.decisionId);
   const batch = d ? findBatch(d.batchId) : null;
   const now = new Date().toISOString();
@@ -3336,6 +3997,7 @@ function fireDueTask(task) {
     executionsLen: d.executions.length, lastExecutionId: d.lastExecutionId
   } : null;
   let result = null;
+  let gateRec = null; // 终态后的下游门控级联（随本事务一起回滚）
   let extraLogs = []; // 本函数通过 addTaskLog 追加的任务级记录
 
   function restoreAll() {
@@ -3362,6 +4024,7 @@ function fireDueTask(task) {
       const i = decisionStore.logs.indexOf(le);
       if (i !== -1) decisionStore.logs.splice(i, 1);
     });
+    if (gateRec) gateRec.rollback();
     if (result) result.rollback();
     decisionStore.rev--;
     if (pendingSnapshot) {
@@ -3433,6 +4096,9 @@ function fireDueTask(task) {
   function block(reasonCode, message) {
     const le = blockTask(task, d, reasonCode, message, now);
     if (le) extraLogs.push(le);
+    // 阻断也是终态：下游任务必须随之进入阻断，级联随本事务一起落盘/回滚
+    gateRec = reconcileTaskGates("系统定时执行");
+    gateRec.logs.forEach(function (gle) { extraLogs.push(gle); });
     commit(release);
   }
   if (!d) { block("decision_gone", "决策草案已不存在"); return; }
@@ -3531,19 +4197,50 @@ function fireDueTask(task) {
     task.snapshotId = pendingSnapshot.id;
   }
 
+  // 任务进入终态后立即重算下游活动任务门控（可继续/等待/阻断），
+  // 与本次执行同一事务落盘；级联日志纳入 extraLogs 以便失败回滚。
+  gateRec = reconcileTaskGates("系统定时执行");
+  gateRec.logs.forEach(function (le) { extraLogs.push(le); });
+
   commit(function afterCommit(ok) {
     release();
   });
 }
 
+let gatePersisting = false;
 function schedulerTick() {
   if (runningTaskIds.size > 0) return; // 上一个任务仍在落盘，等下一轮
   const nowMs = Date.now();
-  // 每轮只触发最早到期的一个任务：多个任务同轮触发时其内存改动与
-  // rev 推进会交叉，串行化后回滚与计数都互不影响（其余下轮再触发）。
+
+  // 先对账门控：HTTP 与上一进程可能留下未持久化的依赖状态变化
+  // （重启后按持久化 gateState 展示，但这里统一以当前任务图重算一次）。
+  // 门控有变化时先落盘，下一轮再触发，保证“只放行一次”与日志不丢。
+  if (!gatePersisting) {
+    let rec = null;
+    try { rec = reconcileTaskGates("系统定时执行"); }
+    catch (e) { console.error("gate reconcile failed:", e); rec = null; }
+    if (rec && rec.changed) {
+      gatePersisting = true;
+      decisionStore.rev++;
+      persistDecisions(function (err) {
+        gatePersisting = false;
+        if (err) {
+          rec.rollback();
+          decisionStore.rev--;
+          console.error("gate reconcile persist failed:", err);
+        }
+      });
+      return; // 本轮不触发执行，待门控落盘后的下一轮
+    }
+  }
+
+  // 每轮只触发最早到期且门控已满足的一个任务：多个任务同轮触发时其内存
+  // 改动与 rev 推进会交叉，串行化后回滚与计数都互不影响（其余下轮再触发）。
   const due = decisionStore.tasks
     .filter(function (t) {
-      return t.status === "scheduled" && Number(t.scheduledAtMs) <= nowMs;
+      if (t.status !== "scheduled" || Number(t.scheduledAtMs) > nowMs) return false;
+      // 双重保险：到点未满足前置条件绝不能误执行
+      return decision.taskGate(t, decisionStore.tasks).state === "ready";
     })
     .sort(function (a, b) { return Number(a.scheduledAtMs) - Number(b.scheduledAtMs); });
   if (!due.length) return;
@@ -3556,6 +4253,8 @@ function schedulerTick() {
 
 // 重启恢复：running 是上一进程崩溃/被杀时未及落终态的任务，
 // 不自动补跑（可能批注已落盘一半），标记 interrupted 等待人工重试。
+// 随后按当前任务图重算全部门控：依赖/审批状态随重启完整恢复，
+// 已到点且条件满足的任务由调度器幂等补触发（成功条目不会重复处理）。
 function recoverInterruptedTasks() {
   let changed = false;
   decisionStore.tasks.forEach(function (t) {
@@ -3573,10 +4272,17 @@ function recoverInterruptedTasks() {
       changed = true;
     }
   });
-  if (changed) {
+  // 重启后重算门控：门控字段已随每次变更持久化，此处只补齐结构性差异，
+  // 状态未变化时 reconcile 幂等、不产生重复日志。
+  const gateRec = reconcileTaskGates("系统重启");
+  if (changed || gateRec.changed) {
     decisionStore.rev++;
     persistDecisions(function (err) {
-      if (err) console.error("recover interrupted tasks persist failed:", err);
+      if (err) {
+        gateRec.rollback();
+        decisionStore.rev--;
+        console.error("recover interrupted tasks persist failed:", err);
+      }
     });
   }
 }
@@ -3608,7 +4314,7 @@ function handleAPI(req, res, pathname, urlObj) {
     handleReviewDecisions(req, res, parts, urlObj);
     return;
   }
-  if (parts[1] === "execution-tasks" && parts.length <= 4) {
+  if (parts[1] === "execution-tasks" && parts.length <= 6) {
     handleExecutionTasks(req, res, parts, urlObj);
     return;
   }

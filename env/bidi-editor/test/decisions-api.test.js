@@ -17,7 +17,7 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 
-const PORT = 8620 + Math.floor(Math.random() * 200);
+const PORT = 8430 + Math.floor(Math.random() * 90);
 const BASE = "http://127.0.0.1:" + PORT;
 const TMP = os.tmpdir();
 const TAG = Date.now() + "-" + process.pid;

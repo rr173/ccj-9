@@ -1,12 +1,14 @@
-# 双向文本编辑器（中文 ⇄ 阿拉伯文同段混排）+ 审阅快照 + 协作批注 + 审阅批次 + 审阅决策 + 定时执行队列
+# 双向文本编辑器（中文 ⇄ 阿拉伯文同段混排）+ 审阅快照 + 协作批注 + 审阅批次 + 审阅决策 + 定时执行队列（任务依赖与执行前审批）
 
 一个零依赖 Node 服务 + 网页编辑器，支持同一段落内中文（从左到右）与阿拉伯文（从右到左）混排，
 提供可恢复、可比较、带乐观并发控制的**审阅快照**功能，可锚定到逻辑字符范围、
 支持回复与四态工作流的**协作批注**功能，把一组批注命名编组、
 跟踪负责人/截止时间/实时进度/完整审阅记录的**审阅批次**功能，在批次批注上
 逐条拟定保留/替换/删除方案、多人投票、三版本校验后部分执行并可撤销的**审阅决策**功能，
-以及把达标草案发布到执行队列、锁定版本、到点由服务端自动执行、可暂停/恢复/取消/失败重试的
-**决策发布与定时执行**功能。
+把达标草案发布到执行队列、锁定版本、到点由服务端自动执行、可暂停/恢复/取消/失败重试的
+**决策发布与定时执行**功能，以及在执行队列上为未开始任务配置**前置任务依赖与
+1~3 名审批人的执行前审批**（部分成功需确认、失败等待、取消阻断、到点未满足绝不执行、
+重启恢复、全流程留痕关联快照）。
 
 ## 双向编辑的需求与实现对照
 
@@ -171,13 +173,17 @@ GET    /api/review-decisions/:id/logs   决策记录，支持 ?from=&to= 时间�
 ### 执行队列 HTTP API 摘要
 
 ```
-GET    /api/execution-tasks[?status=]      队列列表（活动任务在前，按计划时间排序）
-POST   /api/execution-tasks                发布 {decisionId, scheduledAt, paragraphs, actor}（If-Match 必需）
-GET    /api/execution-tasks/:id            任务详情（锁定版本/尝试记录/成功条目）
+GET    /api/execution-tasks[?status=]      队列列表（活动任务在前，按计划时间排序，含门控与审批进度）
+POST   /api/execution-tasks                发布 {decisionId, scheduledAt, paragraphs, actor, dependencies?, approval?}（If-Match 必需）
+GET    /api/execution-tasks/:id            任务详情（锁定版本/尝试记录/成功条目/门控/审批）
 POST   /api/execution-tasks/:id/pause      暂停（If-Match 必需）
 POST   /api/execution-tasks/:id/resume     恢复 {scheduledAt?}（If-Match 必需）
 POST   /api/execution-tasks/:id/cancel     取消 {reason?}（If-Match 必需；草案退回 ready）
 POST   /api/execution-tasks/:id/retry      失败重试 {scheduledAt?, paragraphs?, actor}（If-Match 必需）
+POST   /api/execution-tasks/:id/config     修改前置任务/审批配置 {dependencies?, approval?, actor}（If-Match 必需）
+POST   /api/execution-tasks/:id/approvals  审批 {approver, decision:"approve"|"reject"}（记名，同审批人最后一次决定为准）
+POST   /api/execution-tasks/:id/approvals/:approver/withdraw  撤回本人审批决定 {}
+POST   /api/execution-tasks/:id/continue   前置部分成功时负责人确认继续（If-Match 必需）
 GET    /api/execution-tasks/:id/logs       队列记录，支持 ?from=&to= 时间筛选
 ```
 
@@ -185,6 +191,46 @@ GET    /api/execution-tasks/:id/logs       队列记录，支持 ?from=&to= 时�
 `succeeded` 全部成功 / `partial` 部分成功 / `failed` 零成功 / `blocked` 到点被阻断 /
 `cancelled` 已取消。任务与草案共用决策集合 rev（`X-Decision-Rev`），轮询间隔可用
 `DECISION_SCHEDULER_INTERVAL_MS` 调整。
+
+## 任务依赖与执行前审批
+
+负责人可以为**尚未开始**（`scheduled`/`paused`）的执行任务配置**前置任务**与
+**执行前审批**。只有前置任务全部成功（部分成功需负责人确认）且审批达到最少通过人数，
+任务才允许在计划时间进入执行；条件不满足时到点绝不执行，条件后来满足只自动放行一次。
+
+### 前置门控 gate（独立于任务状态）
+
+依赖与审批不改变任务自身状态（未开始的任务仍是 `scheduled`/`paused`），其能否执行
+由任务上的 `gate` 表示。队列列表、任务详情与草案详情都实时返回门控状态、等待原因
+（`reason`/`blockingDependency`）与当前审批进度：
+
+| gate 状态 | 含义 | 触发条件 |
+|---|---|---|
+| `ready` | 前置已满足，到点执行 | 前置全部成功且审批达标（或无前置无审批） |
+| `waiting` | 等待中 | 前置尚未结束（含前置自己还在等审批/暂停），或前置 `failed` 等待其重试成功 |
+| `can_continue` | 可继续 | 前置任务为 `partial`（部分成功），**需负责人显式确认继续** |
+| `blocked` | 已阻断 | 前置 `cancelled`/终态 `blocked`/不存在，或阻断沿依赖链向上传递 |
+| `approvals` | 等待执行前审批 | 依赖已满足，但通过人数未达门槛且无拒绝 |
+| `rejected` | 审批被拒绝 | 任一指定审批人拒绝（撤回拒绝并补足通过后可继续） |
+
+前置终态到后继门控的单跳映射：`succeeded→ready`、`partial→can_continue`、
+`failed→waiting`（重试成功后自动重新评估）、`cancelled/blocked→blocked`。
+门控沿依赖链传递：上游任务自身未被放行（被阻断/在等待/待确认/审批被拒）时，
+其结果对后继不可用，后继相应进入阻断或等待——例如前置 A 已成功但其自身的前置被取消，
+依赖 A 的任务仍被阻断。
+
+| 需求 | 实现方式 |
+|---|---|
+| 为未开始任务配置前置 | 发布时可带 `dependencies:[taskId...]`；或 `POST …/:id/config` 修改。拒绝自依赖 409 `self_dependency`、不存在的任务 404 `dependency_not_found`、（含新边的）循环依赖 409 `dependency_cycle`；重复 id 去重 |
+| 指定 1~3 名审批人与最少通过人数 | 发布时或 config 中给 `approval:{approvers:[...], minApprovals:n}`；审批人不能为空/超长、**不能重复**（409 `duplicate_approver`），`minApprovals` 必须在 1..审批人数之间；显式 `approval:null` 取消审批要求 |
+| 修改配置按当前决策版本并发校验 | config 与发布/暂停等一样必须 `If-Match: <X-Decision-R>`，旧页面一律 409 `version_conflict` 且不写盘；**已开始/已完成任务不能再改配置**（409 `task_config_locked`） |
+| 改审批配置重置审批 | 修改审批人名单或门槛后，已有审批决定全部清空（`task_approval_configured` 留痕）；仅改依赖不影响已有审批 |
+| 审批通过/拒绝/撤回 | `POST …/:id/approvals`（记名；非指定审批人 403 `not_approver`；同审批人重复相同决定幂等）；拒绝由本人 `…/withdraw` 撤回，撤回后按剩余决定重新计票；终态任务不能再审批 |
+| 部分成功需确认才继续 | `can_continue` 任务即使计划时间已过也不执行；负责人 `POST …/:id/continue` 确认后放行；错误状态调用 409 `gate_not_needs_continue`；确认按依赖逐个记录，重试/改配置后旧确认失效 |
+| 到点不误执行、满足后只触发一次 | 调度器每轮先对账门控再选到期任务，门控非 `ready` 一律不触发（双重检查）；条件在到期后才满足时，下轮询幂等补触发一次，执行幂等保证成功条目不重复处理，审批/执行均不会重复 |
+| 阻断/解除/等待/审批全部留痕 | 阻断 `task_dependency_blocked`、解除 `task_dependency_unblocked`、可继续 `task_dependency_can_continue`、确认继续 `task_dependency_continue`、配置变更 `task_dependencies_changed`/`task_approval_configured`、通过 `task_approved`、拒绝 `task_rejected`、撤回 `task_approval_withdrawn`、达标 `task_approval_met`、否决 `task_approval_rejected` 等都进任务日志，可 `?from=&to=` 按时间筛选 |
+| 日志关联对应快照 | 配置审批的任务自动保存“执行前审批”文本快照，审批通过/拒绝/撤回记录关联其 `snapshotId`；依赖阻断日志关联前置任务的执行/审批快照；保存任意快照继续嵌入当时的执行队列（含门控与审批决定） |
+| 重启恢复 | 门控状态、等待原因、依赖配置、审批配置、逐人审批决定与“确认继续”记录全部随决策文件持久化；重启后按当前任务图重算门控（幂等，不产生重复日志），依赖/审批状态完整恢复 |
 
 ### 批次详情中的决策关联
 
@@ -247,6 +293,8 @@ node --test test/
 - `test/decision-core.test.js`：决策草案校验、记名投票与门槛流转、改方案清票、三版本逐条冲突（文本/批注/批次）、按段预览、同段多条从后向前应用、部分成功、撤销基线、快照摘要
 - `test/decisions-api.test.js`：创建校验（归档/过期/重复草案/空方案/缺投票人）、方案填写与提交、两人投票流转、预览不写盘、三版本逐条冲突的部分成功执行、成功批注转已解决、旧决策版本 409、同草案不可重复执行、撤销（执行后变化不覆盖、全局最近一次顺序）、快照嵌入决策、归档冻结、按时间记录、重启持久化
 - `test/execution-tasks-api.test.js`：发布校验（缺/过去/非法时间、非待执行、重复发布、晚于截止、版本冲突）、发布锁定版本、暂停/恢复/取消、到点自动执行与自动快照、逐条冲突的部分成功、失败重试幂等（成功条目不重复处理）、重锁重试成功、重启后未来任务等待与错过任务补执行、队列记录按时间筛选、快照嵌入执行队列
+- `test/task-gate-core.test.js`：审批配置与审批统计校验（1~3 人/不重复/门槛/撤回/拒绝即否决）、依赖图校验（自依赖/循环/不存在）、门控映射与依赖链传递（成功/部分/失败/取消/阻断/活动前置）、部分成功确认后放行、重启后门控摘要恢复
+- `test/task-dependencies-api.test.js`：发布/配置时的依赖与审批校验、到点前置未满足绝不执行、前置成功后只触发一次、取消联动阻断与日志、配置版本并发校验与终态锁定、审批通过/拒绝/撤回/幂等/非审批人 403、失败→等待与部分成功→确认继续、重启恢复依赖与审批状态
 
 ## Docker 部署
 
@@ -270,12 +318,12 @@ style.css         编辑器样式 + 审阅/快照面板/弹窗/差异高亮（bd
 app.js            段落方向、编辑时间戳、纯文本粘贴、状态栏、序列化/恢复、码点锚点 API（window.Editor）
 snapshot-core.js  快照纯逻辑：校验 + LCS 差异（浏览器与 Node 共用，无 DOM 依赖）
 review-core.js    批注/审阅批次纯逻辑：校验 + 锚点重定位 + 批次载荷校验与实时进度（浏览器与 Node 共用，无 DOM 依赖）
-decision-core.js  审阅决策纯逻辑：方案/投票校验、逐条投票统计、文本指纹与段落对齐、三版本逐条冲突判定、执行合成与按段预览、快照摘要（依赖 snapshot-core）
+decision-core.js  审阅决策纯逻辑：方案/投票校验、逐条投票统计、文本指纹与段落对齐、三版本逐条冲突判定、执行合成与按段预览、执行队列门控（任务依赖图校验/依赖链传递/执行前审批统计）、快照摘要（依赖 snapshot-core）
 snapshots.js      快照 UI：列表/比较/恢复预览二次确认/版本冲突
 annotations.js    批注 UI：列表筛选（段落/四态/批次）/新建/详情回复/四态状态/冲突处理/快照批注查看与恢复
 batches.js        审阅批次 UI：新建（命名/负责人/截止/说明/勾选批注）、列表与实时进度、详情批量操作、加/移成员、归档、按时间查看审阅记录
-decisions.js      审阅决策 UI：从批次创建草案、逐条填写保留/替换/删除、记名投票、按段执行前预览、部分成功执行结果、撤销最近一次执行、发布到执行队列（计划时间/剩余时间/暂停/恢复/取消/失败重试）、按时间记录、快照决策与队列查看
-server.js         零依赖服务：静态文件 + 快照、批注、审阅批次、审阅决策、执行队列 JSON API（四集合乐观锁、原子落盘、定时执行调度器）
+decisions.js      审阅决策 UI：从批次创建草案、逐条填写保留/替换/删除、记名投票、按段执行前预览、部分成功执行结果、撤销最近一次执行、发布到执行队列（计划时间/剩余时间/暂停/恢复/取消/失败重试）、前置任务与执行前审批（等待原因/审批进度/确认继续）、按时间记录、快照决策与队列查看
+server.js         零依赖服务：静态文件 + 快照、批注、审阅批次、审阅决策、执行队列（依赖/审批门控）JSON API（四集合乐观锁、原子落盘、定时执行调度器与门控对账）
 test/             node:test 单元与集成测试
 Dockerfile        node:20-alpine，EXPOSE 8080，数据卷 /app/data
 ```

@@ -14,7 +14,7 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 
-const PORT = 8330 + Math.floor(Math.random() * 200);
+const PORT = 8230 + Math.floor(Math.random() * 90);
 const BASE = "http://127.0.0.1:" + PORT;
 const SNAP_DATA = path.join(os.tmpdir(), "ann-snap-" + Date.now() + "-" + process.pid + ".json");
 const ANN_DATA = path.join(os.tmpdir(), "ann-data-" + Date.now() + "-" + process.pid + ".json");

@@ -36,6 +36,10 @@
     DECISION_MAX_COUNT: 200,
     TASK_MAX_COUNT: 500,
     TASK_ATTEMPT_MAX: 50,
+    TASK_APPROVER_MIN: 1,
+    TASK_APPROVER_MAX: 3,           // 一到三名审批人
+    APPROVER_NAME_MAX_CHARS: 50,
+    TASK_DEPENDENCY_MAX: 50,
     ITEM_VOTE_HISTORY_MAX: 200,    // 每条投票流水保留条数
     LOG_MAX: 5000
   };
@@ -66,6 +70,9 @@
    *   failed    本次没有成功条目（终态；草案退回待执行，可重试）
    *   blocked   到期但批次归档/草案过期等整体不能执行（终态；需先排除原因）
    *   cancelled 已取消（终态；草案退回待执行）
+   *
+   * 依赖与审批不改变任务自身状态：未开始的任务仍是 scheduled/paused，
+   * 其“能否在计划时间进入执行”由独立的前置门控 gate 表示（见 GATE_STATES）。
    */
   var TASK_STATUSES = ["scheduled", "paused", "running",
                       "succeeded", "partial", "failed", "blocked", "cancelled"];
@@ -77,6 +84,35 @@
     succeeded: "全部成功", partial: "部分成功", failed: "执行失败",
     blocked: "已阻断", cancelled: "已取消"
   };
+
+  /* 前置门控（gate）：scheduled/paused 任务在计划时间到来时还要再过两道关。
+   *   ready         前置全部满足，到点允许执行
+   *   waiting       等待中：前置任务尚未结束，或前置失败等待重试后重新评估
+   *   can_continue  前置任务“部分成功”：负责人确认后即可继续（需显式确认）
+   *   blocked       被阻断：前置取消/终态阻断，或前置链上传递了阻断/等待
+   *   approvals     等待执行前审批（依赖已满足，但审批未达门槛）
+   *   rejected      审批被拒绝
+   */
+  var GATE_STATES = ["ready", "waiting", "can_continue", "blocked",
+                     "approvals", "rejected"];
+  var GATE_STATE_LABELS = {
+    ready: "前置已满足",
+    waiting: "等待前置任务",
+    can_continue: "前置部分成功，待确认继续",
+    blocked: "前置未通过，已阻断",
+    approvals: "等待执行前审批",
+    rejected: "审批已拒绝"
+  };
+  // 前置任务终态 → 直接后续任务的依赖门控（不传递时的单跳规则）
+  var DEPENDENCY_TERMINAL_GATE = {
+    succeeded: "ready",
+    partial: "can_continue",
+    failed: "waiting",
+    blocked: "blocked",
+    cancelled: "blocked"
+  };
+
+  var APPROVAL_LABELS = { approve: "通过", reject: "拒绝" };
 
   var RESULT_LABELS = { success: "成功", conflict: "冲突", skipped: "跳过" };
   var REASON_LABELS = {
@@ -437,7 +473,432 @@
                       task.status === "running");
   }
 
-  function taskSummary(t) {
+  /* ---------- 任务依赖配置 ---------- */
+
+  function validateApproverName(v) {
+    if (typeof v !== "string" || !v.trim()) {
+      return err(400, "missing_approver", "审批人必须署名（不能为空）");
+    }
+    var name = v.trim();
+    if (cpLen(name) > LIMITS.APPROVER_NAME_MAX_CHARS) {
+      return err(400, "approver_too_long",
+        "审批人名称不能超过 " + LIMITS.APPROVER_NAME_MAX_CHARS + " 个字符");
+    }
+    return { ok: true, value: name };
+  }
+
+  // 审批配置：null/缺省 = 不要求执行前审批；
+  // 否则 approvers 1~3 人且互不重复，minApprovals 在 1..审批人数之间。
+  // 返回 value：null 或 {approvers:[name...], minApprovals:n}
+  function validateApprovalConfig(payload) {
+    if (payload == null) return { ok: true, value: null };
+    var ap = payload;
+    if (ap && ap.approval !== undefined) ap = ap.approval;
+    if (ap == null) return { ok: true, value: null };
+    if (typeof ap !== "object" || Array.isArray(ap)) {
+      return err(400, "invalid_approval", "审批配置必须是对象");
+    }
+    var raw = ap.approvers;
+    if (raw == null || raw === "") return { ok: true, value: null };
+    if (!Array.isArray(raw)) {
+      return err(400, "invalid_approvers", "审批人必须是数组");
+    }
+    if (raw.length === 0) return { ok: true, value: null };
+    if (raw.length < LIMITS.TASK_APPROVER_MIN ||
+        raw.length > LIMITS.TASK_APPROVER_MAX) {
+      return err(400, "invalid_approvers",
+        "审批人必须为 " + LIMITS.TASK_APPROVER_MIN + " 到 " +
+        LIMITS.TASK_APPROVER_MAX + " 名");
+    }
+    var names = [];
+    var seen = Object.create(null);
+    for (var i = 0; i < raw.length; i++) {
+      var chk = validateApproverName(raw[i]);
+      if (!chk.ok) return chk;
+      if (seen[chk.value]) {
+        return err(409, "duplicate_approver",
+          "审批人“" + chk.value + "”重复：同一名审批人只能出现一次");
+      }
+      seen[chk.value] = true;
+      names.push(chk.value);
+    }
+    var min = ap.minApprovals;
+    if (min == null || min === "") min = names.length;
+    if (!isInt(min) || min < 1 || min > names.length) {
+      return err(400, "invalid_min_approvals",
+        "最少通过人数必须是 1 到审批人数（" + names.length + "）之间的整数");
+    }
+    return { ok: true, value: { approvers: names, minApprovals: min } };
+  }
+
+  // 依赖配置：缺省/null/[] = 无前置；否则每一项必须是字符串任务 id。
+  // 去重保序后返回；数量上限在此校验，自依赖/循环/不存在由
+  // validateTaskDependencies 在完整任务图上统一校验。
+  function normalizeDependencyIds(raw) {
+    if (raw == null || raw === "") return { ok: true, value: [] };
+    if (raw && !Array.isArray(raw.dependencyIds) && raw.dependencies !== undefined) {
+      raw = raw.dependencies;
+    }
+    if (!Array.isArray(raw)) {
+      return err(400, "invalid_dependencies", "前置任务必须是数组");
+    }
+    var ids = [];
+    var seen = Object.create(null);
+    for (var i = 0; i < raw.length; i++) {
+      var v = raw[i];
+      if (typeof v !== "string" || !v.trim()) {
+        return err(400, "invalid_dependency", "第 " + (i + 1) + " 个前置任务 id 无效");
+      }
+      v = v.trim();
+      if (seen[v]) continue; // 同一前置重复列出按一次计
+      seen[v] = true;
+      ids.push(v);
+    }
+    if (ids.length > LIMITS.TASK_DEPENDENCY_MAX) {
+      return err(413, "too_many_dependencies",
+        "前置任务不能超过 " + LIMITS.TASK_DEPENDENCY_MAX + " 个");
+    }
+    return { ok: true, value: ids };
+  }
+
+  // 在完整任务图上校验依赖：拒绝自依赖、不存在的任务与（含本任务新边的）循环。
+  //   taskId        被配置的任务（发布时可能尚不存在，传 null）
+  //   dependencyIds normalize 后的候选依赖
+  //   tasks         当前全部任务
+  function validateTaskDependencies(taskId, dependencyIds, tasks) {
+    var byId = Object.create(null);
+    (tasks || []).forEach(function (t) { byId[t.id] = t; });
+    var deps = (dependencyIds || []).slice();
+
+    for (var i = 0; i < deps.length; i++) {
+      if (taskId && deps[i] === taskId) {
+        return err(409, "self_dependency", "不能把任务自身设为前置任务");
+      }
+      if (!byId[deps[i]]) {
+        return err(404, "dependency_not_found",
+          "前置任务 " + deps[i].slice(0, 8) + " 不存在，可能已被清理，请刷新后重试");
+      }
+    }
+    // 循环检测：以每个候选前置为起点沿既有 dependencyIds 边游走，
+    // 若能回到本任务则新边闭合出环（同时也覆盖既有图中的环）。
+    var edges = Object.create(null);
+    Object.keys(byId).forEach(function (id) {
+      edges[id] = Array.isArray(byId[id].dependencyIds)
+        ? byId[id].dependencyIds.filter(function (x) { return !!byId[x]; }) : [];
+    });
+    if (taskId) {
+      // 用候选依赖替换本任务出边后再检测（配置可能是在删/改既有依赖）
+      edges[taskId] = deps.filter(function (x) { return !!byId[x]; });
+    }
+    var startIds = taskId ? [taskId] : deps;
+    for (var s = 0; s < startIds.length; s++) {
+      var stack = [[startIds[s], 0]];
+      var seen = Object.create(null);
+      while (stack.length) {
+        var frame = stack.pop();
+        var node = frame[0], depth = frame[1];
+        if (depth > LIMITS.TASK_DEPENDENCY_MAX) {
+          return err(409, "dependency_cycle", "前置任务形成了循环依赖，请调整");
+        }
+        var next = edges[node] || [];
+        for (var k = 0; k < next.length; k++) {
+          if (taskId && next[k] === taskId && node !== taskId) {
+            return err(409, "dependency_cycle",
+              "该前置关系会形成循环依赖（经任务 " +
+              (byId[node] ? byId[node].decisionName : node.slice(0, 8)) + "），请调整");
+          }
+          if (!seen[next[k]]) {
+            seen[next[k]] = true;
+            stack.push([next[k], depth + 1]);
+          }
+        }
+      }
+    }
+    return { ok: true, value: deps };
+  }
+
+  /* ---------- 执行前审批统计 ---------- */
+
+  // decisions: [{approver, decision:"approve"|"reject", at, withdrawnAt?}]
+  // 同一审批人以最后一次未撤回的决定为准；返回当前进度与审批门控状态：
+  //   none     未配置审批
+  //   pending  尚无人拒绝，通过人数未达门槛
+  //   approved 达到最少通过人数（且无拒绝）
+  //   rejected 已有拒绝（一名拒绝即否决；撤回拒绝后自动回到 pending/approved）
+  function approvalTally(approval, decisions) {
+    if (!approval || !Array.isArray(approval.approvers) || !approval.approvers.length) {
+      return { configured: false, approvers: [], minApprovals: 0,
+               approved: 0, rejected: 0, pending: 0, decided: 0,
+               byApprover: {}, state: "none" };
+    }
+    var latest = Object.create(null);
+    (decisions || []).forEach(function (x) {
+      if (x && x.withdrawnAt) return;
+      if (x && (x.decision === "approve" || x.decision === "reject")) {
+        latest[x.approver] = x.decision;
+      }
+    });
+    var counts = { approve: 0, reject: 0 };
+    approval.approvers.forEach(function (name) {
+      if (latest[name]) counts[latest[name]]++;
+    });
+    var decided = counts.approve + counts.reject;
+    var state;
+    if (counts.reject > 0) state = "rejected";
+    else if (counts.approve >= approval.minApprovals) state = "approved";
+    else state = "pending";
+    return {
+      configured: true,
+      approvers: approval.approvers.slice(),
+      minApprovals: approval.minApprovals,
+      approved: counts.approve,
+      rejected: counts.reject,
+      pending: approval.approvers.length - decided,
+      decided: decided,
+      byApprover: latest,
+      state: state
+    };
+  }
+
+  /* ---------- 前置门控（依赖 + 审批的统一计算） ---------- */
+
+  // 单个依赖对直接后继的门控（单跳）；active 前置一律 waiting。
+  function directDependencyGate(dep) {
+    if (!dep) return { state: "blocked", reason: "dependency_not_found" };
+    if (taskIsActive(dep)) return { state: "waiting", reason: "dependency_active" };
+    return {
+      state: DEPENDENCY_TERMINAL_GATE[dep.status] || "blocked",
+      reason: "dependency_" + dep.status
+    };
+  }
+
+  // 计算一个活动任务的完整前置门控（内部递归版，带 memo 缓存）。
+  //   task       活动任务（scheduled/paused/running）
+  //   allTasks   全部任务（依赖任务图）
+  // 合并优先级：blocked > rejected > waiting > can_continue > approvals > ready
+  function taskGateImpl(task, list, byId, memo, stack) {
+    if (memo[task.id]) return memo[task.id];
+    if (stack && stack[task.id]) {
+      return { state: "blocked", reason: "dependency_cycle",
+               dependencyState: "blocked", approvalState: "none",
+               dependencies: [], blockingDependency: null, approval: null };
+    }
+    var nextStack = Object.assign({}, stack || null);
+    nextStack[task.id] = true;
+
+    function effectiveDep(dep, rowVia) {
+      if (!dep) return { state: "blocked", reason: "dependency_not_found", via: null };
+      var own = directDependencyGate(dep); // 终态：成功/部分/失败/取消/阻断
+      if (dep.status === "scheduled" || dep.status === "paused") {
+        // 前置自身还在等待：它的门控（审批/继续确认/上游传递）决定其结果可用性
+        var dg = taskGateImpl(dep, list, byId, memo, nextStack);
+        if (dg.state === "ready" || dg.state === "approvals") {
+          // 前置本身尚未执行完毕（即使只差审批），对后继仍是“等待中”；
+          // 但前置只在等审批而本任务也在等审批时，下面的本任务审批优先生效
+          return { state: "waiting", reason: "dependency_active", via: dep.id };
+        }
+        return {
+          state: dg.state === "rejected" ? "blocked" : dg.state,
+          reason: dg.reason, via: dep.id
+        };
+      }
+      // 终态前置还要沿其依赖链传播（其结果是在更上游条件下得到的）
+      var worst = own;
+      (dep.dependencyIds || []).forEach(function (pid) {
+        var pg = effectiveDep(byId[pid], pid);
+        if (pg.state === "blocked" ||
+            (pg.state === "waiting" && worst.state !== "blocked") ||
+            (pg.state === "can_continue" && worst.state === "ready")) {
+          worst = { state: pg.state, reason: pg.reason, via: pid };
+        }
+      });
+      return worst;
+    }
+
+    var depState = "ready";
+    var depRows = [];
+    var blockingDep = null;
+    (task.dependencyIds || []).forEach(function (pid) {
+      var dep = byId[pid];
+      var g = effectiveDep(dep, pid);
+      // 负责人对“部分成功前置”的确认：确认后该前置视为可继续放行
+      var conf = (task.continueConfirmed || {})[pid];
+      if (g.state === "can_continue" && conf) g = { state: "ready", reason: "partial_confirmed" };
+      depRows.push({
+        taskId: pid,
+        decisionName: dep ? dep.decisionName : null,
+        status: dep ? dep.status : "not_found",
+        gate: g.state,
+        reason: g.reason,
+        via: g.via || null,
+        confirmed: !!conf,
+        snapshotId: dep ? (dep.snapshotId || dep.approvalSnapshotId || null) : null
+      });
+      if (g.state === "blocked" ||
+          (g.state === "waiting" && depState !== "blocked") ||
+          (g.state === "can_continue" && depState === "ready")) {
+        depState = g.state;
+        if (g.state !== "ready") blockingDep = depRows[depRows.length - 1];
+      }
+    });
+
+    var tally = approvalTally(task.approval || null, task.approvalDecisions || []);
+    var appState = tally.state; // none | pending | approved | rejected
+
+    var state, reason;
+    if (depState === "blocked") {
+      state = "blocked";
+      reason = blockingDep ? blockingDep.reason : "dependency_blocked";
+    } else if (appState === "rejected") {
+      state = "rejected";
+      reason = "approval_rejected";
+    } else if (depState === "waiting") {
+      state = "waiting";
+      reason = blockingDep ? blockingDep.reason : "dependency_active";
+    } else if (depState === "can_continue") {
+      state = "can_continue";
+      reason = "dependency_partial";
+    } else if (tally.configured && appState === "pending") {
+      state = "approvals";
+      reason = "approval_pending";
+    } else if (tally.configured && appState === "approved") {
+      state = "ready";
+      reason = "approved";
+    } else {
+      state = "ready";
+      reason = depRows.length ? "dependencies_satisfied" : "no_prerequisites";
+    }
+
+    var result = {
+      state: state,
+      reason: reason,
+      dependencyState: depState,
+      approvalState: appState,
+      dependencies: depRows,
+      blockingDependency: blockingDep,
+      continueConfirmations: depRows
+        .filter(function (row) { return row.status === "partial"; })
+        .map(function (row) {
+          var conf = (task.continueConfirmed || {})[row.taskId];
+          return {
+            taskId: row.taskId,
+            needsConfirm: true,
+            confirmed: !!conf,
+            confirmedAt: conf ? (conf.at || null) : null,
+            confirmedBy: conf ? (conf.by || null) : null
+          };
+        }),
+      approval: tally.configured ? {
+        approvers: tally.approvers,
+        minApprovals: tally.minApprovals,
+        approved: tally.approved,
+        rejected: tally.rejected,
+        pending: tally.pending,
+        decided: tally.decided,
+        byApprover: tally.byApprover,
+        state: tally.state
+      } : null
+    };
+    memo[task.id] = result;
+    return result;
+  }
+
+  function taskGate(task, allTasks) {
+    var byId = Object.create(null);
+    (allTasks || []).forEach(function (t) { byId[t.id] = t; });
+    return taskGateImpl(task, allTasks || [], byId, Object.create(null), Object.create(null));
+  }
+
+  // 批量计算整张图上所有活动任务的门控；终态任务给 null。
+  function computeGates(allTasks) {
+    var byId = Object.create(null);
+    (allTasks || []).forEach(function (t) { byId[t.id] = t; });
+    var memo = Object.create(null);
+    var map = Object.create(null);
+    (allTasks || []).forEach(function (t) {
+      map[t.id] = taskIsActive(t)
+        ? taskGateImpl(t, allTasks || [], byId, memo, Object.create(null))
+        : null;
+    });
+    return map;
+  }
+
+  // 单个审批决定（去掉只在服务端使用的字段）
+  function approvalDecisionDigest(x) {
+    return {
+      approver: x.approver,
+      decision: x.decision, // approve | reject
+      at: x.at,
+      withdrawnAt: x.withdrawnAt || null
+    };
+  }
+
+  // 门控的对外结构：优先用实时计算的 gate（含完整任务图），
+  // 否则退回任务上持久化的上一次门控（服务重启后仍可展示等待原因与审批进度）。
+  function gateSummary(task, gate) {
+    var tally = approvalTally(task.approval || null, task.approvalDecisions || []);
+    var approval = tally.configured ? {
+      approvers: tally.approvers,
+      minApprovals: tally.minApprovals,
+      approved: tally.approved,
+      rejected: tally.rejected,
+      pending: tally.pending,
+      decided: tally.decided,
+      byApprover: tally.byApprover,
+      state: tally.state,
+      decisions: (task.approvalDecisions || []).map(approvalDecisionDigest)
+    } : null;
+
+    if (gate) {
+      if (approval) gate.approval = approval; // 实时门控里的 tally 不带决定流水
+      gate.label = GATE_STATE_LABELS[gate.state] || gate.state;
+      gate.ready = gate.state === "ready";
+      gate.at = task.gateAt || null;
+      // 负责人对“部分成功前置”的继续确认进度（确认后该行 gate=ready，
+      // 因此是否“需要确认”看前置自身终态是不是 partial）
+      gate.continueConfirmations = (task.dependencyIds || []).map(function (pid) {
+        var row = (gate.dependencies || []).filter(function (r) { return r.taskId === pid; })[0];
+        var conf = (task.continueConfirmed || {})[pid];
+        return {
+          taskId: pid,
+          needsConfirm: !!(row && row.status === "partial" &&
+            (row.gate === "can_continue" || conf)),
+          confirmed: !!conf,
+          confirmedAt: conf ? (conf.at || null) : null,
+          confirmedBy: conf ? (conf.by || null) : null
+        };
+      }).filter(function (x) { return x.needsConfirm; });
+      return gate;
+    }
+    // 重启恢复路径：只有持久化的门控快照
+    if (!task.gateState) {
+      return {
+        state: "ready", reason: null, label: GATE_STATE_LABELS.ready,
+        ready: true, at: null, dependencyState: "ready",
+        approvalState: tally.state, approval: approval,
+        dependencies: (task.dependencyIds || []).map(function (pid) {
+          return { taskId: pid, gate: "unknown", reason: null, status: null };
+        }),
+        blockingDependency: null, continueConfirmations: []
+      };
+    }
+    return {
+      state: task.gateState,
+      reason: task.gateReason || null,
+      label: GATE_STATE_LABELS[task.gateState] || task.gateState,
+      ready: task.gateState === "ready",
+      at: task.gateAt || null,
+      dependencyState: task.gateDependencyState || "ready",
+      approvalState: tally.state,
+      approval: approval,
+      dependencies: Array.isArray(task.gateDependencies) ? task.gateDependencies : [],
+      blockingDependency: task.gateBlockingDependency || null,
+      continueConfirmations: Array.isArray(task.gateContinueConfirmations)
+        ? task.gateContinueConfirmations : []
+    };
+  }
+
+  function taskSummary(t, gate) {
     if (!t) return null;
     return {
       id: t.id,
@@ -471,6 +932,16 @@
       lastCounts: t.lastCounts || null,
       successAnnotationIds: (t.successAnnotationIds || []).slice(),
       snapshotId: t.snapshotId || null,
+      // 前置任务与执行前审批配置
+      dependencyIds: (t.dependencyIds || []).slice(),
+      approval: t.approval ? {
+        approvers: (t.approval.approvers || []).slice(),
+        minApprovals: t.approval.minApprovals
+      } : null,
+      approvalSnapshotId: t.approvalSnapshotId || null,
+      continueConfirmedIds: Object.keys(t.continueConfirmed || {}),
+      // 实时（或重启后持久化）的门控：等待原因 + 审批进度都在这里
+      gate: gateSummary(t, gate || null),
       lock: t.lock ? {
         at: t.lock.at,
         textRev: t.lock.textRev,
@@ -482,11 +953,52 @@
     };
   }
 
+  // 一次性算好整张任务图的门控再映射摘要（队列列表用，避免 O(n²) 重复计算）
+  function taskSummaries(tasks) {
+    var gates = computeGates(tasks);
+    return (tasks || []).map(function (t) { return taskSummary(t, gates[t.id]); });
+  }
+
+  // 把当前门控快照写回任务（持久化用）；服务重启后据此恢复等待原因与审批进度。
+  function persistGateOnTask(task, gate) {
+    task.gateState = gate.state;
+    task.gateReason = gate.reason || null;
+    task.gateDependencyState = gate.dependencyState;
+    task.gateAt = new Date().toISOString();
+    task.gateDependencies = (gate.dependencies || []).map(function (r) {
+      return {
+        taskId: r.taskId, decisionName: r.decisionName, status: r.status,
+        gate: r.gate, reason: r.reason, via: r.via || null,
+        snapshotId: r.snapshotId || null
+      };
+    });
+    task.gateBlockingDependency = gate.blockingDependency ? {
+      taskId: gate.blockingDependency.taskId,
+      decisionName: gate.blockingDependency.decisionName,
+      status: gate.blockingDependency.status,
+      reason: gate.blockingDependency.reason,
+      via: gate.blockingDependency.via || null,
+      snapshotId: gate.blockingDependency.snapshotId || null
+    } : null;
+    task.gateContinueConfirmations = (task.dependencyIds || []).map(function (pid) {
+      var row = (gate.dependencies || []).filter(function (r) { return r.taskId === pid; })[0];
+      var conf = (task.continueConfirmed || {})[pid];
+      return {
+        taskId: pid,
+        needsConfirm: !!(row && row.status === "partial"),
+        confirmed: !!conf,
+        confirmedAt: conf ? (conf.at || null) : null,
+        confirmedBy: conf ? (conf.by || null) : null
+      };
+    }).filter(function (x) { return x.needsConfirm; });
+  }
+
   // 执行任务（含发布时锁定的文本/批注/批次版本与成功条目集合）快照摘要，
   // 保存快照时嵌入，与当时的草案/批注状态关联。
   function taskDigest(tasks) {
+    var gates = computeGates(tasks);
     return (tasks || []).map(function (t) {
-      var s = taskSummary(t);
+      var s = taskSummary(t, gates[t.id]);
       if (t.lock) {
         s.lock = {
           at: t.lock.at,
@@ -501,6 +1013,10 @@
         };
       }
       s.successAnnotationIds = (t.successAnnotationIds || []).slice();
+      // 历史快照中保留当时审批决定流水，可回溯“谁在执行前通过/拒绝/撤回”
+      if (t.approvalDecisions) {
+        s.approvalDecisions = t.approvalDecisions.map(approvalDecisionDigest);
+      }
       return s;
     });
   }
@@ -869,6 +1385,10 @@
     TASK_STATUSES: TASK_STATUSES,
     TASK_TERMINAL: TASK_TERMINAL,
     TASK_STATUS_LABELS: TASK_STATUS_LABELS,
+    GATE_STATES: GATE_STATES,
+    GATE_STATE_LABELS: GATE_STATE_LABELS,
+    DEPENDENCY_TERMINAL_GATE: DEPENDENCY_TERMINAL_GATE,
+    APPROVAL_LABELS: APPROVAL_LABELS,
     ITEM_STATE_LABELS: ITEM_STATE_LABELS,
     RESULT_LABELS: RESULT_LABELS,
     REASON_LABELS: REASON_LABELS,
@@ -900,7 +1420,19 @@
     taskIsTerminal: taskIsTerminal,
     taskIsActive: taskIsActive,
     taskSummary: taskSummary,
+    taskSummaries: taskSummaries,
     taskDigest: taskDigest,
+    persistGateOnTask: persistGateOnTask,
+    // 任务依赖与执行前审批
+    validateApproverName: validateApproverName,
+    validateApprovalConfig: validateApprovalConfig,
+    normalizeDependencyIds: normalizeDependencyIds,
+    validateTaskDependencies: validateTaskDependencies,
+    approvalTally: approvalTally,
+    directDependencyGate: directDependencyGate,
+    taskGate: taskGate,
+    computeGates: computeGates,
+    gateSummary: gateSummary,
     // 执行与预览
     mapParagraphs: mapParagraphs,
     evaluateItem: evaluateItem,

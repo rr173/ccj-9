@@ -265,6 +265,95 @@
     return box;
   }
 
+  // 前置门控：等待原因 + 审批进度（活动任务才有意义）
+  var GATE_CLASS = {
+    ready: "tk-gate-ready", waiting: "tk-gate-waiting",
+    can_continue: "tk-gate-continue", blocked: "tk-gate-blocked",
+    approvals: "tk-gate-approval", rejected: "tk-gate-rejected"
+  };
+  function gateLabel(g) { return core.GATE_STATE_LABELS[g] || g; }
+  function describeGate(t) {
+    var g = t.gate;
+    if (!g || g.state === "ready") return "";
+    var b = g.blockingDependency;
+    if (g.state === "approvals") {
+      return "等待执行前审批（已通过 " + g.approval.approved + "/" +
+        g.approval.minApprovals + "，待审 " + g.approval.pending + " 人）";
+    }
+    if (g.state === "rejected") return "执行前审批已被拒绝（撤回拒绝并补足通过后可继续）";
+    if (g.state === "can_continue") {
+      return "前置任务“" + (b ? b.decisionName : "—") + "”仅部分成功，需负责人确认继续";
+    }
+    if (g.state === "waiting") {
+      if (g.reason === "dependency_failed") {
+        return "前置任务“" + (b ? b.decisionName : "—") + "”执行失败，等待其重试成功";
+      }
+      if (g.reason === "dependency_active") {
+        return "等待前置任务“" + (b ? b.decisionName : "—") + "”执行完成";
+      }
+      return "等待前置任务满足条件";
+    }
+    if (g.state === "blocked") {
+      if (g.reason === "dependency_cancelled") {
+        return "前置任务“" + (b ? b.decisionName : "—") + "”已取消，任务被阻断";
+      }
+      if (g.reason === "dependency_blocked") {
+        return "前置任务“" + (b ? b.decisionName : "—") + "”已阻断，任务被阻断";
+      }
+      if (g.reason === "approval_rejected" || b && b.via) {
+        return "前置链上存在未通过条件（经“" + (b ? b.decisionName : "—") + "”），任务被阻断";
+      }
+      return "前置条件未通过，任务被阻断";
+    }
+    return gateLabel(g.state);
+  }
+
+  function renderTaskGate(t) {
+    var box = el("div", "task-gate");
+    var g = t.gate;
+    if (!g || (t.status !== "scheduled" && t.status !== "paused")) return box;
+    var line = el("div", "task-gate-line " + (GATE_CLASS[g.state] || ""));
+    var dot = el("span", "task-gate-dot");
+    line.appendChild(dot);
+    line.appendChild(el("span", null,
+      g.state === "ready" ? "前置条件已满足，到点自动执行" : describeGate(t)));
+    box.appendChild(line);
+
+    // 前置任务清单
+    if ((t.dependencyIds || []).length) {
+      var deps = el("div", "task-gate-deps");
+      (g.dependencies || []).forEach(function (r) {
+        var chip = el("span", "task-dep-chip dep-" + r.gate);
+        chip.appendChild(bdi(r.decisionName || r.taskId.slice(0, 8)));
+        chip.appendChild(document.createTextNode("：" +
+          (core.GATE_STATE_LABELS[depGateLabel(r.gate)] || depGateLabel(r.gate)) +
+          (r.confirmed ? "（已确认继续）" : "")));
+        deps.appendChild(chip);
+      });
+      box.appendChild(deps);
+    }
+    // 审批进度（逐人）
+    if (g.approval) {
+      var ap = el("div", "task-gate-approvals");
+      g.approval.approvers.forEach(function (name) {
+        var v = g.approval.byApprover[name];
+        var cls = "approver-pill ap-" + (v || "pending");
+        var pill = el("span", cls);
+        pill.appendChild(bdi(name));
+        pill.appendChild(document.createTextNode(v === "approve" ? " ✓" :
+          v === "reject" ? " ✗" : " 待审"));
+        ap.appendChild(pill);
+      });
+      box.appendChild(ap);
+    }
+    return box;
+  }
+  // 依赖行门控枚举到中文标签（dep 行使用 gate 取值，含 ready）
+  function depGateLabel(g) {
+    return { ready: "可继续", waiting: "等待", can_continue: "部分成功待确认",
+             blocked: "阻断", unknown: "未知" }[g] || g;
+  }
+
   function renderTaskCard(t, compact) {
     var card = el("div", "task-card task-" + t.status);
     var row1 = el("div", "task-row task-row-main");
@@ -298,6 +387,7 @@
         " · 批次 v" + t.lock.batchRev;
       card.appendChild(lock);
     }
+    card.appendChild(renderTaskGate(t));
     if (t.status === "partial" || t.status === "failed" || t.status === "blocked" ||
         t.status === "succeeded") {
       var r = el("div", "task-meta");
@@ -309,6 +399,8 @@
       card.appendChild(r);
     }
 
+    var gate = t.gate;
+    var needsContinue = gate && gate.state === "can_continue";
     if (!compact) {
       var acts = el("div", "task-actions");
       if (t.status === "scheduled") {
@@ -317,6 +409,18 @@
       } else if (t.status === "paused") {
         acts.appendChild(button("恢复…", "btn-mini primary", function () { taskResume(t); }));
         acts.appendChild(button("取消", "btn-mini danger", function () { taskCancel(t); }));
+      }
+      if (needsContinue) {
+        acts.appendChild(button("确认继续", "btn-mini primary",
+          function () { taskContinue(t); }));
+      }
+      if (gate && gate.approval) {
+        acts.appendChild(button("审批…", "btn-mini primary",
+          function () { openApprovalDialog(t); }));
+      }
+      if (t.status === "scheduled" || t.status === "paused") {
+        acts.appendChild(button("前置/审批配置…", "btn-mini",
+          function () { openTaskConfig(t); }));
       }
       if (t.status === "partial" || t.status === "failed" || t.status === "blocked") {
         acts.appendChild(button("失败重试…", "btn-mini primary", function () { taskRetry(t); }));
@@ -332,6 +436,14 @@
       } else if (t.status === "paused") {
         mini.appendChild(button("恢复…", "btn-mini primary", function () { taskResume(t); }));
         mini.appendChild(button("取消", "btn-mini danger", function () { taskCancel(t); }));
+      }
+      if (needsContinue) {
+        mini.appendChild(button("确认继续", "btn-mini primary",
+          function () { taskContinue(t); }));
+      }
+      if (gate && gate.approval) {
+        mini.appendChild(button("审批…", "btn-mini primary",
+          function () { openApprovalDialog(t); }));
       }
       mini.appendChild(button("详情", "btn-mini", function () { openQueuePanel(t.id); }));
       card.appendChild(mini);
@@ -403,9 +515,13 @@
     var errLine = el("div", "composer-error");
     errLine.setAttribute("role", "alert");
 
-    // 先读草案详情，确保在最新数据上发布
-    api("GET", "/api/review-decisions/" + decisionId).then(function (r) {
-      var data = r.data;
+    // 先读草案详情，确保在最新数据上发布；同时读队列供选择前置任务
+    Promise.all([
+      api("GET", "/api/review-decisions/" + decisionId),
+      api("GET", "/api/execution-tasks")
+    ]).then(function (rs) {
+      var data = rs[0].data;
+      var allTasks = (rs[1].data && rs[1].data.tasks) || [];
       var d = data.decision;
       if (d.status !== "ready") {
         errLine.textContent = "只有“待执行”草案可以发布，当前状态：" + statusLabel(d.status);
@@ -435,6 +551,40 @@
       actorInput.value = savedActor();
       box.appendChild(labeled("发布负责人", actorInput));
 
+      // 可选前置任务：只允许选择其他草案的任务
+      var depChecks = Object.create(null);
+      var depCandidates = allTasks.filter(function (x) {
+        return x.decisionId !== decisionId;
+      });
+      if (depCandidates.length) {
+        var depBox = el("div", "dc-dep-list");
+        depCandidates.forEach(function (c) {
+          var lab = el("label", "batch-field dc-dep-option");
+          var cb = document.createElement("input");
+          cb.type = "checkbox";
+          depChecks[c.id] = cb;
+          lab.appendChild(cb);
+          var txt = el("span");
+          txt.appendChild(bdi(c.decisionName));
+          txt.appendChild(document.createTextNode("（" + taskStatusLabel(c.status) +
+            "，计划 " + formatTime(c.scheduledAt) + "）"));
+          lab.appendChild(txt);
+          depBox.appendChild(lab);
+        });
+        box.appendChild(labeled("前置任务（可选；全部成功后才执行）", depBox));
+      }
+      var approversInput = document.createElement("input");
+      approversInput.type = "text";
+      approversInput.className = "composer-author";
+      approversInput.placeholder = "1~3 名审批人，逗号分隔；留空表示发布即不需审批";
+      box.appendChild(labeled("执行前审批人（可选）", approversInput));
+      var minInput = document.createElement("input");
+      minInput.type = "number";
+      minInput.min = "1"; minInput.max = "3"; minInput.step = "1";
+      minInput.className = "composer-author";
+      minInput.placeholder = "最少通过人数，留空=全体审批人";
+      box.appendChild(labeled("审批最少通过人数（可选）", minInput));
+
       box.appendChild(errLine);
 
       var okBtn;
@@ -457,16 +607,42 @@
               return;
             }
             okBtn.disabled = true;
-            api("POST", "/api/execution-tasks", {
+            var body = {
               decisionId: decisionId,
               scheduledAt: when.toISOString(),
               paragraphs: Editor.serialize().paragraphs,
               actor: actorInput.value
-            }, { ifMatch: state.rev }).then(function (rr) {
+            };
+            var depIds = Object.keys(depChecks).filter(function (id) {
+              return depChecks[id].checked;
+            });
+            if (depIds.length) body.dependencies = depIds;
+            var approverNames = approversInput.value.split(/[,，;；]/)
+              .map(function (s) { return s.trim(); }).filter(Boolean);
+            if (approverNames.length) {
+              if (approverNames.length > 3) {
+                errLine.textContent = "审批人最多 3 名（表单内容已保留）。";
+                okBtn.disabled = false;
+                return;
+              }
+              var min = minInput.value === "" ? approverNames.length
+                : parseInt(minInput.value, 10);
+              if (!(min >= 1 && min <= approverNames.length)) {
+                errLine.textContent = "最少通过人数必须在 1 到审批人数之间。";
+                okBtn.disabled = false;
+                return;
+              }
+              body.approval = { approvers: approverNames, minApprovals: min };
+            }
+            api("POST", "/api/execution-tasks", body, { ifMatch: state.rev })
+              .then(function (rr) {
               rememberActor(actorInput.value.trim());
               m.close();
+              var g = rr.data.task.gate;
               toast("已发布到执行队列，计划 " + formatTime(rr.data.task.scheduledAt) +
-                " 自动执行；方案、批注与批次版本已锁定");
+                " 自动执行；方案、批注与批次版本已锁定" +
+                (g && g.state !== "ready" ? "（当前：" +
+                  (core.GATE_STATE_LABELS[g.state] || g.state) + "）" : ""));
               return loadList(true).then(function () { openQueuePanel(rr.data.task.id); });
             }).catch(function (e) {
               okBtn.disabled = false;
@@ -674,6 +850,224 @@
       ]
     });
     fetchLogs();
+  }
+
+  /* ---------- 确认继续（前置部分成功） ---------- */
+
+  function taskContinue(t) {
+    if (!window.confirm(
+        "前置任务仅部分成功。确认接受其结果并继续执行“" + t.decisionName +
+        "”吗？\n其余前置条件满足后，任务将在计划时间执行（仅放行一次）。")) return;
+    api("POST", "/api/execution-tasks/" + t.id + "/continue",
+      { actor: savedActor() || "负责人" }, { ifMatch: state.rev })
+      .then(function () {
+        toast("已确认继续，前置条件全部满足后将自动执行");
+        return loadList(true);
+      }).catch(function (e) {
+        if (e.status === 409 && e.code === "version_conflict") {
+          toast("版本冲突：队列已被其他人更新，已刷新，请重试", "error");
+          loadList(true);
+        } else toast("确认继续失败：" + e.message, "error");
+      });
+  }
+
+  /* ---------- 执行前审批 ---------- */
+
+  function openApprovalDialog(t) {
+    var box = el("div", "decision-composer");
+    var errLine = el("div", "composer-error");
+    api("GET", "/api/execution-tasks/" + t.id).then(function (r) {
+      var cur = r.data.task;
+      var g = cur.gate;
+      box.appendChild(el("p", "muted",
+        "该任务配置了执行前审批：至少 " + g.approval.minApprovals +
+        " 名审批人通过，且没有拒绝，任务才会在计划时间执行。任一审批人拒绝即阻断，" +
+        "拒绝可由本人撤回。"));
+
+      var prog = el("div", "dc-approval-progress");
+      prog.textContent = "当前：已通过 " + g.approval.approved + "/" +
+        g.approval.minApprovals + " · 拒绝 " + g.approval.rejected +
+        " · 待审 " + g.approval.pending;
+      box.appendChild(prog);
+
+      var rowsBox = el("div", "dc-approval-rows");
+      g.approval.approvers.forEach(function (name) {
+        var v = g.approval.byApprover[name];
+        var row = el("div", "dc-approval-row");
+        var who = el("span", "dc-approval-name");
+        who.appendChild(bdi(name));
+        row.appendChild(who);
+        row.appendChild(el("span", "ap-state ap-state-" + (v || "pending"),
+          v === "approve" ? "已通过" : v === "reject" ? "已拒绝" : "待审批"));
+        rowsBox.appendChild(row);
+      });
+      box.appendChild(rowsBox);
+
+      var nameInput = document.createElement("input");
+      nameInput.type = "text";
+      nameInput.className = "composer-author";
+      nameInput.maxLength = 50;
+      nameInput.placeholder = "我的审批人署名（必须是指定审批人）";
+      nameInput.value = savedActor();
+      box.appendChild(labeled("审批人署名", nameInput));
+      box.appendChild(errLine);
+
+      function refresh() {
+        return api("GET", "/api/execution-tasks/" + t.id).then(function (rr) {
+          m.close();
+          openApprovalDialog(rr.data.task);
+          return loadList(true);
+        });
+      }
+      function decide(decision, label) {
+        errLine.textContent = "";
+        if (!nameInput.value.trim()) {
+          errLine.textContent = "必须填写审批人署名。";
+          return;
+        }
+        api("POST", "/api/execution-tasks/" + t.id + "/approvals",
+          { approver: nameInput.value.trim(), decision: decision })
+          .then(function () {
+            rememberActor(nameInput.value.trim());
+            toast(label + "已记录");
+            refresh();
+          }).catch(function (e) {
+            if (e.status === 409 && e.code === "version_conflict") loadList(true);
+            errLine.textContent = e.message;
+          });
+      }
+      function withdraw() {
+        errLine.textContent = "";
+        if (!nameInput.value.trim()) {
+          errLine.textContent = "必须填写审批人署名。";
+          return;
+        }
+        api("POST", "/api/execution-tasks/" + t.id + "/approvals/" +
+            encodeURIComponent(nameInput.value.trim()) + "/withdraw", {})
+          .then(function () {
+            toast("已撤回审批决定");
+            refresh();
+          }).catch(function (e) { errLine.textContent = e.message; });
+      }
+
+      var m = openModal("执行前审批：" + cur.decisionName, box, {
+        buttons: [
+          button("通过", "primary", function () { decide("approve", "通过"); }),
+          button("拒绝", "danger", function () { decide("reject", "拒绝"); }),
+          button("撤回我的决定", null, withdraw),
+          button("关闭", null, function () { m.close(); })
+        ]
+      });
+    }).catch(function (e) {
+      box.appendChild(el("div", "composer-error", "读取任务失败：" + e.message));
+      openModal("执行前审批", box, { buttons: [button("关闭", null, function () {})] });
+    });
+  }
+
+  /* ---------- 前置任务与审批配置 ---------- */
+
+  function openTaskConfig(t) {
+    var box = el("div", "decision-composer");
+    var errLine = el("div", "composer-error");
+    errLine.setAttribute("role", "alert");
+
+    // 加载全部任务供选择前置（不能选自己）
+    api("GET", "/api/execution-tasks").then(function (r) {
+      var all = (r.data && r.data.tasks) || [];
+      var candidates = all.filter(function (x) {
+        return x.id !== t.id && x.status !== "running";
+      });
+
+      box.appendChild(el("p", "muted",
+        "为尚未开始的任务配置前置任务（1 个或多个）与执行前审批（1~3 名审批人）。" +
+        "只有全部前置任务已成功（部分成功需确认）且审批达到最少通过人数，任务才会在计划时间执行。" +
+        "修改审批人或门槛会重置已有审批。"));
+
+      var depBox = el("div", "dc-dep-list");
+      var checks = Object.create(null);
+      if (!candidates.length) {
+        depBox.appendChild(el("div", "review-empty", "队列中没有可作为前置的其他任务。"));
+      }
+      candidates.forEach(function (c) {
+        var lab = el("label", "batch-field dc-dep-option");
+        var cb = document.createElement("input");
+        cb.type = "checkbox";
+        if ((t.dependencyIds || []).indexOf(c.id) !== -1) cb.checked = true;
+        checks[c.id] = cb;
+        lab.appendChild(cb);
+        var txt = el("span");
+        txt.appendChild(bdi(c.decisionName));
+        txt.appendChild(document.createTextNode("（" + taskStatusLabel(c.status) + "）"));
+        lab.appendChild(txt);
+        depBox.appendChild(lab);
+      });
+      box.appendChild(labeled("前置任务（不选表示无前置）", depBox));
+
+      var approversInput = document.createElement("input");
+      approversInput.type = "text";
+      approversInput.className = "composer-author";
+      approversInput.placeholder = "多个审批人用逗号分隔，留空表示不要求审批";
+      approversInput.value = t.approval ? t.approval.approvers.join("，") : "";
+      box.appendChild(labeled("审批人（1~3 名，逗号分隔）", approversInput));
+
+      var minInput = document.createElement("input");
+      minInput.type = "number";
+      minInput.min = "1"; minInput.max = "3"; minInput.step = "1";
+      minInput.className = "composer-author";
+      minInput.placeholder = "最少通过人数";
+      minInput.value = t.approval ? t.approval.minApprovals : "";
+      box.appendChild(labeled("最少通过人数", minInput));
+      box.appendChild(errLine);
+
+      var m = openModal("前置与审批配置：" + t.decisionName, box, {
+        buttons: [
+          button("取消", null, function () { m.close(); }),
+          button("保存配置", "primary", function () {
+            errLine.textContent = "";
+            var deps = Object.keys(checks).filter(function (id) {
+              return checks[id].checked;
+            });
+            var names = approversInput.value.split(/[,，;；]/)
+              .map(function (s) { return s.trim(); })
+              .filter(Boolean);
+            if (names.length > 3) {
+              errLine.textContent = "审批人最多 3 名。";
+              return;
+            }
+            var body = { actor: savedActor() || "负责人", dependencies: deps };
+            if (approversInput.value.trim() === "" && !(t.approval)) {
+              // 原本无审批且留空：不带 approval 字段（不改）
+            } else if (approversInput.value.trim() === "") {
+              body.approval = null; // 显式取消审批
+            } else {
+              var min = parseInt(minInput.value, 10);
+              if (!(min >= 1 && min <= names.length)) {
+                errLine.textContent = "最少通过人数必须在 1 到审批人数之间。";
+                return;
+              }
+              body.approval = { approvers: names, minApprovals: min };
+            }
+            api("POST", "/api/execution-tasks/" + t.id + "/config", body,
+              { ifMatch: state.rev }).then(function (rr) {
+              m.close();
+              toast("前置与审批配置已保存");
+              return loadList(true).then(function () {
+                var g = rr.data.task.gate;
+                if (g && g.state !== "ready") {
+                  toast("当前等待原因：" + (core.GATE_STATE_LABELS[g.state] || g.state), "info");
+                }
+              });
+            }).catch(function (e) {
+              handleError(e, function (msg) { errLine.textContent = msg; }, "保存配置");
+            });
+          })
+        ]
+      });
+    }).catch(function (e) {
+      box.appendChild(el("div", "composer-error", "读取队列失败：" + e.message));
+      openModal("前置与审批配置", box,
+        { buttons: [button("关闭", null, function () {})] });
+    });
   }
 
   function renderCard(d) {
@@ -920,6 +1314,9 @@
             " · 批次 v" + tInfo.lock.batchRev;
           schedP.appendChild(lk);
         }
+        // 前置门控：等待原因 + 审批进度
+        var gateNode = renderTaskGate(tInfo);
+        if (gateNode && gateNode.childNodes.length) schedP.appendChild(gateNode);
         var btns = el("div", "dc-sched-actions");
         if (tInfo.status === "scheduled") {
           btns.appendChild(button("暂停任务", null, function () { taskPause(tInfo); }));
@@ -934,6 +1331,18 @@
         } else if (tInfo.status === "partial" || tInfo.status === "failed" ||
                    tInfo.status === "blocked") {
           btns.appendChild(button("失败重试…", "primary", function () { taskRetry(tInfo); }));
+        }
+        if (tInfo.gate && tInfo.gate.state === "can_continue") {
+          btns.appendChild(button("确认继续", "primary",
+            function () { taskContinue(tInfo); }));
+        }
+        if (tInfo.gate && tInfo.gate.approval) {
+          btns.appendChild(button("执行前审批…", "primary",
+            function () { openApprovalDialog(tInfo); }));
+        }
+        if (tInfo.status === "scheduled" || tInfo.status === "paused") {
+          btns.appendChild(button("前置/审批配置…", null,
+            function () { openTaskConfig(tInfo); }));
         }
         btns.appendChild(button("队列记录", null, function () { openTaskLogs(tInfo); }));
         schedP.appendChild(btns);
@@ -1548,7 +1957,21 @@
     task_failed: "执行失败",
     task_blocked: "任务阻断",
     task_interrupted: "重启中断",
-    task_undo: "撤销自动执行"
+    task_undo: "撤销自动执行",
+    task_gate_waiting: "等待前置条件",
+    task_dependency_blocked: "依赖阻断",
+    task_dependency_unblocked: "依赖阻断解除",
+    task_dependency_can_continue: "前置部分成功",
+    task_dependency_continue: "确认继续",
+    task_dependencies_changed: "修改前置任务",
+    task_approval_configured: "审批配置",
+    task_approved: "审批通过",
+    task_rejected: "审批拒绝",
+    task_approval_withdrawn: "撤回审批",
+    task_approval_met: "审批达标",
+    task_approval_rejected: "审批被否决",
+    task_approval_reopened: "审批重新开放",
+    task_approval_reset: "审批等待中"
   };
 
   function openLogs(d) {
