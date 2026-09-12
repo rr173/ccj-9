@@ -632,6 +632,10 @@
       modal.body.appendChild(bulk);
 
       modal.foot.appendChild(button("编辑信息…", null, function () { openEdit(b, modal); }));
+      modal.foot.appendChild(button("决策草案…", null, function () {
+        if (window.DecisionsUI) window.DecisionsUI.openComposerForBatch(b.id);
+        else toast("决策模块未加载", "error");
+      }));
       modal.foot.appendChild(button("审阅记录", null, function () { openLogs(b); }));
       modal.foot.appendChild(button("归档批次", "danger", function () {
         if (!window.confirm("归档批次“" + b.name + "”吗？\n归档后其中 " + b.memberCount +

@@ -1076,3 +1076,108 @@ tr.rp-added { background: #f0fdf4; }
 .log-action { color: #374151; font-weight: 600; }
 .log-detail { font-size: 12.5px; margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
 .log-detail bdi { unicode-bidi: isolate; }
+
+/* ================= 审阅决策 ================= */
+
+.decision-panel {
+  margin-top: 22px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 20px 18px;
+}
+.decision-panel h2 { font-size: 15px; margin: 0 0 12px; }
+.decision-list { display: flex; flex-direction: column; gap: 10px; }
+
+.decision-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  background: #fcfcfd;
+  transition: border-color .12s, background .12s;
+}
+.decision-card:hover { background: #f8faff; border-color: #c7d2fe; }
+.decision-card.is-frozen { background: #f9fafb; }
+.decision-status {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 1px 9px;
+  margin-inline-start: 8px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.dc-drafting { background: #f3f4f6; color: #374151; }
+.dc-voting  { background: #fef3c7; color: #92400e; }
+.dc-ready   { background: #dcfce7; color: #166534; }
+.dc-executed{ background: #e0e7ff; color: #3730a3; }
+.decision-done-flag {
+  font-size: 11px; color: #4338ca; margin-inline-start: 6px; font-weight: 600;
+}
+.dc-prog { margin: 6px 0 10px; font-size: 12px; }
+
+/* 草案详情条目表 */
+.dc-items-wrap { max-height: 52vh; overflow: auto; margin-top: 8px; }
+.dc-items td, .dc-items th { vertical-align: top; font-size: 12.5px; }
+.dc-items .dc-plan-cell select { width: 100%; margin-bottom: 6px; }
+.dc-repl-input { width: 100%; resize: vertical; font-size: 12.5px; }
+.dc-my-vote { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.dc-my-vote.is-empty { color: #9ca3af; }
+.decision-item-state {
+  display: inline-block;
+  font-size: 11px;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.dc-it-pending  { background: #f3f4f6; color: #6b7280; }
+.dc-it-waiting  { background: #fef3c7; color: #92400e; }
+.dc-it-rejected { background: #fee2e2; color: #991b1b; }
+.dc-it-approved { background: #dcfce7; color: #166534; }
+.dc-vote-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.btn-mini.dc-v-approve { color: #166534; }
+.btn-mini.dc-v-approve.is-mine { background: #dcfce7; border-color: #86efac; }
+.btn-mini.dc-v-reject { color: #991b1b; }
+.btn-mini.dc-v-reject.is-mine { background: #fee2e2; border-color: #fca5a5; }
+.btn-mini.dc-v-abstain.is-mine { background: #e5e7eb; border-color: #d1d5db; }
+.dc-voter-bar {
+  display: flex; align-items: center; gap: 8px;
+  margin: 8px 0; padding: 6px 8px;
+  background: #f8fafc; border: 1px solid var(--border); border-radius: 8px;
+}
+.dc-voter-bar input { max-width: 220px; }
+
+/* 执行预览 */
+.dc-preview-table td, .dc-preview-table th { vertical-align: top; font-size: 12.5px; }
+.dc-pv-item { padding: 4px 0; border-bottom: 1px dashed #e5e7eb; }
+.dc-pv-item:last-child { border-bottom: none; }
+.dc-disp { font-weight: 600; color: #4338ca; }
+.dc-repl-inline { color: #166534; }
+.dc-result { font-size: 11.5px; margin-top: 2px; font-weight: 600; }
+.dc-result-success { color: #166534; }
+.dc-result-conflict { color: #991b1b; }
+.dc-result-skipped { color: #6b7280; }
+.dc-conflict-tag {
+  display: inline-block; font-size: 11px; font-weight: 600;
+  color: #991b1b; background: #fee2e2; border-radius: 4px;
+  padding: 0 6px; margin-bottom: 4px;
+}
+.diff-summary.is-warn { color: #92400e; }
+.dc-res-success { background: #f0fdf4; }
+.dc-res-conflict { background: #fef2f2; }
+.dc-res-skipped { background: #f9fafb; }
+
+/* 历史执行 / 快照决策 */
+.dc-executions { margin: 10px 0; }
+.snap-section-title { font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+.dc-exec-item {
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 8px; margin-bottom: 4px; background: #fcfcfd;
+}
+.dc-exec-item.is-undone { opacity: .65; }
+.dc-snap-card { cursor: default; margin-bottom: 10px; }
+.dc-snap-item { font-size: 12px; color: #374151; padding: 1px 0; }
+.dc-threshold { max-width: 110px; }

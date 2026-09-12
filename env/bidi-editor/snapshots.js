@@ -230,6 +230,9 @@
       tdAct.appendChild(button("批注", "btn-mini", function () {
         if (window.ReviewUI) window.ReviewUI.openSnapshotAnnotations(s.id, s.name);
       }));
+      tdAct.appendChild(button("决策", "btn-mini", function () {
+        if (window.DecisionsUI) window.DecisionsUI.openSnapshotDecisions(s.id, s.name);
+      }));
       tdAct.appendChild(button("删除", "btn-mini danger", function () { deleteSnapshot(s); }));
       tr.appendChild(tdAct);
       rowsBody.appendChild(tr);

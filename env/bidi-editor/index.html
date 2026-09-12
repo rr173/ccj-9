@@ -84,9 +84,26 @@
     <div id="batch-list" class="batch-list"></div>
   </section>
 
+  <!-- 审阅决策：从未归档批次创建草案、逐条方案、多人投票、按段预览、部分执行与撤销 -->
+  <section class="decision-panel" id="decision-panel" aria-label="审阅决策">
+    <h2>审阅决策 <span id="decision-rev" class="snap-rev" title="决策集合版本号（乐观锁）">版本 —</span></h2>
+    <div class="review-controls">
+      <button id="decision-add" class="primary">＋ 新建决策草案</button>
+      <label class="batch-filter-label">显示：<select id="decision-filter-status" aria-label="按草案状态筛选">
+        <option value="">全部草案</option>
+        <option value="drafting">拟定中</option>
+        <option value="voting">投票中</option>
+        <option value="ready">待执行</option>
+        <option value="executed">已执行</option>
+      </select></label>
+      <button id="decision-refresh">刷新</button>
+    </div>
+    <div class="snap-note" id="decision-note" role="status"></div>
+    <div id="decision-list" class="batch-list decision-list"></div>
+  </section>
+
   <!-- 审阅快照：保存 / 列表 / 两两比较 / 恢复前预览 -->
-  <section class="snap-panel" id="snapshot-panel" aria-label="审阅快照">
-    <h2>审阅快照</h2>
+  <section class="snap-panel" id="snapshot-panel" aria-label="审阅快照">    <h2>审阅快照</h2>
     <div class="snap-controls">
       <input type="text" id="snapshot-name" maxlength="100"
              placeholder="快照名称（必填，最长 100 字符）" aria-label="快照名称">
@@ -137,9 +154,11 @@
 <div id="toast-box" class="toast-box" aria-live="polite"></div>
 <script src="snapshot-core.js"></script>
 <script src="review-core.js"></script>
+<script src="decision-core.js"></script>
 <script src="app.js"></script>
 <script src="snapshots.js"></script>
 <script src="annotations.js"></script>
 <script src="batches.js"></script>
+<script src="decisions.js"></script>
 </body>
 </html>

@@ -1,9 +1,10 @@
-# 双向文本编辑器（中文 ⇄ 阿拉伯文同段混排）+ 审阅快照 + 协作批注 + 审阅批次
+# 双向文本编辑器（中文 ⇄ 阿拉伯文同段混排）+ 审阅快照 + 协作批注 + 审阅批次 + 审阅决策
 
 一个零依赖 Node 服务 + 网页编辑器，支持同一段落内中文（从左到右）与阿拉伯文（从右到左）混排，
 提供可恢复、可比较、带乐观并发控制的**审阅快照**功能，可锚定到逻辑字符范围、
-支持回复与四态工作流的**协作批注**功能，以及把一组批注命名编组、
-跟踪负责人/截止时间/实时进度/完整审阅记录的**审阅批次**功能。
+支持回复与四态工作流的**协作批注**功能，把一组批注命名编组、
+跟踪负责人/截止时间/实时进度/完整审阅记录的**审阅批次**功能，以及在批次批注上
+逐条拟定保留/替换/删除方案、多人投票、三版本校验后部分执行并可撤销的**审阅决策**功能。
 
 ## 双向编辑的需求与实现对照
 
@@ -98,6 +99,57 @@ GET    /api/review-batches/:id/logs        审阅记录，支持 ?from=&to= 时�
 冲突响应示例：`409 {"error":"version_conflict","message":"…","currentRev":5}`。
 批次数据默认写到 `./data/review-batches.json`（可用 `REVIEW_BATCHES_FILE` 覆盖）。
 
+## 审阅决策功能
+
+审阅者在**未归档批次**上创建决策草案，为批次中每条批注指定处理方案
+（**保留 keep / 替换 replace / 删除 delete**，处理对象是被批注的原文），
+不同审阅者对草案逐条**投票**（通过 approve / 驳回 reject / 弃权 abstain），
+每条达到草案设定的通过人数且无驳回后，草案进入**待执行**状态；
+执行前按段落生成预览，执行时同时校验三个版本，只应用未冲突条目，可部分成功并可撤销。
+
+| 需求 | 实现方式 |
+|---|---|
+| 只能从未归档批次创建草案 | `POST /api/review-decisions` 必须带 `batchId`；批次不存在 404、已归档 409 `batch_archived`、批次已过截止 409 `deadline_passed`；同一批次最多一个未结束草案，重复创建 409 `duplicate_decision` |
+| 每条批注填写保留/替换/删除 | 创建时可带初始 `items`，之后 `PUT …/items` 逐条/批量保存；非法方案 400、替换文本为空 400 `empty_replacement`、同一条批注提交两个方案 409 `duplicate_item`；方案不属于本草案 409。方案内容变化时该条已有投票自动作废（驳回后改方案即可重新计票），改票流水保留 |
+| 空草案明确提示 | 批次没有成员不能创建（`member_missing`/`empty_draft`）；提交投票时仍有条目未选方案 → 400 `empty_items` 并返回 `unfilled` 列表，当前页面内容保留 |
+| 按段落生成执行前预览 | `POST …/preview` 为纯计算（不写盘、不需要版本锁）：按草案创建时的段落基线对齐当前编辑区，逐段给出“当前文本 / 执行后文本”，并对每条批注给出成功/冲突/跳过判定与原因；可勾选只执行部分条目 |
+| 多人逐条投票，达到通过人数才待执行 | 投票**必须记名**（缺投票人 400 `missing_voter`），同一人改票以最后一次为准、流水留痕；任何一条有驳回或缺票，草案停留 voting；全部条目 approve 数达到门槛才自动进入 ready |
+| 执行前同时校验文本、批注、批次三个版本 | 请求回传当前编辑区段落：文本指纹（dir+text 的双哈希，不含 editedAt）不同即触发段对齐（`decision-core.mapParagraphs`，复用快照 LCS 对齐）；逐条比对——段落删除 `paragraph_deleted`、段落改写 `paragraph_changed`、方向改变 `paragraph_dir_changed`、引文位置变化 `quote_mismatch`、批注 `updatedAt` 变化 `annotation_changed`、批注被删 `annotation_deleted`、批注被移出批次 `member_removed`。**只把受影响条目标为冲突**，其他条目照常执行，绝不覆盖新文字或新批注 |
+| 一次执行可部分成功 | `POST …/execute` 返回每条 `success/conflict/skipped`（跳过原因含 `not_approved`/`not_selected`）及按成功条目合成的 `afterParagraphs`；成功条目的批注标记 resolved，冲突/跳过条目不触碰。有任意成功条目草案即 `executed`，无成功条目则停留 ready 可修正后重试 |
+| 成功、冲突、跳过都按时间留痕 | 执行写一条总记录 + 每条一条 `execute_item_success/conflict/skipped` 记录；`GET …/logs?from=&to=` 按时间筛选、倒序返回 |
+| 撤销最近一次成功执行 | `POST …/undo` 仅允许撤销全局最近一次未撤销的成功执行（否则 409 `not_latest_execution`）：回滚成功条目对应批注为待处理，执行后又被别人修改/删除的批注**不覆盖**（`changed_since_execution`），返回执行前段落供客户端确认后写回编辑区；撤销后草案回到 ready 可重新执行，同一草案不能重复执行（409 `decision_executed`） |
+| 决策状态/投票/执行结果与快照关联 | 保存或覆盖快照时把全部决策草案（逐条方案、当前投票、历次执行及撤销标记）整体嵌入（`decisions` + `decisionRev`）；快照列表新增“决策”按钮，查看历史快照即可看到当时的草案状态，`GET /api/snapshots/:id` 返回完整数据 |
+| 已归档批次不能创建或修改草案 | 批次归档后其草案只读：改方案/投票/执行/撤销全部 409 `batch_archived`，详情与记录仍可查看（`batchFrozen`） |
+| 过期草案明确提示 | 草案沿用批次截止时间；过期后改方案、投票、执行、撤销均 409 `decision_expired`，卡片与详情标“已过期”，当前页面内容保留 |
+| 多人同时修改草案，旧页面提交必须被拒绝 | 决策集合有独立单调 `rev`（响应头 `X-Decision-Rev`），所有变更必须 `If-Match` 严格相等：旧页面任何提交都收到 409 `version_conflict` 且不写盘，弹窗内保留表单内容并按最新数据重绘；缺版本号 428 |
+| 错误不清空页面 | 所有校验先于写存储；写盘失败回滚 rev/状态/记录；前端所有失败只在弹窗内红字提示或 toast，编辑区 DOM 与已填方案不受影响 |
+
+### 审阅决策 HTTP API 摘要
+
+```
+GET    /api/review-decisions?batchId=   草案列表（含逐条进度/是否过期/批次是否归档）+ 当前 rev
+POST   /api/review-decisions            创建草案 {batchId, name?, threshold?, paragraphs(基线文本), items?, actor}（If-Match 必需）
+GET    /api/review-decisions/:id        草案详情（逐条方案/投票/历次执行）
+PUT    /api/review-decisions/:id        改名/调整通过人数（仅拟定中，If-Match 必需）
+PUT    /api/review-decisions/:id/items  保存/修改方案（If-Match 必需；重复 id 整批拒绝）
+POST   /api/review-decisions/:id/submit 方案完成进入投票（全部条目必须已定方案）
+POST   /api/review-decisions/:id/votes  逐条投票 {annotationId, vote, voter}（If-Match 必需）
+POST   /api/review-decisions/:id/preview 执行前按段预览 {paragraphs, annotationIds?}（只读，不需要锁）
+POST   /api/review-decisions/:id/execute 执行 {paragraphs, annotationIds?, actor}（If-Match 必需；三版本逐条校验、可部分成功）
+POST   /api/review-decisions/:id/undo   撤销最近一次成功执行（If-Match 必需；只回滚执行后未再变化的批注）
+GET    /api/review-decisions/:id/logs   决策记录，支持 ?from=&to= 时间筛选
+```
+
+冲突响应示例：`409 {"error":"version_conflict","message":"…","currentRev":8}`；
+逐条版本冲突在执行/预览响应的 `results` 中给出（HTTP 仍为 200），例如
+`{"annotationId":"…","result":"conflict","reason":"quote_mismatch"}`。
+决策数据默认写到 `./data/review-decisions.json`（`REVIEW_DECISIONS_FILE` 覆盖）。
+
+### 批次详情中的决策关联
+
+`GET /api/review-batches/:id` 的响应额外带 `decisionIds`（该批次关联的全部草案 id），
+批次详情弹窗提供“决策草案…”入口，可在该批次上下文直接创建草案。
+
 ### 批注 HTTP API 摘要
 
 ```
@@ -132,7 +184,8 @@ node server.js          # http://localhost:8080
 
 快照数据默认写到 `./data/snapshots.json`（`SNAPSHOTS_FILE` 覆盖），
 批注数据默认写到 `./data/annotations.json`（`ANNOTATIONS_FILE` 覆盖），
-审阅批次与记录默认写到 `./data/review-batches.json`（`REVIEW_BATCHES_FILE` 覆盖）。
+审阅批次与记录默认写到 `./data/review-batches.json`（`REVIEW_BATCHES_FILE` 覆盖），
+审阅决策与记录默认写到 `./data/review-decisions.json`（`REVIEW_DECISIONS_FILE` 覆盖）。
 
 > 注：直接双击打开 `index.html`（file://）时快照与批注接口不可用，双向编辑功能本身仍可使用。
 
@@ -149,6 +202,8 @@ node --test test/
 - `test/review-core.test.js`：批注校验、锚点重定位（编辑/跨段移动/方向切换/emoji/失效）、记录规范化、批次校验与实时进度
 - `test/annotations-api.test.js`：批注 CRUD 与回复、四态流转、双页面 409 冲突、快照嵌入批注状态、从快照恢复、重启持久化
 - `test/review-batches-api.test.js`：批次创建校验、成员互斥、逐条/批量状态、旧页面批量更新 409、加/移成员、审阅记录按时间筛选、归档冻结、快照嵌入批次、恢复对账、重启持久化
+- `test/decision-core.test.js`：决策草案校验、记名投票与门槛流转、改方案清票、三版本逐条冲突（文本/批注/批次）、按段预览、同段多条从后向前应用、部分成功、撤销基线、快照摘要
+- `test/decisions-api.test.js`：创建校验（归档/过期/重复草案/空方案/缺投票人）、方案填写与提交、两人投票流转、预览不写盘、三版本逐条冲突的部分成功执行、成功批注转已解决、旧决策版本 409、同草案不可重复执行、撤销（执行后变化不覆盖、全局最近一次顺序）、快照嵌入决策、归档冻结、按时间记录、重启持久化
 
 ## Docker 部署
 
@@ -172,10 +227,12 @@ style.css         编辑器样式 + 审阅/快照面板/弹窗/差异高亮（bd
 app.js            段落方向、编辑时间戳、纯文本粘贴、状态栏、序列化/恢复、码点锚点 API（window.Editor）
 snapshot-core.js  快照纯逻辑：校验 + LCS 差异（浏览器与 Node 共用，无 DOM 依赖）
 review-core.js    批注/审阅批次纯逻辑：校验 + 锚点重定位 + 批次载荷校验与实时进度（浏览器与 Node 共用，无 DOM 依赖）
+decision-core.js  审阅决策纯逻辑：方案/投票校验、逐条投票统计、文本指纹与段落对齐、三版本逐条冲突判定、执行合成与按段预览、快照摘要（依赖 snapshot-core）
 snapshots.js      快照 UI：列表/比较/恢复预览二次确认/版本冲突
 annotations.js    批注 UI：列表筛选（段落/四态/批次）/新建/详情回复/四态状态/冲突处理/快照批注查看与恢复
 batches.js        审阅批次 UI：新建（命名/负责人/截止/说明/勾选批注）、列表与实时进度、详情批量操作、加/移成员、归档、按时间查看审阅记录
-server.js         零依赖服务：静态文件 + 快照、批注与审阅批次 JSON API（三集合乐观锁、原子落盘）
+decisions.js      审阅决策 UI：从批次创建草案、逐条填写保留/替换/删除、记名投票、按段执行前预览、部分成功执行结果、撤销最近一次执行、按时间记录、快照决策查看
+server.js         零依赖服务：静态文件 + 快照、批注、审阅批次、审阅决策 JSON API（四集合乐观锁、原子落盘）
 test/             node:test 单元与集成测试
 Dockerfile        node:20-alpine，EXPOSE 8080，数据卷 /app/data
 ```

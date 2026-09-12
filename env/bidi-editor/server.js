@@ -7,13 +7,19 @@
  *   批次 data/review-batches.json（REVIEW_BATCHES_FILE 覆盖）
  *
  * 乐观并发（多页面/多人同时操作）：
- *   快照集合、批注集合、审阅批次集合各有单调递增的 rev；
+ *   快照集合、批注集合、审阅批次集合、审阅决策集合各有单调递增的 rev；
  *   快照响应带 X-Snapshot-Rev，批注响应带 X-Annotation-Rev，
- *   批次响应带 X-Batch-Rev；
+ *   批次响应带 X-Batch-Rev，决策响应带 X-Decision-Rev；
  *   所有变更类请求必须带 If-Match: <对应集合 rev>，服务端要求严格相等，
  *   否则 409 version_conflict 且不写盘——旧页面无法覆盖别人的新状态。
  *   批次内成员状态变更同时推进“批注 rev”和“批次 rev”，因此批次页面
  *   持旧批次版本做批量更新时，只要期间任何人改过成员状态都会被拒绝。
+ *
+ * 审阅决策（草案/投票/执行）：
+ *   决策集合有独立 rev（X-Decision-Rev）。执行前按条目同时校验文本版本
+ *   （客户端回传当前段落，服务端比对草案文本指纹）、批注版本（updatedAt）
+ *   与批次版本（成员归属），只把受影响条目标为冲突，一次执行可部分成功。
+ *   决策状态、投票与执行结果在保存快照时整体嵌入，历史快照可见当时草案。
  *
  * 批次约束：
  *   同一条批注最多属于一个“未归档”批次；归档批次的成员状态永久冻结
@@ -32,6 +38,7 @@ const path = require("path");
 const crypto = require("crypto");
 const core = require("./snapshot-core");
 const review = require("./review-core");
+const decision = require("./decision-core");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
@@ -41,6 +48,8 @@ const ANN_FILE = process.env.ANNOTATIONS_FILE ||
   path.join(ROOT, "data", "annotations.json");
 const BATCH_FILE = process.env.REVIEW_BATCHES_FILE ||
   path.join(ROOT, "data", "review-batches.json");
+const DECISION_FILE = process.env.REVIEW_DECISIONS_FILE ||
+  path.join(ROOT, "data", "review-decisions.json");
 const REQUEST_BODY_LIMIT = 4 * 1024 * 1024; // 传输字节上限（校验逻辑另有字符上限）
 
 const MIME = {
@@ -98,7 +107,10 @@ function publicFull(s) {
     paragraphs: s.paragraphs,
     // 快照保存时刻的批注集合（可能为 null：该快照创建于批注功能上线前）
     annotations: Array.isArray(s.annotations) ? s.annotations : null,
-    annotationRev: Number.isInteger(s.annotationRev) ? s.annotationRev : null
+    annotationRev: Number.isInteger(s.annotationRev) ? s.annotationRev : null,
+    // 快照保存时刻的决策草案（可能为 null：该快照创建于决策功能上线前）
+    decisions: Array.isArray(s.decisions) ? s.decisions : null,
+    decisionRev: Number.isInteger(s.decisionRev) ? s.decisionRev : null
   };
 }
 
@@ -277,7 +289,135 @@ function publicBatchFull(b) {
     batch: batchSummary(b),
     members: members,
     // 归档批次返回归档瞬间冻结的完整批注内容，供“查看完整历史”
-    frozen: b.status === "archived"
+    frozen: b.status === "archived",
+    // 该批次关联的决策草案（只读概要，详情走 /api/review-decisions/:id）
+    decisionIds: decisionIndexOfBatch(b.id)
+  };
+}
+
+/* ================= 审阅决策存储 ================= */
+
+const decisionStore = { rev: 0, decisions: [], logs: [] };
+
+function persistDecisions(cb) {
+  const tmp = DECISION_FILE + ".tmp";
+  fs.mkdir(path.dirname(DECISION_FILE), { recursive: true }, function () {
+    fs.writeFile(tmp, JSON.stringify(decisionStore), function (err) {
+      if (err) { cb(err); return; }
+      fs.rename(tmp, DECISION_FILE, cb);
+    });
+  });
+}
+
+try {
+  const raw = fs.readFileSync(DECISION_FILE, "utf8");
+  const data = JSON.parse(raw);
+  if (Number.isInteger(data.rev) && Array.isArray(data.decisions)) {
+    decisionStore.rev = data.rev;
+    decisionStore.decisions = data.decisions;
+    decisionStore.logs = Array.isArray(data.logs) ? data.logs : [];
+  }
+} catch (e) {
+  // 文件不存在/损坏：以空存储启动，损坏文件不覆盖
+}
+
+function findDecision(id) {
+  return decisionStore.decisions.find(function (d) { return d.id === id; });
+}
+
+function decisionIndexOfBatch(batchId) {
+  return decisionStore.decisions
+    .filter(function (d) { return d.batchId === batchId; })
+    .map(function (d) { return d.id; });
+}
+
+// 决策审阅记录：草案创建/方案修改/投票/提交/执行/撤销全部留痕，可按时间查看。
+function addDecisionLog(entry) {
+  decisionStore.logs.push({
+    id: entry.id || crypto.randomUUID(),
+    decisionId: entry.decisionId || null,
+    decisionName: entry.decisionName || null,
+    batchId: entry.batchId || null,
+    batchName: entry.batchName || null,
+    at: entry.at || new Date().toISOString(),
+    actor: entry.actor || "匿名",
+    action: entry.action,
+    detail: entry.detail || null,
+    annotationId: entry.annotationId || null
+  });
+  if (decisionStore.logs.length > decision.LIMITS.LOG_MAX) {
+    decisionStore.logs.splice(0, decisionStore.logs.length - decision.LIMITS.LOG_MAX);
+  }
+}
+
+function decisionItemSummary(it, threshold) {
+  const tally = decision.tallyVotes(it.votes);
+  return {
+    annotationId: it.annotationId,
+    paraIndex: it.paraIndex, start: it.start, end: it.end,
+    quote: it.quote, paraDir: it.paraDir,
+    disposition: it.disposition,
+    replacement: it.replacement,
+    state: decision.itemState(it, threshold),
+    approve: tally.counts.approve,
+    reject: tally.counts.reject,
+    abstain: tally.counts.abstain,
+    voters: tally.voters,
+    annotationUpdatedAt: it.annotationUpdatedAt || null
+  };
+}
+
+function decisionSummary(d) {
+  const p = decision.decisionProgress(d);
+  const batch = findBatch(d.batchId);
+  return {
+    id: d.id, batchId: d.batchId, batchName: d.batchName,
+    name: d.name, status: d.status, threshold: d.threshold,
+    createdAt: d.createdAt, updatedAt: d.updatedAt,
+    submittedAt: d.submittedAt || null, readyAt: d.readyAt || null,
+    deadline: d.deadline || null,
+    itemCount: d.items.length,
+    progress: p,
+    frozen: !!(batch && batch.status === "archived"),
+    overdue: decision.isOverdue(d.deadline) && d.status !== "executed",
+    executed: d.status === "executed",
+    lastExecutionId: d.lastExecutionId || null
+  };
+}
+
+function publicDecisions(batchId) {
+  var list = decisionStore.decisions.slice()
+    .filter(function (d) { return !batchId || d.batchId === batchId; })
+    .sort(function (a, b) { return (b.createdAt || "").localeCompare(a.createdAt || ""); })
+    .map(decisionSummary);
+  return { rev: decisionStore.rev, decisions: list };
+}
+
+function publicDecisionFull(d) {
+  const batch = findBatch(d.batchId);
+  return {
+    rev: decisionStore.rev,
+    decision: decisionSummary(d),
+    batchFrozen: !!(batch && batch.status === "archived"),
+    batchStatus: batch ? batch.status : null,
+    annotationRev: d.annotationRev,
+    batchRev: d.batchRev,
+    textRev: d.textRev,
+    items: d.items.map(function (it) {
+      var s = decisionItemSummary(it, d.threshold);
+      s.votes = (it.votes || []).slice().sort(function (a, b) {
+        return (a.at || "").localeCompare(b.at || "");
+      });
+      return s;
+    }),
+    executions: (d.executions || []).map(function (ex) {
+      return {
+        id: ex.id, at: ex.at, actor: ex.actor, applied: ex.applied,
+        undone: !!ex.undone, undoneAt: ex.undoneAt || null,
+        counts: ex.counts,
+        resultCount: (ex.results || []).length
+      };
+    })
   };
 }
 
@@ -290,6 +430,7 @@ function sendJSON(res, status, body, headers) {
     "X-Snapshot-Rev": String(store.rev),
     "X-Annotation-Rev": String(annStore.rev),
     "X-Batch-Rev": String(batchStore.rev),
+    "X-Decision-Rev": String(decisionStore.rev),
     "Cache-Control": "no-store"
   }, headers || {});
   res.writeHead(status, h);
@@ -773,7 +914,10 @@ function handleSnapshots(req, res, parts) {
         paragraphs: check.value.paragraphs,
         // 关联当前批注集合：查看该历史快照时能看到当时的批注、工作流状态与所属批次
         annotations: review.snapshotDigest(annStore.annotations, batchLookup),
-        annotationRev: annStore.rev
+        annotationRev: annStore.rev,
+        // 关联当前决策草案（状态/投票/执行结果）：历史快照可见当时的决策情况
+        decisions: decision.decisionDigest(decisionStore.decisions),
+        decisionRev: decisionStore.rev
       };
       store.snapshots.push(snap);
       store.rev++;
@@ -837,7 +981,8 @@ function handleSnapshots(req, res, parts) {
         return;
       }
       const backup = { name: s.name, updatedAt: s.updatedAt, paragraphs: s.paragraphs,
-                       annotations: s.annotations, annotationRev: s.annotationRev };
+                       annotations: s.annotations, annotationRev: s.annotationRev,
+                       decisions: s.decisions, decisionRev: s.decisionRev };
       s.name = check.value.name;
       s.paragraphs = check.value.paragraphs;
       s.updatedAt = new Date().toISOString();
@@ -846,6 +991,9 @@ function handleSnapshots(req, res, parts) {
         batchStore.batches.map(function (b) { return [b.id, { id: b.id, name: b.name, status: b.status }]; }));
       s.annotations = review.snapshotDigest(annStore.annotations, batchLookup2);
       s.annotationRev = annStore.rev;
+      // 覆盖保存同步刷新决策草案状态、投票与执行结果
+      s.decisions = decision.decisionDigest(decisionStore.decisions);
+      s.decisionRev = decisionStore.rev;
       store.rev++;
       const newRev = store.rev;
       persist(function (err) {
@@ -853,6 +1001,7 @@ function handleSnapshots(req, res, parts) {
           s.name = backup.name; s.paragraphs = backup.paragraphs;
           s.updatedAt = backup.updatedAt;
           s.annotations = backup.annotations; s.annotationRev = backup.annotationRev;
+          s.decisions = backup.decisions; s.decisionRev = backup.decisionRev;
           store.rev--;
           apiError(res, 500, "persist_failed", "快照保存失败，请重试");
           return;
@@ -1447,6 +1596,944 @@ function handleReviewBatches(req, res, parts, urlObj) {
   apiError(res, 405, "method_not_allowed", "该路径不支持此方法");
 }
 
+/* ================= 审阅决策 API =================
+ * parts: ["api", "review-decisions", ":id?", "submit"|"items"|"votes"|
+ *          "preview"|"execute"|"undo"|"logs"?]
+ * 锁模型：
+ *   - 所有变更必须 If-Match 当前 X-Decision-Rev；决策集合 rev 是权威并发闸门，
+ *     “多人同时修改草案时旧页面提交必被版本冲突拒绝”；
+ *   - 创建额外校验批次未归档/未过期/同批次无活草案；
+ *   - execute/undo 再逐条核对文本版本（请求回传当前段落）、批注版本
+ *     （创建时记录的 updatedAt）、批次版本（成员归属），冲突只落在具体条目。
+ */
+function handleReviewDecisions(req, res, parts, urlObj) {
+  const id = parts[2];
+  const sub = parts[3];
+  const validSubs = { submit: true, items: true, votes: true, preview: true,
+                      execute: true, undo: true, logs: true };
+  if (sub && !(id && validSubs[sub] && parts.length === 4)) {
+    apiError(res, 404, "not_found", "接口不存在");
+    return;
+  }
+  if (parts.length > 4) {
+    apiError(res, 404, "not_found", "接口不存在");
+    return;
+  }
+
+  /* ---- 集合级：GET 列表（可 ?batchId= 过滤）、POST 创建 ---- */
+  if (!id) {
+    if (req.method === "GET") {
+      const bId = urlObj.searchParams.get("batchId");
+      sendJSON(res, 200, publicDecisions(bId));
+      return;
+    }
+    if (req.method === "POST") {
+      if (checkLock(res, req.headers["if-match"], decisionStore.rev, "审阅决策集合")) return;
+      readBody(req, function (err, raw) {
+        if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+        let payload;
+        try { payload = JSON.parse(raw); }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+
+        if (!payload || typeof payload.batchId !== "string") {
+          apiError(res, 400, "invalid_body", "必须指定要派生决策草案的审阅批次");
+          return;
+        }
+        const batch = findBatch(payload.batchId);
+        if (!batch) {
+          apiError(res, 404, "batch_not_found", "审阅批次不存在或已被删除");
+          return;
+        }
+        if (batch.status === "archived") {
+          apiError(res, 409, "batch_archived",
+            "批次“" + batch.name + "”已归档，归档批次不能创建决策草案",
+            { batchId: batch.id });
+          return;
+        }
+        if (review.batchOverdue(batch)) {
+          apiError(res, 409, "deadline_passed",
+            "批次“" + batch.name + "”已过截止时间，不能再创建决策草案；" +
+            "如需继续，请先在批次信息中调整截止时间（当前页面内容已保留）",
+            { batchId: batch.id, deadline: batch.deadline });
+          return;
+        }
+        if (decisionStore.decisions.length >= decision.LIMITS.DECISION_MAX_COUNT) {
+          apiError(res, 413, "too_many_decisions",
+            "决策草案总数已达 " + decision.LIMITS.DECISION_MAX_COUNT + " 个上限");
+          return;
+        }
+        // 同一批次最多保留一个未结束（非已执行）的草案，避免方案分叉重复
+        const dup = decisionStore.decisions.find(function (d) {
+          return d.batchId === batch.id && d.status !== "executed";
+        });
+        if (dup) {
+          apiError(res, 409, "duplicate_decision",
+            "批次“" + batch.name + "”已有决策草案“" + dup.name +
+            "”：请在原草案上继续投票/执行，或等其执行完成后再建新草案",
+            { existingId: dup.id });
+          return;
+        }
+
+        // 成员批注：活批次以 memberIds 的实时记录为准；成员缺失不能建草案
+        const members = batch.memberIds.map(function (aid) { return findAnn(aid); });
+        const missing = members.filter(function (a) { return !a; })
+          .map(function (_, i) { return batch.memberIds[i]; });
+        if (missing.length || !members.length) {
+          apiError(res, 409, "member_missing",
+            members.length
+              ? "批次中有 " + missing.length + " 条批注已不存在，无法创建决策草案，请先核对批次成员"
+              : "批次中没有批注，不能创建空的决策草案",
+            { missing: missing });
+          return;
+        }
+        const nameCheck = decision.validateName(payload.name, batch.name);
+        if (!nameCheck.ok) { apiError(res, nameCheck.status, nameCheck.code, nameCheck.message); return; }
+        const check = decision.validateCreatePayload(payload, members);
+        if (!check.ok) { apiError(res, check.status, check.code, check.message); return; }
+
+        const now = new Date().toISOString();
+        const actor = review.validateAuthor(payload.actor).value;
+        // 基线文本：客户端回传创建草案时编辑区的当前段落
+        const paragraphsCheck = core.validateSnapshotPayload(
+          Object.assign({ name: "decision-baseline" },
+            { paragraphs: payload.paragraphs || [] }));
+        if (!paragraphsCheck.ok) {
+          apiError(res, paragraphsCheck.status, paragraphsCheck.code,
+            "当前文本快照无效：" + paragraphsCheck.message);
+          return;
+        }
+        const baseline = paragraphsCheck.value.paragraphs;
+
+        const d = {
+          id: crypto.randomUUID(),
+          batchId: batch.id,
+          batchName: batch.name,
+          name: nameCheck.value,
+          status: "drafting",
+          threshold: check.value.threshold,
+          createdAt: now,
+          updatedAt: now,
+          submittedAt: null,
+          readyAt: null,
+          deadline: batch.deadline || null,
+          createdBy: actor,
+          // 三版本基线
+          textRev: decision.textContentRev(baseline),
+          annotationRev: annStore.rev,
+          batchRev: batchStore.rev,
+          baselineParagraphs: baseline,
+          items: check.value.items.map(function (g) {
+            const a = members.find(function (m) { return m.id === g.annotationId; });
+            return {
+              annotationId: a.id,
+              paraIndex: a.paraIndex,
+              start: a.start, end: a.end, quote: a.quote, paraDir: a.paraDir,
+              annotationUpdatedAt: a.updatedAt || a.createdAt || now,
+              disposition: g.disposition,
+              replacement: g.replacement,
+              updatedAt: g.disposition ? now : null,
+              voteClearedAt: null,
+              votes: [],
+              voteHistory: []
+            };
+          }),
+          executions: [],
+          lastExecutionId: null
+        };
+        decisionStore.decisions.push(d);
+        decisionStore.rev++;
+        addDecisionLog({
+          decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
+          at: now, actor: actor, action: "decision_create",
+          detail: "创建决策草案，通过人数门槛 " + d.threshold +
+                  "；条目 " + d.items.length + " 条；文本版本 " + d.textRev.slice(0, 8) +
+                  "、批注版本 " + d.annotationRev + "、批次版本 " + d.batchRev,
+          annotationId: null
+        });
+        persistDecisions(function (perr) {
+          if (perr) {
+            decisionStore.decisions.pop();
+            decisionStore.rev--;
+            decisionStore.logs.pop();
+            apiError(res, 500, "persist_failed", "决策草案创建失败，请重试");
+            return;
+          }
+          sendJSON(res, 201, { rev: decisionStore.rev, decision: decisionSummary(d) });
+        });
+      });
+      return;
+    }
+    apiError(res, 405, "method_not_allowed", "该路径不支持此方法");
+    return;
+  }
+
+  const d = findDecision(id);
+  if (!d) {
+    if (req.method === "GET") {
+      apiError(res, 404, "decision_not_found", "决策草案不存在或已被删除");
+      return;
+    }
+    if (checkLock(res, req.headers["if-match"], decisionStore.rev, "审阅决策集合")) return;
+    apiError(res, 404, "decision_not_found", "决策草案不存在或已被删除");
+    return;
+  }
+  const batch = findBatch(d.batchId);
+
+  /* ---- 只读：详情 / 审阅记录 ---- */
+  if (req.method === "GET" && !sub) {
+    sendJSON(res, 200, publicDecisionFull(d));
+    return;
+  }
+  if (sub === "logs" && req.method === "GET") {
+    const params = urlObj.searchParams;
+    let logs = decisionStore.logs.filter(function (l) { return l.decisionId === id; });
+    const from = params.get("from");
+    const to = params.get("to");
+    if (from && !isNaN(Date.parse(from))) {
+      logs = logs.filter(function (l) { return Date.parse(l.at) >= Date.parse(from); });
+    }
+    if (to && !isNaN(Date.parse(to))) {
+      logs = logs.filter(function (l) { return Date.parse(l.at) <= Date.parse(to); });
+    }
+    logs = logs.slice().sort(function (a, b) { return b.at.localeCompare(a.at); });
+    sendJSON(res, 200, { rev: decisionStore.rev, decisionId: id, logs: logs });
+    return;
+  }
+
+  // 以下除 preview（只读计算）外均为变更类：必须带决策集合版本
+  if (!(sub === "preview" && req.method === "POST")) {
+    if (checkLock(res, req.headers["if-match"], decisionStore.rev, "审阅决策集合")) return;
+  }
+
+  function rejectFrozenOrExpired() {
+    if (batch && batch.status === "archived") {
+      apiError(res, 409, "batch_archived",
+        "批次“" + batch.name + "”已归档，其决策草案只读，不能再改动或执行",
+        { batchId: batch.id });
+      return true;
+    }
+    if (decision.isOverdue(d.deadline) && d.status !== "executed") {
+      apiError(res, 409, "decision_expired",
+        "批次已过截止时间（" + d.deadline + "），草案“" + d.name +
+        "”已过期，不能再修改、投票或执行；请先调整批次截止时间后再试",
+        { deadline: d.deadline });
+      return true;
+    }
+    return false;
+  }
+
+  function persistDecision(backup, logEntries, ok, fail) {
+    persistDecisions(function (perr) {
+      if (perr) {
+        backup();
+        decisionStore.rev--;
+        (logEntries || []).forEach(function (le) {
+          const i = decisionStore.logs.indexOf(le);
+          if (i !== -1) decisionStore.logs.splice(i, 1);
+        });
+        apiError(res, 500, "persist_failed", "决策保存失败，请重试");
+        return;
+      }
+      ok();
+    });
+  }
+
+  /* ---- PUT /api/review-decisions/:id：改名 / 调整通过人数（仅拟定中） ---- */
+  if (!sub && req.method === "PUT") {
+    if (rejectFrozenOrExpired()) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload;
+      try { payload = JSON.parse(raw); }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+
+      if (d.status !== "drafting") {
+        apiError(res, 409, "decision_not_editable",
+          "草案已进入投票，名称与通过人数不能再修改（当前页面内容已保留）");
+        return;
+      }
+      const backup = {
+        name: d.name, threshold: d.threshold, updatedAt: d.updatedAt
+      };
+      let changed = false;
+      if (payload.name !== undefined) {
+        const nc = decision.validateName(payload.name, batch.name);
+        if (!nc.ok) { apiError(res, nc.status, nc.code, nc.message); return; }
+        if (nc.value !== d.name) {
+          d.name = nc.value; changed = true;
+        }
+      }
+      if (payload.threshold !== undefined) {
+        const tc = decision.validateThreshold(payload.threshold);
+        if (!tc.ok) { apiError(res, tc.status, tc.code, tc.message); return; }
+        if (tc.value !== d.threshold) {
+          d.threshold = tc.value; changed = true;
+        }
+      }
+      if (!changed) {
+        apiError(res, 400, "no_change", "没有需要更新的字段");
+        return;
+      }
+      const now = new Date().toISOString();
+      d.updatedAt = now;
+      const le = {
+        decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
+        at: now, actor: review.validateAuthor(payload.actor).value,
+        action: "decision_update",
+        detail: "草案更新：" +
+          (backup.name !== d.name ? "名称“" + backup.name + "”→“" + d.name + "”；" : "") +
+          (backup.threshold !== d.threshold ? "通过人数 " + backup.threshold + " → " + d.threshold : ""),
+        annotationId: null
+      };
+      addDecisionLog(le);
+      decisionStore.rev++;
+      persistDecision(function () {
+        d.name = backup.name; d.threshold = backup.threshold; d.updatedAt = backup.updatedAt;
+      }, [le], function () {
+        sendJSON(res, 200, { rev: decisionStore.rev, decision: decisionSummary(d) });
+      });
+    });
+    return;
+  }
+
+  /* ---- PUT /api/review-decisions/:id/items：逐条填写/修改方案 ---- */
+  if (sub === "items" && req.method === "PUT") {
+    if (rejectFrozenOrExpired()) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload;
+      try { payload = JSON.parse(raw); }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+
+      if (d.status !== "drafting" && d.status !== "voting") {
+        apiError(res, 409, "decision_not_editable",
+          d.status === "executed" ? "草案已执行，方案不能再修改"
+                                  : "草案当前状态不能修改方案");
+        return;
+      }
+      const check = decision.validateItemsUpdate(payload, d);
+      if (!check.ok) { apiError(res, check.status, check.code, check.message); return; }
+      const now = new Date().toISOString();
+      const backup = d.items.map(function (it) {
+        return {
+          annotationId: it.annotationId, disposition: it.disposition,
+          replacement: it.replacement, votes: it.votes.slice(),
+          voteClearedAt: it.voteClearedAt, updatedAt: it.updatedAt
+        };
+      });
+      const logEntries = [];
+      let cleared = 0;
+      check.value.items.forEach(function (patch) {
+        const it = d.items.find(function (x) { return x.annotationId === patch.annotationId; });
+        const rev = decision.reviseItem(it, patch, now);
+        if (rev.changed) {
+          it.disposition = rev.disposition;
+          it.replacement = rev.replacement;
+          it.votes = rev.votes;
+          it.voteClearedAt = rev.voteClearedAt;
+          it.updatedAt = rev.updatedAt;
+          if (backup.find(function (b) {
+            return b.annotationId === it.annotationId && b.votes.length;
+          })) cleared++;
+          logEntries.push({
+            decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
+            at: now, actor: review.validateAuthor(payload.actor).value,
+            action: "items_update",
+            detail: "方案更新为“" + decision.DISPOSITION_LABELS[patch.disposition] + "”" +
+              (patch.disposition === "replace" ? "，替换文本 " + decision.cpLen(patch.replacement) + " 字符" : "") +
+              (rev.changed && backup.find(function (b) {
+                return b.annotationId === it.annotationId && b.votes.length;
+              }) ? "（该条已有投票已作废，需重新投票）" : ""),
+            annotationId: it.annotationId
+          });
+        }
+      });
+      if (!logEntries.length) {
+        apiError(res, 400, "no_change", "方案没有变化");
+        return;
+      }
+      d.updatedAt = now;
+      logEntries.forEach(addDecisionLog);
+      decisionStore.rev++;
+      persistDecision(function () {
+        d.items.forEach(function (it) {
+          const b = backup.find(function (x) { return x.annotationId === it.annotationId; });
+          if (!b) return;
+          it.disposition = b.disposition; it.replacement = b.replacement;
+          it.votes = b.votes; it.voteClearedAt = b.voteClearedAt; it.updatedAt = b.updatedAt;
+        });
+      }, logEntries, function () {
+        sendJSON(res, 200, publicDecisionFull(d));
+      });
+    });
+    return;
+  }
+
+  /* ---- POST /api/review-decisions/:id/submit：方案完成，进入投票 ---- */
+  if (sub === "submit" && req.method === "POST") {
+    if (rejectFrozenOrExpired()) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload = {};
+      if (raw) {
+        try { payload = JSON.parse(raw) || {}; }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      }
+      if (d.status !== "drafting") {
+        apiError(res, 409, "decision_not_editable",
+          d.status === "voting" ? "草案已在投票中" :
+          d.status === "ready" ? "草案已达到通过门槛，等待执行" : "草案已执行");
+        return;
+      }
+      const unfilled = d.items.filter(function (it) { return !it.disposition; })
+        .map(function (it) { return it.annotationId; });
+      if (unfilled.length) {
+        apiError(res, 400, "empty_items",
+          "还有 " + unfilled.length + " 条批注没有处理方案：每条都必须选择保留、替换或删除后才能提交投票（当前页面内容已保留）",
+          { unfilled: unfilled });
+        return;
+      }
+      const now = new Date().toISOString();
+      const backup = { status: d.status, submittedAt: d.submittedAt, updatedAt: d.updatedAt };
+      d.status = "voting";
+      d.submittedAt = now;
+      d.updatedAt = now;
+      const le = {
+        decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
+        at: now, actor: review.validateAuthor(payload.actor).value,
+        action: "decision_submit",
+        detail: "方案填写完成并提交投票，通过人数门槛 " + d.threshold,
+        annotationId: null
+      };
+      addDecisionLog(le);
+      decisionStore.rev++;
+      persistDecision(function () {
+        d.status = backup.status; d.submittedAt = backup.submittedAt;
+        d.updatedAt = backup.updatedAt;
+      }, [le], function () {
+        sendJSON(res, 200, publicDecisionFull(d));
+      });
+    });
+    return;
+  }
+
+  /* ---- POST /api/review-decisions/:id/votes：逐条投票 ---- */
+  if (sub === "votes" && req.method === "POST") {
+    if (rejectFrozenOrExpired()) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload;
+      try { payload = JSON.parse(raw); }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+
+      if (d.status === "drafting") {
+        apiError(res, 409, "decision_not_voting",
+          "草案尚未提交投票：请先为每条批注填写处理方案并提交（当前页面内容已保留）");
+        return;
+      }
+      if (d.status === "executed") {
+        apiError(res, 409, "decision_executed", "草案已执行，投票已关闭");
+        return;
+      }
+      const check = decision.validateVotePayload(payload);
+      if (!check.ok) { apiError(res, check.status, check.code, check.message); return; }
+      const it = d.items.find(function (x) { return x.annotationId === check.value.annotationId; });
+      if (!it) {
+        apiError(res, 404, "item_not_found", "该批注不在此决策草案中");
+        return;
+      }
+      if (!it.disposition) {
+        apiError(res, 409, "item_has_no_disposition",
+          "该条批注还没有处理方案，不能投票；请先补充方案");
+        return;
+      }
+      const prev = d.status;
+      const tallyBefore = decision.tallyVotes(it.votes).byVoter[check.value.voter];
+      const now = new Date().toISOString();
+      const backupItem = {
+        votes: it.votes.slice(), voteHistory: it.voteHistory.slice(),
+        status: d.status, readyAt: d.readyAt, updatedAt: d.updatedAt
+      };
+      const applied = decision.applyVote(it, check.value.voter, check.value.vote, now);
+      it.votes = applied.votes;
+      it.voteHistory = applied.voteHistory;
+      d.updatedAt = now;
+      const newStatus = decision.recomputeStatus(d);
+      if (newStatus !== d.status) {
+        d.status = newStatus;
+        if (newStatus === "ready") d.readyAt = now;
+      }
+      const le = {
+        decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
+        at: now, actor: check.value.voter,
+        action: "vote",
+        detail: "投票“" + decision.VOTE_LABELS[check.value.vote] + "”" +
+          (tallyBefore ? "（改票，原投票：" + decision.VOTE_LABELS[tallyBefore] + "）" : "") +
+          (newStatus === "ready" && prev !== "ready" ? "；全部条目达标，草案进入待执行" : ""),
+        annotationId: it.annotationId
+      };
+      addDecisionLog(le);
+      decisionStore.rev++;
+      persistDecision(function () {
+        it.votes = backupItem.votes; it.voteHistory = backupItem.voteHistory;
+        d.status = backupItem.status; d.readyAt = backupItem.readyAt;
+        d.updatedAt = backupItem.updatedAt;
+      }, [le], function () {
+        sendJSON(res, 200, publicDecisionFull(d));
+      });
+    });
+    return;
+  }
+
+  /* ---- POST /api/review-decisions/:id/preview：按段执行前预览（纯计算，不写盘） ---- */
+  if (sub === "preview" && req.method === "POST") {
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload;
+      try { payload = JSON.parse(raw); }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+
+      const vCheck = core.validateSnapshotPayload(
+        Object.assign({ name: "decision-current" }, { paragraphs: payload.paragraphs || [] }));
+      if (!vCheck.ok) { apiError(res, vCheck.status, vCheck.code, "当前文本快照无效：" + vCheck.message); return; }
+      let selected = null;
+      if (payload.annotationIds !== undefined) {
+        const ic = review.validateAnnotationIds(payload.annotationIds);
+        if (!ic.ok) { apiError(res, ic.status, ic.code, ic.message); return; }
+        const foreign = ic.value.filter(function (aid) {
+          return !d.items.some(function (it) { return it.annotationId === aid; });
+        });
+        if (foreign.length) {
+          apiError(res, 409, "not_batch_member",
+            "有 " + foreign.length + " 条批注不在该决策草案中", { foreignIds: foreign });
+          return;
+        }
+        selected = ic.value;
+      }
+      const preview = decision.buildPreview(d, vCheck.value.paragraphs,
+        annMap(), batch && batch.status !== "archived" ? batch.memberIds : [], selected);
+      sendJSON(res, 200, {
+        rev: decisionStore.rev,
+        decision: decisionSummary(d),
+        textChanged: preview.textChanged,
+        baselineTextRev: preview.baselineTextRev,
+        currentTextRev: preview.currentTextRev,
+        counts: preview.counts,
+        // 逐条判定（不分段），与执行结果结构一致，便于冲突汇总与勾选执行
+        results: preview.results.map(function (r) {
+          return {
+            annotationId: r.annotationId, disposition: r.disposition,
+            result: r.result, reason: r.reason,
+            paraIndex: r.paraIndex, currentParaIndex: r.currentParaIndex
+          };
+        }),
+        rows: preview.rows.map(function (row) {
+          return {
+            paraIndex: row.paraIndex,
+            currentParaIndex: row.currentParaIndex,
+            dirChanged: row.dirChanged,
+            deleted: row.deleted,
+            paraChanged: row.paraChanged,
+            baseline: row.baseline,
+            current: row.current,
+            afterText: row.afterText,
+            items: row.items.map(function (it) {
+              return {
+                annotationId: it.annotationId, quote: it.quote,
+                start: it.start, end: it.end, paraDir: it.paraDir,
+                disposition: it.disposition, replacement: it.replacement,
+                afterText: it.afterText,
+                voteState: it.voteState,
+                approve: it.tally.counts.approve, reject: it.tally.counts.reject,
+                abstain: it.tally.counts.abstain,
+                result: it.result, reason: it.reason, selected: it.selected
+              };
+            })
+          };
+        })
+      });
+    });
+    return;
+  }
+
+  /* ---- POST /api/review-decisions/:id/execute：三版本逐条校验 + 部分成功 ---- */
+  if (sub === "execute" && req.method === "POST") {
+    // 并发闸门用决策集合 rev：客户端必须带预览/详情时看到的版本
+    if (checkLock(res, req.headers["if-match"], decisionStore.rev, "审阅决策集合")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload;
+      try { payload = JSON.parse(raw); }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+
+      if (batch && batch.status === "archived") {
+        apiError(res, 409, "batch_archived",
+          "批次已归档，决策草案只读，不能执行");
+        return;
+      }
+      if (decision.isOverdue(d.deadline)) {
+        apiError(res, 409, "decision_expired",
+          "批次已过截止时间，草案已过期，不能执行；请先调整批次截止时间");
+        return;
+      }
+      if (d.status === "executed") {
+        apiError(res, 409, "decision_executed",
+          "该草案已经执行过，同一草案不能重复执行；如需恢复请使用“撤销最近一次执行”",
+          { lastExecutionId: d.lastExecutionId });
+        return;
+      }
+      if (d.status !== "ready") {
+        const p = decision.decisionProgress(d);
+        apiError(res, 409, "decision_not_ready",
+          "草案尚未达到执行条件：" + p.approved + "/" + p.total +
+          " 条通过投票（有驳回或缺票时不能执行），当前状态：" +
+          decision.STATUS_LABELS[d.status],
+          { progress: p });
+        return;
+      }
+      if (!batch) {
+        apiError(res, 404, "batch_not_found", "草案所属批次已不存在，无法执行");
+        return;
+      }
+      const vCheck = core.validateSnapshotPayload(
+        Object.assign({ name: "decision-current" }, { paragraphs: payload.paragraphs || [] }));
+      if (!vCheck.ok) { apiError(res, vCheck.status, vCheck.code, "当前文本快照无效：" + vCheck.message); return; }
+      const currentParas = vCheck.value.paragraphs;
+
+      let selected;
+      if (payload.annotationIds != null) {
+        const ic = review.validateAnnotationIds(payload.annotationIds);
+        if (!ic.ok) { apiError(res, ic.status, ic.code, ic.message); return; }
+        const foreign = ic.value.filter(function (aid) {
+          return !d.items.some(function (it) { return it.annotationId === aid; });
+        });
+        if (foreign.length) {
+          apiError(res, 409, "not_batch_member", "有批注不在该决策草案中", { foreignIds: foreign });
+          return;
+        }
+        selected = ic.value;
+      }
+
+      const now = new Date().toISOString();
+      const actor = review.validateAuthor(payload.actor).value;
+      const plan = decision.planExecution(d, currentParas, annMap(),
+        batch.memberIds, selected);
+
+      // 合成执行后段落（只含成功条目；冲突/跳过条目不触碰）
+      const afterParas = decision.applyPlan(currentParas, plan.results);
+
+      // 成功条目对应的批注：标记已解决（保留/替换/删除都表示该批注处理完成）
+      const successIds = plan.results.filter(function (r) { return r.result === "success"; })
+        .map(function (r) { return r.annotationId; });
+      const annBackups = successIds.map(function (aid) {
+        const a = findAnn(aid);
+        return { ann: a, status: a.status, resolvedAt: a.resolvedAt,
+                 resolvedBy: a.resolvedBy, updatedAt: a.updatedAt };
+      });
+      successIds.forEach(function (aid) {
+        const a = findAnn(aid);
+        a.status = "resolved";
+        a.resolvedAt = now;
+        a.resolvedBy = actor;
+        a.updatedAt = now;
+      });
+      if (successIds.length) annStore.rev++;
+      // 批次进度随成员状态变化推进批次 rev
+      if (successIds.some(function (aid) { return batch.memberIds.indexOf(aid) !== -1; })) {
+        batch.updatedAt = now;
+        batchStore.rev++;
+      }
+
+      const applied = successIds.length > 0;
+      const ex = {
+        id: crypto.randomUUID(),
+        at: now,
+        actor: actor,
+        applied: applied,
+        undone: false,
+        undoneAt: null,
+        textRevBefore: plan.currentTextRev,
+        textRevAfter: decision.textContentRev(afterParas),
+        annotationRevBefore: d.annotationRev,
+        batchRevBefore: d.batchRev,
+        // 成功执行前的段落（供撤销时把编辑区恢复回来）
+        beforeParagraphs: applied ? currentParas : null,
+        counts: plan.counts,
+        results: plan.results.map(function (r) {
+          return {
+            annotationId: r.annotationId,
+            disposition: r.disposition,
+            replacement: r.replacement,
+            result: r.result,
+            reason: r.reason,
+            paraIndex: r.paraIndex,
+            currentParaIndex: r.currentParaIndex == null ? null : r.currentParaIndex,
+            start: r.start, end: r.end,
+            at: now
+          };
+        }),
+        undo: null
+      };
+
+      const prevStatus = d.status;
+      const prevLastExec = d.lastExecutionId;
+      const prevUpdated = d.updatedAt;
+      d.executions.push(ex);
+      d.lastExecutionId = ex.id;
+      d.updatedAt = now;
+      if (applied) {
+        // 一次部分成功也视为该草案已执行：成功部分固化，冲突/跳过条目记录在案
+        d.status = "executed";
+      }
+
+      const le = {
+        decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
+        at: now, actor: actor,
+        action: "execute",
+        detail: "执行决策：成功 " + plan.counts.success + " 条、冲突 " +
+          plan.counts.conflict + " 条、跳过 " + plan.counts.skipped + " 条" +
+          (plan.textChanged ? "；执行前检测到文本版本已变化（" +
+            plan.baselineTextRev.slice(0, 8) + " → " + plan.currentTextRev.slice(0, 8) + "）" : "") +
+          (applied ? "" : "（没有可成功执行的条目，草案仍为待执行）"),
+        annotationId: null
+      };
+      addDecisionLog(le);
+      // 逐条结果也进记录，可按时间查看每条批注为何成功/冲突/跳过
+      plan.results.forEach(function (r) {
+        addDecisionLog({
+          decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
+          at: now, actor: actor,
+          action: "execute_item_" + r.result,
+          detail: decision.DISPOSITION_LABELS[r.disposition] || r.disposition + "：" +
+            (r.result === "success" ? "执行成功"
+             : r.result === "conflict" ? "冲突（" + (decision.REASON_LABELS[r.reason] || r.reason) + "）"
+             : "跳过（" + (decision.REASON_LABELS[r.reason] || r.reason) + "）"),
+          annotationId: r.annotationId
+        });
+      });
+      decisionStore.rev++;
+
+      function rollbackAll() {
+        annBackups.forEach(function (bk) {
+          bk.ann.status = bk.status; bk.ann.resolvedAt = bk.resolvedAt;
+          bk.ann.resolvedBy = bk.resolvedBy; bk.ann.updatedAt = bk.updatedAt;
+        });
+        if (successIds.length) annStore.rev--;
+        if (successIds.some(function (aid) { return batch.memberIds.indexOf(aid) !== -1; })) {
+          batchStore.rev--;
+        }
+        d.status = prevStatus; d.lastExecutionId = prevLastExec;
+        d.updatedAt = prevUpdated;
+        const i = d.executions.indexOf(ex);
+        if (i !== -1) d.executions.splice(i, 1);
+        decisionStore.rev--;
+        const logStart = decisionStore.logs.findIndex(function (x) {
+          return x.decisionId === d.id && x.at === now &&
+            (x.action === "execute" || x.action.indexOf("execute_item_") === 0);
+        });
+        if (logStart !== -1) decisionStore.logs.splice(logStart);
+      }
+
+      persistDecisions(function (derr) {
+        if (derr) {
+          rollbackAll();
+          apiError(res, 500, "persist_failed", "决策执行记录保存失败，全部改动已回滚，请重试");
+          return;
+        }
+        // 决策已落盘后再落批注/批次：失败也不回滚已成功的执行（与批次状态接口同策略），
+        // 仅回滚内存中的 rev 推进，刷新后以批注存储为准；执行记录保留。
+        if (successIds.length) {
+          persistAnnotations(function (aerr) {
+            if (aerr) console.error("decision execute annotation persist failed:", aerr);
+            persistBatches(function (berr) {
+              if (berr) console.error("decision execute batch persist failed:", berr);
+              sendJSON(res, 200, executionResponse(ex, afterParas));
+            });
+          });
+        } else {
+          sendJSON(res, 200, executionResponse(ex, afterParas));
+        }
+      });
+
+      function executionResponse(exRec, afterParas2) {
+        return {
+          rev: decisionStore.rev,
+          decision: decisionSummary(d),
+          executionId: exRec.id,
+          applied: exRec.applied,
+          counts: exRec.counts,
+          status: d.status,
+          // 服务端校验通过后合成的执行后段落：由客户端在确认后写入编辑区
+          afterParagraphs: afterParas2,
+          results: exRec.results,
+          annotationRev: annStore.rev,
+          batchRev: batchStore.rev
+        };
+      }
+    });
+    return;
+  }
+
+  /* ---- POST /api/review-decisions/:id/undo：撤销最近一次成功执行 ---- */
+  if (sub === "undo" && req.method === "POST") {
+    if (checkLock(res, req.headers["if-match"], decisionStore.rev, "审阅决策集合")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload = {};
+      if (raw) {
+        try { payload = JSON.parse(raw) || {}; }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      }
+      if (batch && batch.status === "archived") {
+        apiError(res, 409, "batch_archived", "批次已归档，不能撤销执行");
+        return;
+      }
+      if (decision.isOverdue(d.deadline)) {
+        apiError(res, 409, "decision_expired", "批次已过截止时间，不能撤销执行");
+        return;
+      }
+      if (d.status !== "executed" || !d.lastExecutionId) {
+        apiError(res, 409, "nothing_to_undo", "该草案没有可撤销的执行");
+        return;
+      }
+      const ex = d.executions.find(function (x) { return x.id === d.lastExecutionId; });
+      if (!ex || !ex.applied || ex.undone) {
+        apiError(res, 409, "nothing_to_undo", "最近一次执行没有成功条目，或已经撤销过");
+        return;
+      }
+      // 全局只允许撤销“最近一次成功执行”
+      const latestApplied = decisionStore.decisions
+        .reduce(function (acc, x) {
+          const le2 = (x.executions || []).filter(function (e) {
+            return e.applied && !e.undone;
+          }).sort(function (a, b) { return b.at.localeCompare(a.at); })[0];
+          if (le2 && (!acc || le2.at > acc.at)) return le2;
+          return acc;
+        }, null);
+      if (!latestApplied || latestApplied.id !== ex.id) {
+        apiError(res, 409, "not_latest_execution",
+          "这不是最近一次成功执行：其后已有其他草案执行，请先撤销更新的执行",
+          { latestExecutionId: latestApplied ? latestApplied.id : null });
+        return;
+      }
+
+      const now = new Date().toISOString();
+      const actor = review.validateAuthor(payload.actor).value;
+      // 成功条目的批注：仅当执行后未再被改动时回滚为待处理；
+      // 已被别人更新/删除的保留现状（不能覆盖新的批注）。
+      // 回滚会产生新的 updatedAt：同步更新该条目的批注版本基线，
+      // 否则重新执行时会被“批注版本已变化”误判为冲突而无法再次执行。
+      const undoResults = ex.results.filter(function (r) {
+        return r.result === "success";
+      }).map(function (r) {
+        const a = findAnn(r.annotationId);
+        const it = d.items.find(function (x) { return x.annotationId === r.annotationId; });
+        if (!a) return { annotationId: r.annotationId, reverted: false, reason: "annotation_deleted" };
+        if (a.updatedAt !== ex.at || a.status !== "resolved") {
+          // 执行后又被别人修改/删除：保留现状（不覆盖新批注），但把该条目的
+          // 批注版本基线推进到撤销时刻的最新 updatedAt，否则重新执行时会被
+          // 永远误判为 annotation_changed。
+          if (it) it.annotationUpdatedAt = a.updatedAt || now;
+          return { annotationId: r.annotationId, reverted: false, reason: "changed_since_execution" };
+        }
+        a.status = "open";
+        a.resolvedAt = null;
+        a.resolvedBy = null;
+        a.updatedAt = now;
+        if (it) it.annotationUpdatedAt = now;
+        return { annotationId: r.annotationId, reverted: true };
+      });
+      const revertedIds = undoResults.filter(function (u) { return u.reverted; })
+        .map(function (u) { return u.annotationId; });
+      if (revertedIds.length) annStore.rev++;
+      if (revertedIds.some(function (aid) { return batch && batch.memberIds.indexOf(aid) !== -1; })) {
+        batch.updatedAt = now;
+        batchStore.rev++;
+      }
+
+      const backupUndo = { status: d.status, updatedAt: d.updatedAt,
+                           undone: ex.undone, undoneAt: ex.undoneAt, undo: ex.undo };
+      ex.undone = true;
+      ex.undoneAt = now;
+      ex.undo = { at: now, actor: actor, results: undoResults };
+      d.status = "ready"; // 撤销后草案回到待执行，允许再次执行
+      d.updatedAt = now;
+
+      const le = {
+        decisionId: d.id, decisionName: d.name, batchId: d.batchId, batchName: d.batchName,
+        at: now, actor: actor,
+        action: "execute_undo",
+        detail: "撤销最近一次执行：回滚批注 " + revertedIds.length + " 条；" +
+          (undoResults.length - revertedIds.length) +
+          " 条因执行后又被修改/删除而未回滚",
+        annotationId: null
+      };
+      addDecisionLog(le);
+      decisionStore.rev++;
+
+      function rollbackAll() {
+        undoResults.forEach(function (u) {
+          if (!u.reverted) return;
+          const a = findAnn(u.annotationId);
+          if (!a) return;
+          a.status = "resolved"; a.resolvedAt = ex.at; a.resolvedBy = ex.actor; a.updatedAt = ex.at;
+          const it = d.items.find(function (x) { return x.annotationId === u.annotationId; });
+          if (it) it.annotationUpdatedAt = ex.at;
+        });
+        if (revertedIds.length) annStore.rev--;
+        if (revertedIds.some(function (aid) { return batch && batch.memberIds.indexOf(aid) !== -1; })) {
+          batchStore.rev--;
+        }
+        d.status = backupUndo.status; d.updatedAt = backupUndo.updatedAt;
+        ex.undone = backupUndo.undone; ex.undoneAt = backupUndo.undoneAt; ex.undo = backupUndo.undo;
+        decisionStore.rev--;
+        const li = decisionStore.logs.indexOf(le);
+        if (li !== -1) decisionStore.logs.splice(li, 1);
+      }
+
+      persistDecisions(function (derr) {
+        if (derr) {
+          rollbackAll();
+          apiError(res, 500, "persist_failed", "撤销记录保存失败，已回滚，请重试");
+          return;
+        }
+        if (revertedIds.length) {
+          persistAnnotations(function (aerr) {
+            if (aerr) console.error("decision undo annotation persist failed:", aerr);
+            persistBatches(function () {
+              sendJSON(res, 200, {
+                rev: decisionStore.rev,
+                decision: decisionSummary(d),
+                reverted: revertedIds.length,
+                notReverted: undoResults.length - revertedIds.length,
+                undoResults: undoResults,
+                // 执行前的段落：由客户端确认后写回编辑区
+                beforeParagraphs: ex.beforeParagraphs,
+                annotationRev: annStore.rev,
+                batchRev: batchStore.rev
+              });
+            });
+          });
+        } else {
+          sendJSON(res, 200, {
+            rev: decisionStore.rev,
+            decision: decisionSummary(d),
+            reverted: 0,
+            notReverted: undoResults.length,
+            undoResults: undoResults,
+            beforeParagraphs: ex.beforeParagraphs,
+            annotationRev: annStore.rev,
+            batchRev: batchStore.rev
+          });
+        }
+      });
+    });
+    return;
+  }
+
+  apiError(res, 405, "method_not_allowed", "该路径不支持此方法");
+}
+
 /* ================= 路由 ================= */
 
 function handleAPI(req, res, pathname, urlObj) {
@@ -1461,6 +2548,10 @@ function handleAPI(req, res, pathname, urlObj) {
   }
   if (parts[1] === "review-batches" && parts.length <= 4) {
     handleReviewBatches(req, res, parts, urlObj);
+    return;
+  }
+  if (parts[1] === "review-decisions" && parts.length <= 4) {
+    handleReviewDecisions(req, res, parts, urlObj);
     return;
   }
   apiError(res, 404, "not_found", "接口不存在");
@@ -1511,6 +2602,7 @@ http.createServer((req, res) => {
 syncAnnotationBatchFields();
 
 module.exports = {
-  core, review,
-  store: store, annStore: annStore, batchStore: batchStore
+  core, review, decision,
+  store: store, annStore: annStore, batchStore: batchStore,
+  decisionStore: decisionStore
 };

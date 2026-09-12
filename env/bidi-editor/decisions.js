@@ -1,0 +1,1225 @@
+/* decisions.js
+ * 审阅决策 UI：从未归档批次创建决策草案、逐条填写保留/替换/删除方案、
+ * 按段落执行前预览、多人逐条投票（通过/驳回/弃权）、部分成功执行与撤销、
+ * 按时间查看决策记录、查看历史快照中当时的草案状态。
+ *
+ * 并发模型：本地缓存决策集合版本 rev（X-Decision-Rev），所有变更带
+ * If-Match: <rev>；服务端严格相等校验，多人同时修改草案时旧页面提交必被
+ * 409 version_conflict 拒绝——弹窗内表单内容保留，按最新数据重绘后重试。
+ *
+ * 三版本校验在服务端：执行时把编辑区当前段落随请求回传，服务端比对草案
+ * 创建时的文本指纹、每条批注的 updatedAt 与批次成员归属，只把受影响条目
+ * 标为冲突；前端只负责展示冲突、绝不把冲突条目的新文字覆盖掉。
+ *
+ * ★ 中阿混排：引文/替换文本一律 <bdi> 隔离，位置标签固定 dir=ltr。
+ */
+(function () {
+  "use strict";
+
+  var core = window.DecisionCore;
+  var Editor = window.Editor;
+
+  var state = {
+    rev: null,
+    items: [],
+    filterStatus: "",
+    lastAnnRev: null,
+    lastBatchRev: null
+  };
+
+  /* ---------- 小工具 ---------- */
+
+  function $(id) { return document.getElementById(id); }
+
+  function el(tag, className, text) {
+    var e = document.createElement(tag);
+    if (className) e.className = className;
+    if (text != null) e.textContent = text; // 一律 textContent，防注入
+    return e;
+  }
+
+  function bdi(text) {
+    var b = document.createElement("bdi");
+    b.textContent = text == null ? "" : text;
+    return b;
+  }
+
+  function formatTime(iso) {
+    if (!iso) return "—";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    var p = function (n) { return String(n).padStart(2, "0"); };
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+      " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+
+  function toast(message, kind) {
+    var box = $("toast-box");
+    var t = el("div", "toast toast-" + (kind || "info"));
+    t.textContent = message;
+    box.appendChild(t);
+    setTimeout(function () {
+      t.classList.add("toast-out");
+      setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 300);
+    }, kind === "error" ? 6000 : 3500);
+  }
+
+  function button(label, className, onClick) {
+    var b = el("button", className || null);
+    b.textContent = label;
+    if (onClick) b.addEventListener("click", onClick);
+    return b;
+  }
+
+  function openModal(title, bodyNode, opts) {
+    opts = opts || {};
+    var overlay = el("div", "modal-overlay");
+    var modal = el("div", "modal modal-wide");
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+
+    var head = el("div", "modal-head");
+    head.appendChild(el("h3", null, title));
+    var closeBtn = el("button", "modal-close", "×");
+    closeBtn.title = "关闭（不做任何修改）";
+    head.appendChild(closeBtn);
+    modal.appendChild(head);
+
+    var body = el("div", "modal-body");
+    body.appendChild(bodyNode);
+    modal.appendChild(body);
+
+    var foot = el("div", "modal-foot");
+    (opts.buttons || []).forEach(function (b) { foot.appendChild(b); });
+    modal.appendChild(foot);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+
+    function close() {
+      if (opts.onCancel) opts.onCancel();
+      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+      document.removeEventListener("keydown", onKey);
+    }
+    function onKey(e) { if (e.key === "Escape") { e.preventDefault(); close(); } }
+
+    closeBtn.addEventListener("click", close);
+    overlay.addEventListener("mousedown", function (e) {
+      if (e.target === overlay) close();
+    });
+    document.addEventListener("keydown", onKey);
+    return { close: close, body: body, foot: foot, overlay: overlay,
+             setTitle: function (t) { head.querySelector("h3").textContent = t; } };
+  }
+
+  /* ---------- 网络层 ---------- */
+
+  function api(method, url, options) {
+    options = options || {};
+    var headers = { "Accept": "application/json" };
+    if (options.ifMatch != null) headers["If-Match"] = String(options.ifMatch);
+    var init = { method: method, headers: headers };
+    if (options.body != null) {
+      headers["Content-Type"] = "application/json; charset=utf-8";
+      init.body = JSON.stringify(options.body);
+    }
+    return fetch(url, init).then(function (res) {
+      var rev = res.headers.get("X-Decision-Rev");
+      var annRev = res.headers.get("X-Annotation-Rev");
+      var batchRev = res.headers.get("X-Batch-Rev");
+      return res.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+        if (!res.ok) {
+          var err = new Error((data && data.message) || ("请求失败：HTTP " + res.status));
+          err.status = res.status;
+          err.code = data && data.error;
+          err.data = data;
+          throw err;
+        }
+        if (rev != null) state.rev = parseInt(rev, 10);
+        // 执行/撤销会推进批注与批次集合：仅在版本确实变化时通知对应面板静默刷新，
+        // 避免决策列表的轮询 GET 反复触发其他面板刷新。
+        if (annRev != null && annRev !== String(state.lastAnnRev)) {
+          state.lastAnnRev = annRev;
+          if (window.ReviewUI) window.ReviewUI.reload(true);
+        }
+        if (batchRev != null && batchRev !== String(state.lastBatchRev)) {
+          state.lastBatchRev = batchRev;
+          if (window.ReviewBatchesUI) window.ReviewBatchesUI.reload(true);
+        }
+        return { data: data, rev: rev != null ? parseInt(rev, 10) : null };
+      });
+    });
+  }
+
+  /* ---------- 标签 ---------- */
+
+  var STATUS_CLASS = {
+    drafting: "dc-drafting", voting: "dc-voting",
+    ready: "dc-ready", executed: "dc-executed"
+  };
+  function statusLabel(s) { return core.STATUS_LABELS[s] || s; }
+  function dispositionLabel(d) { return d ? core.DISPOSITION_LABELS[d] : "未定"; }
+  function voteLabel(v) { return core.VOTE_LABELS[v] || v; }
+  var ITEM_STATE_CLASS = {
+    pending: "dc-it-pending", waiting: "dc-it-waiting",
+    rejected: "dc-it-rejected", approved: "dc-it-approved"
+  };
+  function itemStateLabel(s) { return core.ITEM_STATE_LABELS[s] || s; }
+  function reasonLabel(r) { return core.REASON_LABELS[r] || r; }
+  function resultLabel(r) { return core.RESULT_LABELS[r] || r; }
+  function savedActor() {
+    try { return localStorage.getItem("review-author") || ""; } catch (e) { return ""; }
+  }
+  function rememberActor(name) {
+    try { localStorage.setItem("review-author", name); } catch (e) {}
+  }
+
+  /* ---------- 列表 ---------- */
+
+  var listBox = $("decision-list");
+  var note = $("decision-note");
+  var revLabel = $("decision-rev");
+  var filterSel = $("decision-filter-status");
+
+  function setNote(text, isError) {
+    note.textContent = text || "";
+    note.className = "snap-note" + (isError ? " is-error" : "");
+  }
+
+  function loadList(silent) {
+    if (!silent) setNote("正在加载决策草案……");
+    return api("GET", "/api/review-decisions").then(function (r) {
+      state.items = (r.data && r.data.decisions) || [];
+      state.rev = r.rev != null ? r.rev : (r.data && r.data.rev);
+      render();
+      setNote("");
+    }).catch(function (err) {
+      setNote("无法加载决策草案（" + err.message + "），编辑与其他面板不受影响。", true);
+    });
+  }
+
+  function render() {
+    revLabel.textContent = "版本 " + (state.rev == null ? "—" : state.rev);
+    listBox.innerHTML = "";
+    var items = state.items.filter(function (d) {
+      return !state.filterStatus || d.status === state.filterStatus;
+    });
+    if (!items.length) {
+      listBox.appendChild(el("div", "review-empty",
+        state.items.length
+          ? "当前筛选条件下没有决策草案。"
+          : "尚无决策草案。在未归档批次中为每条批注填写保留/替换/删除方案，" +
+            "投票达到通过人数后即可执行。"));
+      return;
+    }
+    items.forEach(function (d) { listBox.appendChild(renderCard(d)); });
+  }
+
+  function renderCard(d) {
+    var card = el("div", "decision-card" + (d.frozen ? " is-frozen" : ""));
+    card.addEventListener("click", function () { openDetail(d.id); });
+
+    var head = el("div", "batch-card-head");
+    var name = el("div", "batch-name");
+    name.appendChild(bdi(d.name));
+    name.appendChild(el("span", "decision-status " + STATUS_CLASS[d.status], statusLabel(d.status)));
+    if (d.executed) name.appendChild(el("span", "decision-done-flag", "已执行"));
+    if (d.frozen) name.appendChild(el("span", "batch-archived-flag", "批次已归档"));
+    if (d.overdue) name.appendChild(el("span", "batch-overdue-flag", "已过期"));
+    head.appendChild(name);
+    var meta = el("div", "batch-card-meta");
+    meta.setAttribute("dir", "ltr");
+    meta.textContent = "门槛 " + d.threshold + " 人 · " + d.itemCount + " 条批注";
+    head.appendChild(meta);
+    card.appendChild(head);
+
+    var info = el("div", "batch-card-info");
+    var bn = el("span");
+    bn.appendChild(document.createTextNode("所属批次："));
+    bn.appendChild(bdi(d.batchName));
+    info.appendChild(bn);
+    info.appendChild(el("span", "muted",
+      " · 截止 " + (d.deadline ? formatTime(d.deadline) : "未设置") +
+      " · 更新于 " + formatTime(d.updatedAt)));
+    card.appendChild(info);
+
+    var p = d.progress;
+    var wrap = el("div", "batch-progress");
+    var bar = el("div", "batch-progress-bar");
+    var pct = p.total ? Math.round(p.approved / p.total * 100) : 0;
+    var fill = el("div", "batch-progress-fill" + (p.ready ? " is-done" : ""));
+    fill.style.width = pct + "%";
+    bar.appendChild(fill);
+    wrap.appendChild(bar);
+    var label = el("div", "batch-progress-label");
+    label.setAttribute("dir", "ltr");
+    label.textContent = "通过 " + p.approved + "/" + p.total + " · 待投票 " +
+      p.counts.waiting + " · 驳回 " + p.counts.rejected + (p.counts.pending ? " · 未定 " + p.counts.pending : "");
+    wrap.appendChild(label);
+    card.appendChild(wrap);
+    return card;
+  }
+
+  filterSel.addEventListener("change", function () {
+    state.filterStatus = filterSel.value;
+    render();
+  });
+
+  /* ---------- 新建草案 ---------- */
+
+  function openComposer(preselectBatchId) {
+    Promise.all([
+      api("GET", "/api/review-batches"),
+      window.ReviewUI ? window.ReviewUI.reload(true) : Promise.resolve()
+    ]).then(function (rs) {
+      var batches = (rs[0].data && rs[0].data.batches) || [];
+      var pending = batches.filter(function (b) { return b.status === "pending"; });
+      var box = el("div", "decision-composer");
+      var errLine = el("div", "composer-error");
+      errLine.setAttribute("role", "alert");
+
+      if (!pending.length) {
+        box.appendChild(el("div", "review-empty",
+          "当前没有未归档批次。请先在“审阅批次”面板创建批次并加入批注。"));
+        box.appendChild(errLine);
+        var mEmpty = openModal("新建决策草案", box, {
+          buttons: [button("关闭", null, function () { mEmpty.close(); })]
+        });
+        return;
+      }
+
+      var batchSel = document.createElement("select");
+      pending.forEach(function (b) {
+        var o = el("option", null, b.name + "（" + b.memberCount + " 条批注" +
+          (b.overdue ? "，已过期" : "") + "）");
+        o.value = b.id;
+        if (preselectBatchId === b.id) o.selected = true;
+        batchSel.appendChild(o);
+      });
+      box.appendChild(labeled("从未归档批次创建", batchSel));
+
+      var nameInput = document.createElement("input");
+      nameInput.type = "text";
+      nameInput.className = "composer-author";
+      nameInput.maxLength = core.LIMITS.DECISION_NAME_MAX_CHARS;
+      nameInput.placeholder = "草案名称（可选，默认“批次名 + 决策草案”）";
+      box.appendChild(labeled("草案名称", nameInput));
+
+      var thresholdInput = document.createElement("input");
+      thresholdInput.type = "number";
+      thresholdInput.min = core.LIMITS.THRESHOLD_MIN;
+      thresholdInput.max = core.LIMITS.THRESHOLD_MAX;
+      thresholdInput.value = "1";
+      thresholdInput.className = "composer-author dc-threshold";
+      box.appendChild(labeled("通过人数门槛（1–" + core.LIMITS.THRESHOLD_MAX + "，每条需多少人投通过）",
+        thresholdInput));
+
+      var actorInput = document.createElement("input");
+      actorInput.type = "text";
+      actorInput.className = "composer-author";
+      actorInput.maxLength = 50;
+      actorInput.placeholder = "创建者署名（可选，默认匿名）";
+      actorInput.value = savedActor();
+      box.appendChild(labeled("创建者", actorInput));
+
+      box.appendChild(el("p", "muted",
+        "草案创建时会记录当前编辑区文本、批注集合与批次三个版本号；执行前若任一版本变化，" +
+        "只会把受影响的条目标记为冲突，不会覆盖新的文字或批注。方案可在创建后逐条填写。"));
+      box.appendChild(errLine);
+
+      var okBtn = button("创建草案", "primary", function () {
+        errLine.textContent = "";
+        var batchId = batchSel.value;
+        var payload = {
+          batchId: batchId,
+          name: nameInput.value,
+          threshold: parseInt(thresholdInput.value, 10),
+          paragraphs: Editor.serialize().paragraphs,
+          actor: actorInput.value
+        };
+        var tc = core.validateThreshold(payload.threshold);
+        if (!tc.ok) { errLine.textContent = tc.message; return; }
+        okBtn.disabled = true;
+        api("POST", "/api/review-decisions", { body: payload, ifMatch: state.rev })
+          .then(function (r) {
+            rememberActor(actorInput.value.trim());
+            m.close();
+            toast("决策草案已创建，请逐条填写处理方案");
+            return loadList(true).then(function () { openDetail(r.data.decision.id); });
+          })
+          .catch(function (err) {
+            okBtn.disabled = false;
+            handleError(err, function (m2) { errLine.textContent = m2; }, "创建草案");
+          });
+      });
+      var m = openModal("新建决策草案", box, {
+        buttons: [button("取消", null, function () { m.close(); }), okBtn]
+      });
+    }).catch(function () {
+      toast("批次列表尚未就绪，请稍后重试", "error");
+    });
+  }
+
+  function labeled(text, input) {
+    var wrap = el("label", "batch-field");
+    wrap.appendChild(el("span", "batch-field-label", text));
+    wrap.appendChild(input);
+    return wrap;
+  }
+
+  /* ---------- 草案详情 ---------- */
+
+  function findSummary(id) {
+    return state.items.filter(function (d) { return d.id === id; })[0];
+  }
+
+  function openDetail(id) {
+    var modal = openModal("决策草案", el("div"), { buttons: [] });
+    modal.setTitle("草案加载中…");
+    api("GET", "/api/review-decisions/" + id).then(function (r) {
+      renderDetail(modal, r.data);
+    }).catch(function (err) {
+      modal.body.appendChild(el("div", "composer-error",
+        "读取草案失败：" + err.message + "（当前页面内容未受影响）"));
+      modal.foot.appendChild(button("关闭", null, function () { modal.close(); }));
+    });
+  }
+
+  function refreshDetail(modal) {
+    return api("GET", "/api/review-decisions/" + modal.decisionId).then(function (r) {
+      renderDetail(modal, r.data);
+    });
+  }
+
+  function renderDetail(modal, data) {
+    var d = data.decision;
+    modal.decisionId = d.id;
+    var frozen = !!data.batchFrozen;
+    modal.body.innerHTML = "";
+    modal.foot.innerHTML = "";
+    modal.setTitle((frozen ? "📦 只读草案：" : "决策草案：") + d.name);
+
+    /* —— 元信息 —— */
+    var meta = el("div", "batch-detail-meta");
+    meta.setAttribute("dir", "ltr");
+    function metaLine(labelText, node) {
+      var line = el("div", "batch-meta-line");
+      line.appendChild(el("span", "muted", labelText));
+      line.appendChild(node);
+      return line;
+    }
+    var statusNode = el("span", "decision-status " + STATUS_CLASS[d.status], statusLabel(d.status));
+    meta.appendChild(metaLine("状态：", statusNode));
+    var bn = el("span"); bn.appendChild(bdi(d.batchName));
+    meta.appendChild(metaLine("所属批次：", bn));
+    meta.appendChild(metaLine("通过门槛：", el("span", null, d.threshold + " 人/条")));
+    meta.appendChild(metaLine("截止：", el("span", d.overdue ? "is-overdue" : null,
+      (d.deadline ? formatTime(d.deadline) : "未设置") + (d.overdue ? "（已过期，草案锁定）" : ""))));
+    meta.appendChild(metaLine("创建：", el("span", null, formatTime(d.createdAt))));
+    meta.appendChild(metaLine("最近更新：", el("span", null, formatTime(d.updatedAt))));
+    var ver = el("span", "muted");
+    ver.setAttribute("dir", "ltr");
+    ver.textContent = "文本 " + (data.textRev || "—").slice(0, 8) +
+      " · 批注 v" + (data.annotationRev == null ? "—" : data.annotationRev) +
+      " · 批次 v" + (data.batchRev == null ? "—" : data.batchRev);
+    meta.appendChild(metaLine("执行前将校验的版本：", ver));
+    modal.body.appendChild(meta);
+
+    var p = d.progress;
+    var progLine = el("div", "batch-progress-label dc-prog");
+    progLine.setAttribute("dir", "ltr");
+    progLine.textContent = "通过 " + p.approved + "/" + p.total + " · 待投票 " +
+      p.counts.waiting + " · 已驳回 " + p.counts.rejected + " · 方案未定 " + p.counts.pending;
+    modal.body.appendChild(progLine);
+
+    if (frozen) {
+      modal.body.appendChild(el("p", "composer-error",
+        "所属批次已归档：草案只读，不能再修改方案、投票、执行或撤销；以下为归档时的完整状态。"));
+    } else if (d.status === "executed") {
+      var exInfo = (data.executions || [])[data.executions.length - 1];
+      modal.body.appendChild(el("p", "muted",
+        "草案已执行（成功 " + (exInfo ? exInfo.counts.success : 0) + " · 冲突 " +
+        (exInfo ? exInfo.counts.conflict : 0) + " · 跳过 " +
+        (exInfo ? exInfo.counts.skipped : 0) + "）。同一草案不能重复执行，可撤销最近一次成功执行后重做。"));
+    }
+
+    var errLine = el("div", "composer-error detail-error");
+    errLine.setAttribute("role", "alert");
+    modal.body.appendChild(errLine);
+    function showErr(m) { errLine.textContent = m; }
+
+    /* —— 投票署名 —— */
+    var voterBar = el("div", "dc-voter-bar");
+    voterBar.appendChild(el("span", "muted", "我的署名："));
+    var voterInput = document.createElement("input");
+    voterInput.type = "text";
+    voterInput.className = "composer-author";
+    voterInput.maxLength = 50;
+    voterInput.value = savedActor();
+    voterInput.placeholder = "投票必须署名";
+    if (frozen) voterInput.disabled = true;
+    voterBar.appendChild(voterInput);
+    modal.body.appendChild(voterBar);
+
+    /* —— 条目表 —— */
+    var rows = data.items.map(function (it) {
+      return renderItemRow(modal, data, it, voterInput, frozen, showErr);
+    });
+    var tableWrap = el("div", "batch-members-wrap dc-items-wrap");
+    var table = el("table", "batch-members dc-items");
+    var thead = el("thead");
+    var hr = el("tr");
+    hr.appendChild(el("th", null, "批注 / 位置"));
+    hr.appendChild(el("th", null, "处理方案"));
+    hr.appendChild(el("th", null, "投票"));
+    if (!frozen) hr.appendChild(el("th", null, "操作"));
+    thead.appendChild(hr);
+    table.appendChild(thead);
+    var tbody = el("tbody");
+    rows.forEach(function (r) { tbody.appendChild(r.tr); });
+    table.appendChild(tbody);
+    tableWrap.appendChild(table);
+    modal.body.appendChild(tableWrap);
+
+    /* —— 历史执行记录 —— */
+    if (data.executions && data.executions.length) {
+      var exBox = el("div", "dc-executions");
+      exBox.appendChild(el("div", "snap-section-title", "执行记录（按时间）"));
+      data.executions.slice().reverse().forEach(function (ex) {
+        var item = el("div", "dc-exec-item" + (ex.undone ? " is-undone" : ""));
+        var h = el("div", "ann-meta");
+        h.setAttribute("dir", "ltr");
+        h.appendChild(bdi(ex.actor || "匿名"));
+        h.appendChild(document.createTextNode(" · " + formatTime(ex.at) +
+          " · 成功 " + ex.counts.success + " / 冲突 " + ex.counts.conflict +
+          " / 跳过 " + ex.counts.skipped + (ex.applied ? "" : "（无成功条目）") +
+          (ex.undone ? " · 已撤销" + (ex.undoneAt ? " " + formatTime(ex.undoneAt) : "") : "")));
+        item.appendChild(h);
+        exBox.appendChild(item);
+      });
+      modal.body.appendChild(exBox);
+    }
+
+    /* —— 底部操作 —— */
+    function addBtn(b) { modal.foot.appendChild(b); }
+    addBtn(button("审阅记录", null, function () { openLogs(d); }));
+
+    if (!frozen) {
+      if (d.status === "drafting") {
+        var saveBtn = button("保存方案", "primary", function () {
+          saveItems(modal, data, rows, voterInput, showErr, saveBtn);
+        });
+        var submitBtn = button("提交投票…", null, function () {
+          submitDraft(modal, data, rows, voterInput, showErr, submitBtn);
+        });
+        addBtn(saveBtn); addBtn(submitBtn);
+      } else if (d.status === "voting" || d.status === "ready") {
+        addBtn(button("保存方案修改", null, function () {
+          saveItems(modal, data, rows, voterInput, showErr, null);
+        }));
+        addBtn(button("执行前预览…", "primary", function () {
+          openPreview(modal, data, rows, showErr);
+        }));
+      } else if (d.status === "executed") {
+        var last = data.executions[data.executions.length - 1];
+        var canUndo = last && last.applied && !last.undone;
+        var undoBtn = button("撤销最近一次执行", "danger", function () {
+          undoLast(modal, showErr, undoBtn);
+        });
+        if (!canUndo) { undoBtn.disabled = true; undoBtn.title = "最近一次执行没有成功条目或已撤销"; }
+        addBtn(undoBtn);
+      }
+    }
+    addBtn(button("关闭", null, function () { modal.close(); }));
+  }
+
+  function renderItemRow(modal, data, it, voterInput, frozen, showErr) {
+    var tr = el("tr");
+
+    // 批注与位置
+    var tdAnn = el("td");
+    var pos = el("div", "ann-meta");
+    pos.setAttribute("dir", "ltr");
+    pos.textContent = "段落 #" + (it.paraIndex + 1) + " [" + it.start + "–" + it.end + ")";
+    tdAnn.appendChild(pos);
+    var q = el("div", "ann-quote batch-member-quote");
+    q.appendChild(bdi(it.quote));
+    tdAnn.appendChild(q);
+    tr.appendChild(tdAnn);
+
+    // 方案
+    var tdPlan = el("td", "dc-plan-cell");
+    var selWrap = el("div");
+    var dispSel = document.createElement("select");
+    [["", "未定方案"], ["keep", "保留原文"], ["replace", "替换为…"], ["delete", "删除原文"]]
+      .forEach(function (pair) {
+        var o = el("option", null, pair[1]);
+        o.value = pair[0];
+        if (it.disposition === pair[0] || (!it.disposition && pair[0] === "")) o.selected = true;
+        dispSel.appendChild(o);
+      });
+    if (frozen || data.decision.status === "executed") dispSel.disabled = true;
+    selWrap.appendChild(dispSel);
+    tdPlan.appendChild(selWrap);
+
+    var replBox = el("div", "dc-repl-box");
+    var replInput = document.createElement("textarea");
+    replInput.rows = 2;
+    replInput.className = "composer-body dc-repl-input";
+    replInput.maxLength = core.LIMITS.REPLACEMENT_MAX_CHARS;
+    replInput.placeholder = "替换为的文本（中阿混排均可）";
+    replInput.value = it.disposition === "replace" ? (it.replacement || "") : "";
+    if (it.disposition !== "replace") replBox.style.display = "none";
+    if (frozen || data.decision.status === "executed") replInput.disabled = true;
+    replBox.appendChild(replInput);
+    tdPlan.appendChild(replBox);
+    dispSel.addEventListener("change", function () {
+      replBox.style.display = dispSel.value === "replace" ? "" : "none";
+    });
+    tr.appendChild(tdPlan);
+
+    // 投票状态
+    var tdVote = el("td");
+    var stateBadge = el("div", "decision-item-state " + ITEM_STATE_CLASS[it.state],
+      itemStateLabel(it.state));
+    tdVote.appendChild(stateBadge);
+    var tally = el("div", "ann-meta");
+    tally.setAttribute("dir", "ltr");
+    tally.textContent = "通过 " + it.approve + " · 驳回 " + it.reject + " · 弃权 " + it.abstain;
+    tdVote.appendChild(tally);
+    var mine = (it.votes || []).filter(function (v) {
+      return v.voter === (voterInput.value || savedActor());
+    })[0];
+    var mineLine = el("div", "dc-my-vote" + (mine ? "" : " is-empty"));
+    mineLine.setAttribute("dir", "ltr");
+    mineLine.textContent = mine ? ("我的一票：" + voteLabel(mine.vote)) : "我尚未投票";
+    tdVote.appendChild(mineLine);
+    voterInput.addEventListener("input", function () {
+      var m2 = (it.votes || []).filter(function (v) { return v.voter === voterInput.value; })[0];
+      mineLine.textContent = m2 ? ("我的一票：" + voteLabel(m2.vote)) : "我尚未投票";
+      mineLine.classList.toggle("is-empty", !m2);
+    });
+    tr.appendChild(tdVote);
+
+    var apiRow = {
+      tr: tr, annotationId: it.annotationId,
+      dispSel: dispSel, replInput: replInput,
+      origDisposition: it.disposition, origReplacement: it.replacement || "",
+      current: it
+    };
+
+    // 操作：保存本行 + 三个投票按钮
+    if (!frozen) {
+      var tdAct = el("td", "batch-row-actions dc-vote-actions");
+      var saveOne = button("保存", "btn-mini", function () {
+        saveItems(modal, data, [apiRow], voterInput, showErr, saveOne);
+      });
+      if (data.decision.status === "executed") saveOne.disabled = true;
+      tdAct.appendChild(saveOne);
+      [["approve", "通过", "dc-v-approve"],
+       ["reject", "驳回", "dc-v-reject"],
+       ["abstain", "弃权", "dc-v-abstain"]].forEach(function (cfg) {
+        var b = button(cfg[1], "btn-mini " + cfg[2], function () {
+          castVote(modal, data, it.annotationId, cfg[0], voterInput, showErr, b);
+        });
+        if (data.decision.status === "drafting" || data.decision.status === "executed") b.disabled = true;
+        if (mine && mine.vote === cfg[0]) b.classList.add("is-mine");
+        tdAct.appendChild(b);
+      });
+      tr.appendChild(tdAct);
+    }
+    return apiRow;
+  }
+
+  function collectItemPayload(rows) {
+    return rows.map(function (r) {
+      var disp = r.dispSel.value || null;
+      return {
+        annotationId: r.annotationId,
+        disposition: disp,
+        replacement: disp === "replace" ? r.replInput.value : null
+      };
+    }).filter(function (x) { return x.disposition; }); // 未定方案不下发
+  }
+
+  function saveItems(modal, data, rows, voterInput, showErr, btn) {
+    showErr("");
+    var payloadItems = collectItemPayload(rows);
+    if (!payloadItems.length) {
+      showErr("没有可保存的方案：请先为至少一条批注选择保留、替换或删除（当前页面内容已保留）。");
+      return;
+    }
+    // 本地预检：替换文本非空/不超长；重复方案
+    var seen = Object.create(null);
+    for (var i = 0; i < payloadItems.length; i++) {
+      var x = payloadItems[i];
+      if (seen[x.annotationId]) { showErr("同一条批注出现了两个方案，请只保留一个。"); return; }
+      seen[x.annotationId] = true;
+      if (x.disposition === "replace") {
+        var rc = core.validateReplacement("replace", x.replacement);
+        if (!rc.ok) { showErr(rc.message); return; }
+      }
+    }
+    if (btn) btn.disabled = true;
+    api("PUT", "/api/review-decisions/" + data.decision.id + "/items",
+      { items: payloadItems, actor: voterInput.value || undefined },
+      { ifMatch: state.rev }).then(function () {
+      rememberActor(voterInput.value.trim());
+      toast("方案已保存" + (data.decision.status !== "drafting" ? "（改动条目的已有投票已作废，需重新投票）" : ""));
+      return refreshDetail(modal);
+    }).then(function () { return loadList(true); })
+      .catch(function (err) {
+        if (btn) btn.disabled = false;
+        handleDetailError(err, showErr, modal, "保存方案");
+      });
+  }
+
+  function submitDraft(modal, data, rows, voterInput, showErr, btn) {
+    showErr("");
+    var unfilled = rows.filter(function (r) { return !r.dispSel.value; });
+    if (unfilled.length) {
+      showErr("还有 " + unfilled.length + " 条批注没有处理方案：每条都必须选择保留、替换或删除后才能提交投票。");
+      return;
+    }
+    // 先保存全部方案，再提交
+    btn.disabled = true;
+    var payloadItems = collectItemPayload(rows);
+    api("PUT", "/api/review-decisions/" + data.decision.id + "/items",
+      { items: payloadItems, actor: voterInput.value || undefined },
+      { ifMatch: state.rev }).catch(function (err) {
+      if (err.code === "no_change") return { data: null }; // 方案无变化，继续提交
+      throw err;
+    }).then(function () {
+      return api("POST", "/api/review-decisions/" + data.decision.id + "/submit",
+        { actor: voterInput.value || undefined }, { ifMatch: state.rev });
+    }).then(function () {
+      rememberActor(voterInput.value.trim());
+      toast("草案已提交投票，审阅者可逐条投票");
+      return refreshDetail(modal);
+    }).then(function () { return loadList(true); })
+      .catch(function (err) {
+        btn.disabled = false;
+        handleDetailError(err, showErr, modal, "提交投票");
+      });
+  }
+
+  function castVote(modal, data, annotationId, vote, voterInput, showErr, btn) {
+    showErr("");
+    var voter = (voterInput.value || "").trim();
+    var vc = core.validateVoter(voter);
+    if (!vc.ok) { showErr(vc.message); voterInput.focus(); return; }
+    btn.disabled = true;
+    api("POST", "/api/review-decisions/" + data.decision.id + "/votes",
+      { annotationId: annotationId, vote: vote, voter: vc.value },
+      { ifMatch: state.rev }).then(function () {
+      rememberActor(vc.value);
+      return refreshDetail(modal);
+    }).then(function (r) {
+      var dd = r && r.data;
+      if (dd && dd.decision.status === "ready") {
+        toast("全部条目已达通过门槛，草案进入待执行状态");
+      } else {
+        toast("投票“" + voteLabel(vote) + "”已记录");
+      }
+      return loadList(true);
+    }).catch(function (err) {
+      btn.disabled = false;
+      handleDetailError(err, showErr, modal, "投票");
+    });
+  }
+
+  /* ---------- 执行前预览 + 执行 ---------- */
+
+  function openPreview(parentModal, data, rows, showErr) {
+    var box = el("div", "dc-preview-box");
+    box.appendChild(el("p", "muted", "正在按当前编辑区文本生成按段预览……"));
+    var m = openModal("执行前预览：" + data.decision.name, box, { buttons: [] });
+
+    api("POST", "/api/review-decisions/" + data.decision.id + "/preview",
+      { paragraphs: Editor.serialize().paragraphs }).then(function (r) {
+      renderPreview(parentModal, m, r.data);
+    }).catch(function (err) {
+      box.innerHTML = "";
+      box.appendChild(el("div", "composer-error", "生成预览失败：" + err.message));
+      m.foot.appendChild(button("关闭", null, function () { m.close(); }));
+    });
+  }
+
+  function renderPreview(parentModal, modal, pv) {
+    var d = pv.decision;
+    modal.body.innerHTML = "";
+    modal.foot.innerHTML = "";
+
+    var warn = el("p", "restore-warn",
+      "执行会把“成功”条目的保留/替换/删除合成后写入编辑区；“冲突”条目因文本、批注或批次版本变化而跳过，" +
+      "“跳过”条目尚未通过投票或本次未勾选。一次执行可部分成功，成功、冲突、跳过都会逐条留痕，且可撤销最近一次成功执行。");
+    modal.body.appendChild(warn);
+
+    var sum = el("p", "diff-summary");
+    sum.setAttribute("dir", "ltr");
+    sum.textContent = "成功 " + pv.counts.success + " · 冲突 " + pv.counts.conflict +
+      " · 跳过 " + pv.counts.skipped +
+      (pv.textChanged ? "（检测到草案创建后文本版本已变化，受影响条目已逐条标出）" : "（文本版本未变化）");
+    sum.classList.toggle("is-warn", pv.textChanged && pv.counts.conflict > 0);
+    modal.body.appendChild(sum);
+
+    // 勾选本次要执行的条目（默认勾选当前可成功的条目）
+    var checkMap = Object.create(null);
+    pv.results.forEach(function (r) {
+      checkMap[r.annotationId] = r.result === "success";
+    });
+
+    var table = el("table", "restore-table dc-preview-table");
+    var thead = el("thead");
+    var hr = el("tr");
+    ["执行", "段落", "当前文本（按段）", "执行后（仅成功条目）", "条目判定"].forEach(function (h, i) {
+      hr.appendChild(el("th", i === 0 ? "c-check" : null, h));
+    });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+    var tbody = el("tbody");
+
+    function recount() {
+      var c = { success: 0, conflict: 0, skipped: 0 };
+      pv.results.forEach(function (r) {
+        if (!checkMap[r.annotationId]) { c.skipped++; return; }
+        if (r.result === "success") c.success++;
+        else if (r.result === "conflict") c.conflict++;
+        else c.skipped++;
+      });
+      sum.textContent = "按当前勾选：成功 " + c.success + " · 冲突 " + c.conflict +
+        " · 跳过 " + c.skipped;
+      executeBtn.disabled = c.success === 0;
+    }
+
+    pv.rows.forEach(function (row) {
+      var tr = el("tr", "dc-pv-row");
+      var tdCheck = el("td", "c-check");
+      var anySuccess = row.items.some(function (it) {
+        return it.result === "success" && it.disposition;
+      });
+      row.items.forEach(function (it) {
+        if (it.voteState !== "approved") return;
+        var cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = checkMap[it.annotationId];
+        cb.addEventListener("change", function () {
+          checkMap[it.annotationId] = cb.checked;
+          recount();
+        });
+        tdCheck.appendChild(cb);
+      });
+      tr.appendChild(tdCheck);
+
+      var idxTd = el("td", "c-idx");
+      idxTd.setAttribute("dir", "ltr");
+      idxTd.textContent = "#" + (row.paraIndex + 1) +
+        (row.currentParaIndex == null ? " ✖" :
+          row.currentParaIndex === row.paraIndex ? "" : "→现#" + (row.currentParaIndex + 1));
+      tr.appendChild(idxTd);
+
+      var curTd = el("td", "rp-cell");
+      var tag = null;
+      if (row.deleted) tag = "整段已删除";
+      else if (row.paraChanged) tag = "段落已改写";
+      else if (row.dirChanged) tag = "段落方向已改变";
+      if (tag) {
+        var badge = el("div", "dc-conflict-tag", tag);
+        curTd.appendChild(badge);
+      }
+      var curText = el("div", "para-text");
+      curText.appendChild(bdi(row.current ? row.current.text : "—"));
+      curTd.appendChild(curText);
+      tr.appendChild(curTd);
+
+      var afterTd = el("td", "rp-cell");
+      var afterText = el("div", "para-text" + (anySuccess ? " para-added" : ""));
+      afterText.appendChild(bdi(row.afterText == null ? "—" : row.afterText));
+      afterTd.appendChild(afterText);
+      tr.appendChild(afterTd);
+
+      var itemsTd = el("td", "dc-pv-items");
+      row.items.forEach(function (it) {
+        var line = el("div", "dc-pv-item dc-pv-" + it.result);
+        var st = el("span", "decision-item-state " + ITEM_STATE_CLASS[it.voteState],
+          itemStateLabel(it.voteState));
+        line.appendChild(st);
+        line.appendChild(document.createTextNode(" "));
+        line.appendChild(el("span", "dc-disp", dispositionLabel(it.disposition)));
+        line.appendChild(document.createTextNode(" "));
+        var q = el("span", "batch-pick-quote"); q.appendChild(bdi(it.quote));
+        line.appendChild(q);
+        if (it.disposition === "replace") {
+          line.appendChild(document.createTextNode(" → "));
+          var rp = el("span", "dc-repl-inline"); rp.appendChild(bdi(it.replacement));
+          line.appendChild(rp);
+        }
+        var resultBadge = el("div", "dc-result dc-result-" + it.result,
+          resultLabel(it.result) + (it.reason ? "：" + reasonLabel(it.reason) : ""));
+        line.appendChild(resultBadge);
+        itemsTd.appendChild(line);
+      });
+      tr.appendChild(itemsTd);
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    var scroll = el("div", "diff-scroll");
+    scroll.appendChild(table);
+    modal.body.appendChild(scroll);
+
+    var errLine = el("div", "composer-error");
+    modal.body.appendChild(errLine);
+
+    var executeBtn = button("确认执行所选条目", "primary", function () {
+      var ids = Object.keys(checkMap).filter(function (k) { return checkMap[k]; });
+      executeBtn.disabled = true;
+      execute(parentModal, modal, d.id, ids, errLine, executeBtn, pv);
+    });
+    executeBtn.disabled = pv.counts.success === 0;
+    modal.foot.appendChild(button("取消", null, function () { modal.close(); }));
+    modal.foot.appendChild(executeBtn);
+  }
+
+  function execute(parentModal, modal, decisionId, ids, errLine, btn, previewData) {
+    errLine.textContent = "";
+    api("POST", "/api/review-decisions/" + decisionId + "/execute", {
+      paragraphs: Editor.serialize().paragraphs,
+      annotationIds: ids,
+      actor: savedActor() || undefined
+    }, { ifMatch: state.rev }).then(function (r) {
+      var data = r.data;
+      // 把服务端校验合成后的执行后段落写入编辑区（仅当确有条目成功）
+      if (data.applied) {
+        var restored = Editor.restore({ paragraphs: data.afterParagraphs });
+        if (!restored.ok) {
+          errLine.textContent = "执行已在服务端完成，但写入编辑区失败：" + restored.message +
+            "（可从审阅记录或撤销接口核对，编辑区未被改动）";
+          renderExecutionResult(modal, data, true);
+          return;
+        }
+        Editor.updateStatus();
+      }
+      renderExecutionResult(modal, data, false);
+      toast("执行完成：成功 " + data.counts.success + " · 冲突 " +
+        data.counts.conflict + " · 跳过 " + data.counts.skipped);
+      return loadList(true).then(function () {
+        if (parentModal && parentModal.overlay && parentModal.overlay.parentNode) {
+          return refreshDetail(parentModal);
+        }
+      });
+    }).catch(function (err) {
+      btn.disabled = false;
+      if (err.status === 409 && err.code === "version_conflict") {
+        errLine.textContent = "版本冲突：" + err.message + " 请关闭预览后在最新草案上重试。";
+        loadList(true);
+      } else {
+        errLine.textContent = "执行失败：" + err.message;
+      }
+    });
+  }
+
+  function renderExecutionResult(modal, data, editorWriteFailed) {
+    if (data.decision && data.decision.id) modal.decisionId = data.decision.id;
+    modal.body.innerHTML = "";
+    modal.foot.innerHTML = "";
+    modal.setTitle("执行结果");
+    var sum = el("p", "diff-summary" + (data.counts.conflict ? " is-warn" : ""));
+    sum.setAttribute("dir", "ltr");
+    sum.textContent = "成功 " + data.counts.success + " · 冲突 " +
+      data.counts.conflict + " · 跳过 " + data.counts.skipped +
+      (data.applied ? "（执行结果已写入编辑区，成功批注已标记为已解决）" : "（没有可成功执行的条目，草案仍为待执行）");
+    modal.body.appendChild(sum);
+    if (editorWriteFailed) {
+      modal.body.appendChild(el("p", "composer-error",
+        "注意：服务端已记录执行，但编辑区写入失败，当前编辑区文字未被替换。"));
+    }
+    var table = el("table", "batch-members");
+    var thead = el("thead");
+    var hr = el("tr");
+    ["批注", "方案", "结果", "原因"].forEach(function (h) { hr.appendChild(el("th", null, h)); });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+    var tbody = el("tbody");
+    data.results.forEach(function (r) {
+      var tr = el("tr", "dc-res-" + r.result);
+      var tdQ = el("td");
+      tdQ.setAttribute("dir", "ltr");
+      tdQ.textContent = "段落 #" + (r.paraIndex + 1);
+      tr.appendChild(tdQ);
+      tr.appendChild(el("td", null, dispositionLabel(r.disposition)));
+      tr.appendChild(el("td", null, resultLabel(r.result)));
+      tr.appendChild(el("td", null, r.reason ? reasonLabel(r.reason) : "—"));
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    modal.body.appendChild(el("div", "batch-members-wrap", table));
+
+    var closeBtn = button("关闭", "primary", function () { modal.close(); });
+    modal.foot.appendChild(closeBtn);
+    var undoBtn = button("撤销最近一次执行", null, function () {
+      undoLastById(modal, data.decisionId || null, closeBtn);
+    });
+    if (data.applied) modal.foot.appendChild(undoBtn);
+    modal.decisionId = (data.decision && data.decision.id) || modal.decisionId;
+  }
+
+  /* ---------- 撤销 ---------- */
+
+  function undoLast(modal, showErr, btn) {
+    undoLastById(modal, modal.decisionId, btn, showErr);
+  }
+
+  function undoLastById(modal, decisionId, btn, showErr) {
+    var id = decisionId || modal.decisionId;
+    if (!window.confirm("撤销最近一次成功执行吗？\n" +
+      "成功条目对应的批注会回滚为待处理（执行后又被修改/删除的批注不会被覆盖）；" +
+      "确认后可把执行前的文本写回编辑区。")) return;
+    if (btn) btn.disabled = true;
+    api("POST", "/api/review-decisions/" + id + "/undo",
+      { actor: savedActor() || undefined }, { ifMatch: state.rev })
+      .then(function (r) {
+        var data = r.data;
+        if (data.beforeParagraphs &&
+            window.confirm("已回滚 " + data.reverted + " 条批注状态。是否把执行前的文本写回编辑区？\n" +
+              "（点“取消”则只回滚记录，编辑区保持当前文字）")) {
+          var restored = Editor.restore({ paragraphs: data.beforeParagraphs });
+          if (!restored.ok) toast("编辑区写回失败：" + restored.message, "error");
+          else { Editor.updateStatus(); toast("编辑区已恢复为执行前文本"); }
+        } else {
+          toast("已撤销执行记录（回滚批注 " + data.reverted + " 条），编辑区未改动");
+        }
+        modal.close();
+        return loadList(true).then(function () { openDetail(id); });
+      })
+      .catch(function (err) {
+        if (btn) btn.disabled = false;
+        if (showErr) handleDetailError(err, showErr, modal, "撤销执行");
+        else toast("撤销失败：" + err.message, "error");
+      });
+  }
+
+  /* ---------- 审阅记录 ---------- */
+
+  var ACTION_LABELS = {
+    decision_create: "创建草案",
+    decision_update: "修改草案设置",
+    decision_submit: "提交投票",
+    items_update: "修改方案",
+    vote: "投票",
+    execute: "执行决策",
+    execute_item_success: "执行条目·成功",
+    execute_item_conflict: "执行条目·冲突",
+    execute_item_skipped: "执行条目·跳过",
+    execute_undo: "撤销执行"
+  };
+
+  function openLogs(d) {
+    var box = el("div", "batch-logs");
+    box.appendChild(el("p", "muted",
+      "草案创建、方案修改、逐条投票、执行结果与撤销全部记录在案（批次归档后仍可查看）。"));
+    var filterBar = el("div", "batch-log-filter");
+    var fromInput = document.createElement("input");
+    fromInput.type = "datetime-local";
+    var toInput = document.createElement("input");
+    toInput.type = "datetime-local";
+    var fromLabel = el("label", "batch-field");
+    fromLabel.appendChild(el("span", "batch-field-label", "从"));
+    fromLabel.appendChild(fromInput);
+    var toLabel = el("label", "batch-field");
+    toLabel.appendChild(el("span", "batch-field-label", "到"));
+    toLabel.appendChild(toInput);
+    filterBar.appendChild(fromLabel);
+    filterBar.appendChild(toLabel);
+    var list = el("div", "batch-log-list");
+    box.appendChild(filterBar);
+    box.appendChild(list);
+
+    function fetchLogs() {
+      var qs = [];
+      if (fromInput.value) qs.push("from=" + encodeURIComponent(new Date(fromInput.value).toISOString()));
+      if (toInput.value) qs.push("to=" + encodeURIComponent(new Date(toInput.value).toISOString()));
+      list.innerHTML = "";
+      list.appendChild(el("div", "muted", "正在加载决策记录……"));
+      api("GET", "/api/review-decisions/" + d.id + "/logs" + (qs.length ? "?" + qs.join("&") : ""))
+        .then(function (r) {
+          list.innerHTML = "";
+          var logs = (r.data && r.data.logs) || [];
+          if (!logs.length) {
+            list.appendChild(el("div", "review-empty", "该时间范围内没有决策记录。"));
+            return;
+          }
+          logs.forEach(function (l) {
+            var item = el("div", "log-item log-" + l.action);
+            var h = el("div", "log-head");
+            h.setAttribute("dir", "ltr");
+            h.appendChild(el("span", "log-time", formatTime(l.at)));
+            h.appendChild(document.createTextNode(" · "));
+            h.appendChild(el("span", "log-action", ACTION_LABELS[l.action] || l.action));
+            h.appendChild(document.createTextNode(" · "));
+            var actor = el("span"); actor.appendChild(bdi(l.actor || "匿名"));
+            h.appendChild(actor);
+            item.appendChild(h);
+            if (l.detail) {
+              var det = el("div", "log-detail");
+              det.appendChild(bdi(l.detail));
+              item.appendChild(det);
+            }
+            list.appendChild(item);
+          });
+        }).catch(function (err) {
+          list.innerHTML = "";
+          list.appendChild(el("div", "composer-error", "读取决策记录失败：" + err.message));
+        });
+    }
+    fromInput.addEventListener("change", fetchLogs);
+    toInput.addEventListener("change", fetchLogs);
+    var m = openModal("决策记录：" + d.name, box, {
+      buttons: [
+        button("按时间筛选", null, fetchLogs),
+        button("清除时间范围", null, function () { fromInput.value = ""; toInput.value = ""; fetchLogs(); }),
+        button("关闭", null, function () { m.close(); })
+      ]
+    });
+    fetchLogs();
+  }
+
+  /* ---------- 历史快照中的决策草案 ---------- */
+
+  function openSnapshotDecisions(snapshotId, snapshotName) {
+    fetch("/api/snapshots/" + snapshotId).then(function (res) { return res.json(); }).then(function (snap) {
+      var box = el("div", "snap-ann-box");
+      var head = el("p", "muted");
+      head.appendChild(document.createTextNode("快照 "));
+      head.appendChild(bdi(snap.name));
+      var ds = snap.decisions;
+      if (!ds) {
+        head.appendChild(document.createTextNode(" 创建于决策功能上线前，未记录决策数据。"));
+        box.appendChild(head);
+        openModal("快照决策：" + (snapshotName || snap.name), box, { buttons: [] });
+        return;
+      }
+      head.appendChild(document.createTextNode(" 保存时共有 " + ds.length +
+        " 个决策草案（决策集合版本 " + (snap.decisionRev == null ? "—" : snap.decisionRev) + "）。"));
+      box.appendChild(head);
+
+      if (!ds.length) box.appendChild(el("div", "review-empty", "该快照保存时不存在决策草案。"));
+      ds.forEach(function (d) {
+        var cardEl = el("div", "decision-card is-frozen dc-snap-card");
+        var h = el("div", "batch-card-head");
+        var nm = el("div", "batch-name");
+        nm.appendChild(bdi(d.name));
+        nm.appendChild(el("span", "decision-status " + (STATUS_CLASS[d.status] || ""),
+          statusLabel(d.status)));
+        h.appendChild(nm);
+        cardEl.appendChild(h);
+        var info = el("div", "batch-card-info");
+        var bn = el("span"); bn.appendChild(document.createTextNode("批次："));
+        bn.appendChild(bdi(d.batchName));
+        info.appendChild(bn);
+        info.appendChild(el("span", "muted",
+          " · 门槛 " + d.threshold + " · " + formatTime(d.updatedAt)));
+        cardEl.appendChild(info);
+
+        var prog = decisionProgressOf(d);
+        var pl = el("div", "batch-progress-label");
+        pl.setAttribute("dir", "ltr");
+        pl.textContent = "通过 " + prog.approved + "/" + prog.total +
+          " · 待投票 " + prog.counts.waiting + " · 驳回 " + prog.counts.rejected +
+          " · 未定 " + prog.counts.pending;
+        cardEl.appendChild(pl);
+
+        (d.items || []).forEach(function (it) {
+          var line = el("div", "dc-snap-item");
+          var tally = core.tallyVotes(it.votes);
+          line.setAttribute("dir", "ltr");
+          line.appendChild(el("span", "dc-disp", dispositionLabel(it.disposition)));
+          line.appendChild(document.createTextNode(" · 段#" + (it.paraIndex + 1) + " "));
+          var q = el("span"); q.appendChild(bdi(it.quote));
+          line.appendChild(q);
+          line.appendChild(document.createTextNode(" · 通过 " + tally.counts.approve +
+            " / 驳回 " + tally.counts.reject + " / 弃权 " + tally.counts.abstain));
+          cardEl.appendChild(line);
+        });
+        (d.executions || []).forEach(function (ex) {
+          var exl = el("div", "ann-meta" + (ex.undone ? " is-undone" : ""));
+          exl.setAttribute("dir", "ltr");
+          exl.textContent = "执行 " + formatTime(ex.at) + " · 成功 " +
+            ex.counts.success + " / 冲突 " + ex.counts.conflict + " / 跳过 " +
+            ex.counts.skipped + (ex.undone ? " · 已撤销" : "");
+          cardEl.appendChild(exl);
+        });
+        box.appendChild(cardEl);
+      });
+
+      var m = openModal("快照决策：" + (snapshotName || snap.name), box, {
+        buttons: [button("关闭", null, function () { m.close(); })]
+      });
+    }).catch(function (err) {
+      toast("读取快照决策失败：" + err.message, "error");
+    });
+  }
+
+  // 快照摘要是纯数据（无 window.DecisionCore 的进度计算上下文），本地复刻一份
+  function decisionProgressOf(d) {
+    var counts = { pending: 0, waiting: 0, rejected: 0, approved: 0 };
+    (d.items || []).forEach(function (it) {
+      var st = core.itemState(it, d.threshold || 1);
+      counts[st]++;
+    });
+    return { total: (d.items || []).length, counts: counts,
+             approved: counts.approved };
+  }
+
+  /* ---------- 错误处理 ---------- */
+
+  function handleError(err, showError, action) {
+    var msg;
+    if (err.status === 409 && err.code === "version_conflict") {
+      msg = "版本冲突：决策集合已被其他页面更新（当前版本 " +
+        ((err.data && err.data.currentRev) != null ? err.data.currentRev : "—") +
+        "），本次" + action + "已被拒绝，没有覆盖较新内容。已按最新数据刷新，请重试。";
+      loadList(true);
+    } else if (err.status === 428) {
+      msg = "缺少版本号，请刷新决策列表后重试。";
+      loadList(true);
+    } else {
+      msg = action + "失败：" + err.message;
+    }
+    showError(msg);
+  }
+
+  function handleDetailError(err, showError, modal, action) {
+    if (err.status === 409 && err.code === "version_conflict") {
+      showError("版本冲突：" + err.message + " 已为你重新加载草案最新内容，请重试。");
+      loadList(true);
+      refreshDetail(modal);
+    } else if (err.status === 428) {
+      showError("缺少版本号，请刷新后重试。");
+      loadList(true);
+      refreshDetail(modal);
+    } else {
+      showError(action + "失败：" + err.message + "（当前页面内容已保留）");
+    }
+  }
+
+  /* ---------- 绑定 ---------- */
+
+  $("decision-add").addEventListener("click", openComposer);
+  $("decision-refresh").addEventListener("click", function () { loadList(); });
+
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) loadList(true);
+  });
+  window.addEventListener("focus", function () { loadList(true); });
+
+  window.DecisionsUI = {
+    reload: loadList,
+    openDetail: openDetail,
+    openComposerForBatch: function (batchId) { openComposer(batchId); },
+    openSnapshotDecisions: openSnapshotDecisions
+  };
+
+  /* ---------- 启动 ---------- */
+  loadList();
+})();
