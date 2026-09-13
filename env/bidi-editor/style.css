@@ -1298,3 +1298,145 @@ tr.rp-added { background: #f0fdf4; }
 .dc-snap-card { cursor: default; margin-bottom: 10px; }
 .dc-snap-item { font-size: 12px; color: #374151; padding: 1px 0; }
 .dc-threshold { max-width: 110px; }
+
+/* ================= 执行回放（审计包导出/导入/只读时间线） ================= */
+.modal.modal-xwide { width: min(1180px, 100%); }
+
+#replay-open-btn { margin-left: 6px; }
+
+.replay-center { display: flex; flex-direction: column; gap: 14px; }
+.replay-section {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 14px; background: #fcfcfd;
+}
+.replay-section h4 { margin: 0 0 10px; font-size: 14px; }
+.replay-section-head {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+}
+.replay-section-head h4 { margin: 0; }
+.replay-section-head button { margin-left: auto; }
+.replay-rev-tag { margin-left: 2px; }
+
+.replay-form-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0;
+}
+.replay-form-row label { font-size: 13px; color: #374151; }
+.replay-name-input { flex: 1 1 280px; min-width: 220px; }
+.replay-dash { color: #6b7280; }
+
+.replay-space-list, .replay-fail-list {
+  display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto;
+}
+.replay-space-card, .replay-fail-card {
+  border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; background: #fff;
+}
+.replay-space-head, .replay-fail-head {
+  display: flex; align-items: center; gap: 10px;
+}
+.replay-space-name { font-weight: 600; font-size: 13.5px; }
+.replay-space-head .snap-rev { margin-left: auto; }
+.replay-space-meta {
+  display: flex; gap: 14px; flex-wrap: wrap;
+  font-size: 12px; color: #4b5563; margin: 4px 0;
+}
+.replay-space-hash {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0;
+}
+.replay-space-hash code {
+  font-size: 11px; background: #f3f4f6; border-radius: 4px; padding: 1px 6px;
+}
+.replay-space-hash .replay-hash { color: #6b7280; }
+.replay-space-actions { display: flex; gap: 8px; margin-top: 6px; }
+
+.replay-fail-head .replay-fail-time { margin-left: auto; font-size: 12px; color: #6b7280; }
+.replay-fail-msg { font-size: 12.5px; color: #7f1d1d; margin: 4px 0; }
+.replay-fail-meta { font-size: 11px; color: #6b7280; }
+.replay-fail-errors { margin: 4px 0 0 18px; font-size: 12px; color: #991b1b; }
+.replay-empty { color: #9ca3af; font-size: 13px; padding: 8px 2px; }
+
+.replay-badge {
+  display: inline-block; font-size: 11px; font-weight: 600;
+  color: #374151; background: #eef2ff; border: 1px solid #e0e7ff;
+  border-radius: 10px; padding: 0 8px; line-height: 18px; white-space: nowrap;
+}
+.replay-badge-danger { color: #991b1b; background: #fee2e2; border-color: #fecaca; }
+.replay-badge-ok { color: #166534; background: #dcfce7; border-color: #bbf7d0; }
+
+/* 空间详情 */
+.replay-space-view { display: flex; flex-direction: column; gap: 10px; }
+.replay-locked-note {
+  font-size: 12.5px; color: #92400e; background: #fffbeb;
+  border: 1px solid #fde68a; border-radius: 6px; padding: 6px 10px;
+}
+.replay-detail-head { display: flex; flex-direction: column; gap: 6px; }
+.replay-detail-meta {
+  font-size: 12px; color: #4b5563; display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+}
+.replay-detail-meta code { background: #f3f4f6; border-radius: 4px; padding: 1px 6px; }
+.replay-validation { display: flex; gap: 8px; flex-wrap: wrap; }
+.replay-filters {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  border-top: 1px dashed var(--border); border-bottom: 1px dashed var(--border);
+  padding: 8px 0;
+}
+.replay-filters label { font-size: 12.5px; color: #374151; }
+.replay-filters select { max-width: 260px; }
+.replay-filters .snap-rev { margin-left: auto; }
+
+.replay-conflict-box {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  border: 1px solid #fecaca; background: #fef2f2; border-radius: 6px; padding: 6px 10px;
+}
+.replay-timeline-info { font-size: 12px; color: #6b7280; margin-bottom: 6px; }
+
+.replay-tl-group { margin-bottom: 12px; }
+.replay-tl-group-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: #f8fafc; border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 10px;
+}
+.replay-tl-task-name { font-weight: 600; font-size: 13px; }
+.replay-tl-task-id { font-size: 11px; color: #9ca3af; margin-left: auto; }
+.replay-tl-events { list-style: none; margin: 6px 0 0; padding-left: 18px; border-left: 2px solid #e5e7eb; }
+.replay-tl-event { position: relative; padding: 4px 10px 8px; }
+.replay-tl-event::before {
+  content: ""; position: absolute; left: -23px; top: 9px;
+  width: 9px; height: 9px; border-radius: 50%; background: #9ca3af; border: 2px solid #fff;
+}
+.replay-cat-wait::before { background: #60a5fa; }
+.replay-cat-approval::before { background: #a78bfa; }
+.replay-cat-config::before { background: #fbbf24; }
+.replay-cat-execute::before { background: #34d399; }
+.replay-cat-retry::before { background: #fb923c; }
+.replay-cat-cancel::before { background: #f87171; }
+.replay-tl-event-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.replay-tl-time { font-size: 11.5px; color: #6b7280; font-variant-numeric: tabular-nums; }
+.replay-tl-action {
+  font-family: ui-monospace, monospace; font-size: 11.5px; color: #1f2937;
+  background: #f3f4f6; border-radius: 4px; padding: 0 6px;
+}
+.replay-tl-actor { font-size: 11.5px; color: #4b5563; }
+.replay-tl-detail { font-size: 12.5px; color: #374151; margin: 2px 0 0; }
+.replay-tl-refs { display: flex; gap: 8px; align-items: center; margin-top: 3px; flex-wrap: wrap; }
+.replay-tl-refs code {
+  font-size: 11px; background: #f9fafb; border: 1px solid var(--border);
+  border-radius: 4px; padding: 0 6px; color: #6b7280;
+}
+.replay-link {
+  border: 1px solid #c7d2fe; background: #eef2ff; color: #3730a3;
+  border-radius: 4px; font-size: 11px; padding: 0 6px; cursor: pointer;
+}
+.replay-link:hover { background: #e0e7ff; }
+.replay-cat-badge { color: #fff; border: none; }
+.replay-cat-badge-wait { background: #3b82f6; }
+.replay-cat-badge-approval { background: #7c3aed; }
+.replay-cat-badge-config { background: #d97706; }
+.replay-cat-badge-execute { background: #059669; }
+.replay-cat-badge-retry { background: #ea580c; }
+.replay-cat-badge-cancel { background: #dc2626; }
+
+.replay-snapshot-view h4 { margin: 8px 0; }
+.replay-snap-para {
+  font-size: 13px; padding: 4px 8px; border-bottom: 1px dashed #e5e7eb;
+}
+.replay-snap-idx { color: #9ca3af; font-size: 11.5px; }

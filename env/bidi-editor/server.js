@@ -39,6 +39,7 @@ const crypto = require("crypto");
 const core = require("./snapshot-core");
 const review = require("./review-core");
 const decision = require("./decision-core");
+const replay = require("./replay-core");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
@@ -50,7 +51,12 @@ const BATCH_FILE = process.env.REVIEW_BATCHES_FILE ||
   path.join(ROOT, "data", "review-batches.json");
 const DECISION_FILE = process.env.REVIEW_DECISIONS_FILE ||
   path.join(ROOT, "data", "review-decisions.json");
+const REPLAY_FILE = process.env.REPLAY_SPACES_FILE ||
+  path.join(ROOT, "data", "replay-spaces.json");
 const REQUEST_BODY_LIMIT = 4 * 1024 * 1024; // 传输字节上限（校验逻辑另有字符上限）
+// 审计包内含锁定文本，允许更大的导入请求体（可用环境变量覆盖）
+const REPLAY_BODY_LIMIT = Number(process.env.REPLAY_BODY_LIMIT_BYTES) ||
+  32 * 1024 * 1024;
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -840,6 +846,592 @@ function runDecisionExecution(d, currentParas, opts) {
   };
 }
 
+/* ================= 执行回放：审计包导出 / 导入 / 回放空间 =================
+ *
+ * 回放模块与线上批次、决策、执行队列完全隔离：
+ *   - 导出（POST /api/replay/export）只读取线上数据生成自洽审计包，绝不写线上数据；
+ *   - 导入只把通过全部校验的审计包写入独立的 replayStore（data/replay-spaces.json），
+ *     绝不触碰 batchStore / decisionStore / annStore / store；
+ *   - 回放视图只有 GET 接口与筛选条件保存，没有任何暂停 / 审批 / 执行入口；
+ *   - 导入校验全部在写盘之前完成，失败时记录失败原因，空间不会被部分写入；
+ *   - 同一审计包导入两次幂等；不同包但 packageId 相同返回 409 replay_conflict。
+ */
+
+const replayStore = {
+  rev: 0,
+  spaces: [],     // 已导入的回放空间（锁定的审计包 + 视图状态）
+  failures: []    // 导入失败记录（保留失败原因，重启后仍可查）
+};
+
+function persistReplay(cb) {
+  const tmp = REPLAY_FILE + ".tmp";
+  fs.mkdir(path.dirname(REPLAY_FILE), { recursive: true }, function () {
+    fs.writeFile(tmp, JSON.stringify(replayStore), function (err) {
+      if (err) { cb(err); return; }
+      fs.rename(tmp, REPLAY_FILE, cb); // 同目录原子替换
+    });
+  });
+}
+
+try {
+  const rawReplay = fs.readFileSync(REPLAY_FILE, "utf8");
+  const dataReplay = JSON.parse(rawReplay);
+  if (Number.isInteger(dataReplay.rev) && Array.isArray(dataReplay.spaces)) {
+    replayStore.rev = dataReplay.rev;
+    replayStore.spaces = dataReplay.spaces;
+    replayStore.failures = Array.isArray(dataReplay.failures) ? dataReplay.failures : [];
+  }
+} catch (e) {
+  // 文件不存在/损坏：以空存储启动，损坏文件不覆盖
+}
+
+function findReplaySpace(id) {
+  return replayStore.spaces.find(function (s) { return s.id === id; });
+}
+
+function addReplayFailure(record) {
+  replayStore.failures.push({
+    id: crypto.randomUUID(),
+    at: new Date().toISOString(),
+    actor: record.actor || "匿名",
+    name: record.name || null,
+    packageId: record.packageId || null,
+    producerId: record.producerId || null,
+    code: record.code,
+    message: record.message,
+    errors: Array.isArray(record.errors) ? record.errors.slice(0, 50) : []
+  });
+  if (replayStore.failures.length > 200) {
+    replayStore.failures.splice(0, replayStore.failures.length - 200);
+  }
+}
+
+// 回放空间对外视图：包内容是锁定的历史；view 是该空间保存的筛选条件
+function publicReplaySpace(sp) {
+  return {
+    id: sp.id,
+    rev: sp.rev,
+    packageId: sp.packageId,
+    producerId: sp.producerId,
+    name: sp.name,
+    format: sp.format,
+    packageVersion: sp.packageVersion,
+    schemaVersion: sp.schemaVersion,
+    importedAt: sp.importedAt,
+    importedBy: sp.importedBy,
+    exportedAt: sp.exportedAt,
+    range: sp.range,
+    manifest: sp.manifest,
+    view: sp.view || { taskId: "", category: "", action: "", annotationId: "" },
+    validation: {
+      verified: true,
+      contentHash: sp.manifest && sp.manifest.contentHash,
+      chainHead: sp.manifest && sp.manifest.chainHead,
+      eventCount: sp.manifest && sp.manifest.eventCount,
+      verifiedAt: sp.verifiedAt
+    },
+    counts: {
+      tasks: sp.content.tasks.length,
+      decisions: sp.content.decisions.length,
+      executions: sp.content.executions.length,
+      events: sp.content.events.length,
+      snapshots: sp.content.snapshots.length
+    },
+    content: sp.content // 锁定的完整历史内容
+  };
+}
+
+function publicReplaySummary(sp) {
+  const c = sp.content;
+  return {
+    id: sp.id,
+    rev: sp.rev,
+    packageId: sp.packageId,
+    producerId: sp.producerId,
+    name: sp.name,
+    packageVersion: sp.packageVersion,
+    importedAt: sp.importedAt,
+    importedBy: sp.importedBy,
+    exportedAt: sp.exportedAt,
+    range: sp.range,
+    view: sp.view || { taskId: "", category: "", action: "", annotationId: "" },
+    manifest: {
+      contentHash: sp.manifest.contentHash,
+      chainHead: sp.manifest.chainHead,
+      eventCount: sp.manifest.eventCount
+    },
+    counts: {
+      tasks: c.tasks.length,
+      decisions: c.decisions.length,
+      executions: c.executions.length,
+      events: c.events.length,
+      snapshots: c.snapshots.length
+    }
+  };
+}
+
+/* ---------- 导出：从线上数据只读构建审计包 ---------- */
+
+function buildReplayExport(payload) {
+  const range = {
+    from: payload.from || null,
+    to: payload.to || null
+  };
+  if (range.from && !replay.isISODateString(range.from)) {
+    return { status: 400, code: "invalid_from", message: "起始时间不是合法 ISO 时间" };
+  }
+  if (range.to && !replay.isISODateString(range.to)) {
+    return { status: 400, code: "invalid_to", message: "结束时间不是合法 ISO 时间" };
+  }
+  if (range.from && range.to && Date.parse(range.from) > Date.parse(range.to)) {
+    return { status: 400, code: "invalid_range", message: "起始时间晚于结束时间" };
+  }
+
+  // 执行记录按草案分组（线上 d.executions 是完整结构，逐条结果含冲突原因）
+  const executionsMap = Object.create(null);
+  decisionStore.decisions.forEach(function (d) {
+    if (Array.isArray(d.executions) && d.executions.length) {
+      executionsMap[d.id] = d.executions;
+    }
+  });
+
+  const built = replay.buildPackage({
+    name: payload.name,
+    producerId: payload.producerId,
+    packageId: payload.packageId,
+    actor: payload.actor,
+    range: range,
+    tasks: decisionStore.tasks,
+    decisionLogs: decisionStore.logs,
+    executions: executionsMap,
+    snapshots: store.snapshots,
+    decisions: decisionStore.decisions
+  });
+  if (!built.ok) {
+    const status = built.code === "package_too_large" ? 413 : 400;
+    return { status: status, code: built.code, message: built.message };
+  }
+  if (!built.value.content.events.length) {
+    return { status: 404, code: "empty_export",
+      message: "指定时间范围内没有任何执行队列事件（任务等待/审批/执行/重试），未生成审计包" };
+  }
+  return { status: 200, value: built.value };
+}
+
+/* ---------- 导入：全量校验通过后一次性原子写入（cb 风格，落盘结果决定响应） ---------- */
+
+function recordReplayFailure(rec, cb) {
+  addReplayFailure(rec);
+  // 失败记录落盘是尽力而为：即使再失败也不改变“空间未写入”的事实
+  persistReplay(function () { if (cb) cb(); });
+}
+
+function importReplayPackage(payload, actor, cb) {
+  // 1) 格式与内容哈希、事件链、引用、数量上限全部校验（先于任何写入）
+  const verified = replay.verifyPackage(payload);
+  if (!verified.ok) {
+    recordReplayFailure({
+      actor: actor,
+      name: payload && payload.name,
+      packageId: payload && payload.packageId,
+      producerId: payload && payload.producerId,
+      code: verified.code,
+      message: verified.message,
+      errors: verified.errors
+    }, function () {
+      const status = (verified.code === "package_too_large") ? 413 : 400;
+      cb({ status: status, code: verified.code, message: verified.message,
+           errors: verified.errors });
+    });
+    return;
+  }
+  const pkg = verified.value;
+
+  // 2) 同包幂等 / 同标识不同包冲突
+  const existing = replayStore.spaces.find(function (s) {
+    return s.packageId === pkg.packageId && s.producerId === pkg.producerId;
+  });
+  if (existing) {
+    if (existing.manifest.contentHash === pkg.manifest.contentHash &&
+        existing.manifest.chainHead === pkg.manifest.chainHead) {
+      // 同一审计包再次导入：幂等返回已有空间，不新建、不部分写入
+      cb(null, { status: 200, value: existing, idempotent: true });
+      return;
+    }
+    recordReplayFailure({
+      actor: actor, name: pkg.name, packageId: pkg.packageId, producerId: pkg.producerId,
+      code: "replay_conflict",
+      message: "已存在相同标识（" + pkg.packageId + "）但内容哈希不同的审计包；" +
+        "为避免覆盖锁定历史，本次导入已拒绝。已有空间：" + existing.id
+    }, function () {
+      cb({ status: 409, code: "replay_conflict",
+        message: "审计包标识 " + pkg.packageId + " 已被另一份不同内容的包占用（" +
+          existing.name + "）。同一标识只能导入同一内容；如需导入新包请重新导出以获得新标识。",
+        existingSpaceId: existing.id });
+    });
+    return;
+  }
+
+  // 3) 构造空间（校验已过，下面不再改任何线上对象）
+  const now = new Date().toISOString();
+  const sp = {
+    id: crypto.randomUUID(),
+    rev: 1,
+    packageId: pkg.packageId,
+    producerId: pkg.producerId,
+    name: pkg.name,
+    format: pkg.format,
+    packageVersion: pkg.packageVersion,
+    schemaVersion: pkg.schemaVersion,
+    range: pkg.range,
+    manifest: pkg.manifest,
+    content: pkg.content,        // 锁定的历史内容（导入后永不变更）
+    importedAt: now,
+    importedBy: actor,
+    exportedAt: pkg.exportedAt,
+    verifiedAt: now,
+    // 筛选条件随空间持久化：服务重启后恢复
+    view: { taskId: "", category: "", action: "", annotationId: "" }
+  };
+
+  // 4) 先在内存追加，再原子落盘；落盘失败整体移除（绝不留下部分写入）
+  replayStore.spaces.push(sp);
+  replayStore.rev++;
+  persistReplay(function (err) {
+    if (err) {
+      const i = replayStore.spaces.indexOf(sp);
+      if (i !== -1) replayStore.spaces.splice(i, 1);
+      replayStore.rev--;
+      recordReplayFailure({
+        actor: actor, name: pkg.name, packageId: pkg.packageId, producerId: pkg.producerId,
+        code: "persist_failed", message: "回放空间落盘失败，已整体回滚：" + err.message
+      }, function () {
+        cb({ status: 500, code: "persist_failed",
+             message: "回放空间保存失败，已整体回滚，原回放空间未被改动" });
+      });
+      return;
+    }
+    cb(null, { status: 201, value: sp, idempotent: false });
+  });
+}
+
+/* ---------- 回放视图筛选条件（只影响回放空间自身，随空间持久化） ---------- */
+
+function saveReplayView(sp, view, cb) {
+  const next = {
+    taskId: typeof view.taskId === "string" ? view.taskId : "",
+    category: typeof view.category === "string" ? view.category : "",
+    action: typeof view.action === "string" ? view.action : "",
+    annotationId: typeof view.annotationId === "string" ? view.annotationId : ""
+  };
+  if (next.taskId &&
+      !sp.content.tasks.some(function (t) { return t.id === next.taskId; })) {
+    return { error: { status: 400, code: "task_not_in_package",
+      message: "筛选的任务不在该审计包内" } };
+  }
+  if (next.category && replay.EVENT_CATEGORIES.indexOf(next.category) === -1) {
+    return { error: { status: 400, code: "invalid_category",
+      message: "事件类型筛选非法：" + next.category } };
+  }
+  if (next.action && typeof next.action !== "string") {
+    return { error: { status: 400, code: "invalid_action", message: "事件动作筛选非法" } };
+  }
+  sp.view = next;
+  sp.rev++;
+  replayStore.rev++;
+  persistReplay(function (err) {
+    if (err) { cb(err); return; }
+    cb(null);
+  });
+  return null;
+}
+
+function deleteReplaySpace(sp, cb) {
+  const i = replayStore.spaces.indexOf(sp);
+  if (i !== -1) replayStore.spaces.splice(i, 1);
+  replayStore.rev++;
+  persistReplay(function (err) {
+    if (err) {
+      if (i !== -1) replayStore.spaces.splice(i, 0, sp);
+      replayStore.rev--;
+      cb(err);
+      return;
+    }
+    cb(null);
+  });
+}
+
+/* ---------- 回放 API 路由 ---------- */
+
+function handleReplay(req, res, parts, urlObj) {
+  // /api/replay/export | /api/replay/imports/import | /api/replay/spaces[/:id[/view|timeline|snapshots/:sid]] | /api/replay/failures
+  const seg = parts.slice(2); // ["replay", ...] -> 去掉 "api"
+  // seg[0] === "replay"
+
+  /* ---- GET /api/replay/preview?from=&to=：导出前预览（命中任务/事件数，只读） ---- */
+  if (seg[0] === "preview" && req.method === "GET") {
+    const params = urlObj.searchParams;
+    const from = params.get("from");
+    const to = params.get("to");
+    if (from && !replay.isISODateString(from)) {
+      apiError(res, 400, "invalid_from", "起始时间不是合法 ISO 时间"); return;
+    }
+    if (to && !replay.isISODateString(to)) {
+      apiError(res, 400, "invalid_to", "结束时间不是合法 ISO 时间"); return;
+    }
+    if (from && to && Date.parse(from) > Date.parse(to)) {
+      apiError(res, 400, "invalid_range", "起始时间晚于结束时间"); return;
+    }
+    const taskHits = Object.create(null);
+    let eventCount = 0;
+    decisionStore.logs.forEach(function (l) {
+      if (!l.taskId) return;
+      if (!replay.inRange(l.at, from || null, to || null)) return;
+      taskHits[l.taskId] = true;
+      eventCount++;
+    });
+    // 关联的前置任务也算入预览任务数
+    Object.keys(taskHits).forEach(function (tid) {
+      const t = findTask(tid);
+      if (t) (t.dependencyIds || []).forEach(function (d) { taskHits[d] = true; });
+    });
+    sendJSON(res, 200, {
+      range: { from: from || null, to: to || null },
+      taskCount: Object.keys(taskHits).length,
+      eventCount: eventCount
+    });
+    return;
+  }
+
+  /* ---- POST /api/replay/export：构建并下载审计包（只读线上数据，带 ?download=1 时给附件头） ---- */
+  if (seg[0] === "export" && req.method === "POST") {
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let payload;
+      try { payload = JSON.parse(raw); }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      const actor = review.validateAuthor(payload.actor).value;
+      const result = buildReplayExport({
+        from: payload.from, to: payload.to, name: payload.name,
+        producerId: payload.producerId, actor: actor
+      });
+      if (result.status !== 200) {
+        apiError(res, result.status, result.code, result.message);
+        return;
+      }
+      const body = JSON.stringify(result.value, null, 2);
+      const download = urlObj.searchParams.get("download") === "1";
+      const headers = { "Content-Type": "application/json; charset=utf-8" };
+      if (download) {
+        const fname = encodeURIComponent(result.value.packageId + ".replay.json");
+        headers["Content-Disposition"] =
+          "attachment; filename=\"replay.json\"; filename*=UTF-8''" + fname;
+      }
+      res.writeHead(200, headers);
+      res.end(body);
+    });
+    return;
+  }
+
+  /* ---- POST /api/replay/import：导入审计包到空白回放空间 ---- */
+  if (seg[0] === "import" && req.method === "POST") {
+    readReplayBody(req, function (err, raw) {
+      if (err) {
+        if (err.message === "body_too_large") {
+          apiError(res, 413, "body_too_large", "审计包超过请求体大小上限");
+        } else {
+          apiError(res, 400, "invalid_json", "读取请求体失败");
+        }
+        return;
+      }
+      let payload;
+      try { payload = JSON.parse(raw); }
+      catch (e) {
+        recordReplayFailure({
+          actor: "匿名", code: "invalid_format",
+          message: "审计包不是合法 JSON：" + e.message
+        }, function () {
+          apiError(res, 400, "invalid_format", "审计包不是合法 JSON 文件");
+        });
+        return;
+      }
+      const actor = (payload && typeof payload.importedBy === "string")
+        ? review.validateAuthor(payload.importedBy).value
+        : "负责人";
+      // 允许 {space: pkg} 包裹或直接提交包本体
+      const pkg = (payload && payload.format === undefined && payload.package)
+        ? payload.package : payload;
+      importReplayPackage(pkg, actor, function (failure, outcome) {
+        if (failure) {
+          const extra = failure.errors ? { errors: failure.errors } : {};
+          if (failure.existingSpaceId) extra.existingSpaceId = failure.existingSpaceId;
+          apiError(res, failure.status, failure.code, failure.message, extra);
+          return;
+        }
+        sendJSON(res, outcome.status, {
+          space: publicReplaySummary(outcome.value),
+          idempotent: outcome.idempotent
+        });
+      });
+    });
+    return;
+  }
+
+  /* ---- GET /api/replay/failures：导入失败记录（保留失败原因） ---- */
+  if (seg[0] === "failures" && req.method === "GET") {
+    sendJSON(res, 200, { rev: replayStore.rev,
+      failures: replayStore.failures.slice().reverse() });
+    return;
+  }
+
+  /* ---- 回放空间集合 / 单项 ---- */
+  if (seg[0] === "spaces") {
+    handleReplaySpaces(req, res, seg.slice(1), urlObj);
+    return;
+  }
+
+  apiError(res, 404, "not_found", "回放接口不存在");
+}
+
+function readReplayBody(req, cb) {
+  let size = 0;
+  const chunks = [];
+  req.on("data", function (c) {
+    size += c.length;
+    if (size > REPLAY_BODY_LIMIT) {
+      req.destroy();
+      cb(new Error("body_too_large"));
+      cb = function () {};
+      return;
+    }
+    chunks.push(c);
+  });
+  req.on("end", function () { cb(null, Buffer.concat(chunks).toString("utf8")); });
+  req.on("error", cb);
+}
+
+function handleReplaySpaces(req, res, seg, urlObj) {
+  // seg: [] | [":id"] | [":id", "view"] | [":id", "timeline"] |
+  //      [":id", "snapshots", ":sid"] | [":id", "conflicts"] | [":id", "tasks"]
+  if (!seg.length) {
+    /* GET 列表（只含摘要，不含锁定全文，便于首屏） */
+    if (req.method === "GET") {
+      const list = replayStore.spaces
+        .slice()
+        .sort(function (a, b) { return b.importedAt.localeCompare(a.importedAt); })
+        .map(publicReplaySummary);
+      sendJSON(res, 200, { rev: replayStore.rev, spaces: list });
+      return;
+    }
+    apiError(res, 405, "method_not_allowed", "仅支持 GET");
+    return;
+  }
+
+  const sp = findReplaySpace(seg[0]);
+  if (!sp) {
+    apiError(res, 404, "replay_space_not_found", "回放空间不存在或已删除");
+    return;
+  }
+
+  if (seg.length === 1 && req.method === "GET") {
+    sendJSON(res, 200, { rev: replayStore.rev, space: publicReplaySpace(sp) });
+    return;
+  }
+
+  if (seg.length === 1 && req.method === "DELETE") {
+    deleteReplaySpace(sp, function (err) {
+      if (err) { apiError(res, 500, "persist_failed", "删除失败，回放空间未被改动"); return; }
+      sendJSON(res, 200, { ok: true, id: sp.id });
+    });
+    return;
+  }
+
+  /* PUT /spaces/:id/view：保存筛选条件（If-Match: 空间 rev） */
+  if (seg.length === 2 && seg[1] === "view" && req.method === "PUT") {
+    if (checkLock(res, req.headers["if-match"], sp.rev, "回放空间视图")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let view;
+      try { view = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      const attempt = saveReplayView(sp, view, function (perr) {
+        if (perr) {
+          apiError(res, 500, "persist_failed", "筛选条件保存失败，未生效");
+          return;
+        }
+        sendJSON(res, 200, { rev: replayStore.rev,
+          spaceId: sp.id, spaceRev: sp.rev, view: sp.view });
+      });
+      if (attempt && attempt.error) {
+        const e = attempt.error;
+        apiError(res, e.status, e.code, e.message);
+      }
+    });
+    return;
+  }
+
+  /* GET /spaces/:id/timeline：按时间线返回（可 ?taskId=&category= 实时筛选，
+     不带参数时回退到空间已保存的筛选条件） */
+  if (seg.length === 2 && seg[1] === "timeline" && req.method === "GET") {
+    const params = urlObj.searchParams;
+    const saved = sp.view || {};
+    const opts = {
+      taskId: params.get("taskId") !== null ? params.get("taskId") : saved.taskId,
+      category: params.get("category") !== null ? params.get("category") : saved.category,
+      action: params.get("action") !== null ? params.get("action") : saved.action,
+      annotationId: params.get("annotationId") !== null
+        ? params.get("annotationId") : saved.annotationId,
+      from: params.get("from"),
+      to: params.get("to")
+    };
+    Object.keys(opts).forEach(function (k) { if (!opts[k]) opts[k] = ""; });
+    if (opts.category && replay.EVENT_CATEGORIES.indexOf(opts.category) === -1) {
+      apiError(res, 400, "invalid_category", "事件类型筛选非法：" + opts.category);
+      return;
+    }
+    const timeline = replay.timelineByTask(sp.content, opts);
+    const taskIndex = Object.create(null);
+    sp.content.tasks.forEach(function (t) { taskIndex[t.id] = t; });
+    sendJSON(res, 200, {
+      rev: sp.rev,
+      view: saved,
+      applied: opts,
+      timeline: timeline.map(function (g) {
+        return {
+          taskId: g.taskId,
+          task: g.task,
+          events: g.events
+        };
+      })
+    });
+    return;
+  }
+
+  /* GET /spaces/:id/conflicts：冲突原因汇总（逐条结果） */
+  if (seg.length === 2 && seg[1] === "conflicts" && req.method === "GET") {
+    sendJSON(res, 200, { rev: sp.rev, summary: replay.conflictSummary(sp.content) });
+    return;
+  }
+
+  /* GET /spaces/:id/tasks/:taskId：包内锁定的单个任务（只读） */
+  if (seg.length === 3 && seg[1] === "tasks" && req.method === "GET") {
+    const t = sp.content.tasks.find(function (x) { return x.id === seg[2]; });
+    if (!t) { apiError(res, 404, "task_not_in_package", "该任务不在审计包内"); return; }
+    sendJSON(res, 200, { rev: sp.rev, task: t });
+    return;
+  }
+
+  /* GET /spaces/:id/snapshots/:sid：包内锁定的单个快照（只读） */
+  if (seg.length === 3 && seg[1] === "snapshots" && req.method === "GET") {
+    const snap = sp.content.snapshots.find(function (x) { return x.id === seg[2]; });
+    if (!snap) { apiError(res, 404, "snapshot_not_in_package", "该快照不在审计包内"); return; }
+    sendJSON(res, 200, { rev: sp.rev, snapshot: snap });
+    return;
+  }
+
+  apiError(res, 404, "not_found", "回放接口不存在");
+}
+
 /* ================= HTTP 工具 ================= */
 
 function sendJSON(res, status, body, headers) {
@@ -850,6 +1442,7 @@ function sendJSON(res, status, body, headers) {
     "X-Annotation-Rev": String(annStore.rev),
     "X-Batch-Rev": String(batchStore.rev),
     "X-Decision-Rev": String(decisionStore.rev),
+    "X-Replay-Rev": String(replayStore.rev),
     "Cache-Control": "no-store"
   }, headers || {});
   res.writeHead(status, h);
@@ -4318,6 +4911,10 @@ function handleAPI(req, res, pathname, urlObj) {
     handleExecutionTasks(req, res, parts, urlObj);
     return;
   }
+  if (parts[1] === "replay" && parts.length <= 7) {
+    handleReplay(req, res, parts, urlObj);
+    return;
+  }
   apiError(res, 404, "not_found", "接口不存在");
 }
 
@@ -4369,7 +4966,7 @@ syncAnnotationBatchFields();
 startScheduler();
 
 module.exports = {
-  core, review, decision,
+  core, review, decision, replay,
   store: store, annStore: annStore, batchStore: batchStore,
-  decisionStore: decisionStore
+  decisionStore: decisionStore, replayStore: replayStore
 };
