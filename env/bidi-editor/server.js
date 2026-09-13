@@ -41,6 +41,7 @@ const review = require("./review-core");
 const decision = require("./decision-core");
 const replay = require("./replay-core");
 const replayReview = require("./replay-review-core");
+const replaySession = require("./replay-session-core");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
@@ -881,10 +882,12 @@ try {
     replayStore.rev = dataReplay.rev;
     replayStore.spaces = dataReplay.spaces;
     replayStore.failures = Array.isArray(dataReplay.failures) ? dataReplay.failures : [];
-    // 历史证据复核（旧版数据文件缺这些字段，启动时补齐，锁定内容 content 永不变更）
+    // 历史证据复核 + 复核会话（旧版数据文件缺这些字段，启动时补齐，锁定内容 content 永不变更）
     replayStore.spaces.forEach(function (sp) {
       if (!Array.isArray(sp.reviews)) sp.reviews = [];
       if (!Array.isArray(sp.reviewLogs)) sp.reviewLogs = [];
+      if (!Array.isArray(sp.sessions)) sp.sessions = [];
+      if (!Array.isArray(sp.sessionLogs)) sp.sessionLogs = [];
     });
   }
 } catch (e) {
@@ -945,9 +948,11 @@ function publicReplaySpace(sp) {
       reviews: (sp.reviews || []).length,
       openReviews: (sp.reviews || []).filter(function (r) {
         return r.status !== "closed";
-      }).length
+      }).length,
+      sessions: (sp.sessions || []).length
     },
     reviews: (sp.reviews || []).map(publicReview),
+    sessions: (sp.sessions || []).map(function (s) { return publicSession(s); }),
     content: sp.content // 锁定的完整历史内容
   };
 }
@@ -980,7 +985,8 @@ function publicReplaySummary(sp) {
       reviews: (sp.reviews || []).length,
       openReviews: (sp.reviews || []).filter(function (r) {
         return r.status !== "closed";
-      }).length
+      }).length,
+      sessions: (sp.sessions || []).length
     }
   };
 }
@@ -1231,6 +1237,225 @@ function reassignSpaceReview(sp, rv, body, actor, cb) {
   });
 }
 
+/* ================= 复核会话 =================
+ *
+ * 复核会话挂在回放空间上（sessions + sessionLogs），与审计包锁定内容严格隔离：
+ *   - 负责人按当前筛选条件选取多条复核意见创建会话，设置参与人与截止时间；
+ *     创建瞬间锁定每条意见的 version 与引用摘要（targetSummary）；
+ *   - 参与人只能对会话内意见逐条提交结论（confirm/reject/need_evidence + 备注）；
+ *   - 提交时校验会话版本（X-Session-Version）与意见版本（lockedVersion）：
+ *     意见已关闭 / 已被会话外更新 / 引用目标不存在 → 标记冲突并拒绝覆盖，
+ *     冲突留痕持久化，结论不写入、意见不被改动；
+ *   - 空选集、重复加入（选集内重复或已在其他未过期会话）、非法/过去截止时间、
+ *     过期会话提交都明确拒绝；
+ *   - 会话与每条结论的操作记录只增不改，随空间原子落盘，重启后可继续处理；
+ *   - 会话报告导出是纯只读计算，失败不改变意见、会话进度或回放空间，
+ *     也绝不调用线上暂停/审批/执行接口。
+ */
+
+function findSpaceSession(sp, sessionId) {
+  return (sp.sessions || []).find(function (s) { return s.id === sessionId; }) || null;
+}
+
+function addSessionLogs(sp, entries) {
+  entries.forEach(function (e) { sp.sessionLogs.push(e); });
+  if (sp.sessionLogs.length > replaySession.LIMITS.SESSION_LOGS_PER_SPACE_MAX) {
+    sp.sessionLogs.splice(0,
+      sp.sessionLogs.length - replaySession.LIMITS.SESSION_LOGS_PER_SPACE_MAX);
+  }
+}
+
+function sessionLogEntry(sessionId, action, actor, detail) {
+  const d = detail || {};
+  return {
+    id: crypto.randomUUID(),
+    sessionId: sessionId,
+    at: new Date().toISOString(),
+    action: action, // create/conclusion/conflict
+    actor: actor,
+    reviewId: d.reviewId || null,
+    detail: d
+  };
+}
+
+function publicSession(s, nowIso) {
+  return {
+    id: s.id,
+    version: s.version,
+    name: s.name,
+    participants: (s.participants || []).slice(),
+    deadline: s.deadline,
+    createdBy: s.createdBy,
+    createdAt: s.createdAt,
+    filters: s.filters || null,
+    progress: replaySession.sessionProgress(s, nowIso || new Date().toISOString())
+  };
+}
+
+// 会话详情：条目 + 锁定摘要 + 结论/冲突 + 意见当前状态（实时进度不缓存）
+function publicSessionDetail(sp, s) {
+  const pub = publicSession(s);
+  pub.items = (s.items || []).map(function (it) {
+    const rv = findSpaceReview(sp, it.reviewId);
+    return {
+      reviewId: it.reviewId,
+      lockedVersion: it.lockedVersion,
+      lockedStatus: it.lockedStatus,
+      targetSummary: it.targetSummary || null,
+      review: rv ? publicReview(rv) : null,
+      conclusion: it.conclusion || null,
+      conflict: it.conflict || null
+    };
+  });
+  return pub;
+}
+
+function createSpaceSession(sp, body, actor, cb) {
+  const now = new Date().toISOString();
+  if ((sp.sessions || []).length >= replaySession.LIMITS.SESSIONS_PER_SPACE_MAX) {
+    cb({ status: 413, code: "session_too_large",
+      message: "该回放空间的复核会话已达上限 " +
+        replaySession.LIMITS.SESSIONS_PER_SPACE_MAX });
+    return;
+  }
+  const checked = replaySession.validateCreate(
+    body, sp.reviews || [], sp.sessions || [], now);
+  if (!checked.ok) {
+    const status = checked.code === "review_not_found" ? 404
+      : (checked.code === "already_in_session" ||
+         checked.code === "duplicate_review_id") ? 409
+      : (checked.code === "session_too_large") ? 413
+      : 400;
+    cb({ status: status, code: checked.code, message: checked.message,
+      reviewId: checked.reviewId, existingSessionId: checked.existingSessionId });
+    return;
+  }
+  const v = checked.value;
+  mutateReplaySpace(sp, function () {
+    const s = {
+      id: crypto.randomUUID(),
+      version: 1,
+      name: v.name || ("复核会话 " + now.slice(0, 16).replace("T", " ")),
+      participants: v.participants,
+      deadline: v.deadline,
+      filters: v.filters,
+      createdBy: actor,
+      createdAt: now,
+      // 创建瞬间锁定：意见版本 + 引用摘要（此后会话外如何变化都不影响锁定值）
+      items: v.reviews.map(function (rv) {
+        return {
+          reviewId: rv.id,
+          lockedVersion: rv.version,
+          lockedStatus: rv.status,
+          targetSummary: replayReview.describeTarget(sp.content, rv.target),
+          conclusion: null,
+          conflict: null
+        };
+      })
+    };
+    sp.sessions.push(s);
+    addSessionLogs(sp, [sessionLogEntry(s.id, "create", actor, {
+      name: s.name, participants: s.participants, deadline: s.deadline,
+      reviewIds: v.reviewIds, filters: s.filters
+    })]);
+    sp.rev++;
+    replayStore.rev++;
+    return s;
+  }, function (failure, s) {
+    if (failure) { cb(failure); return; }
+    cb(null, { status: 201, session: publicSessionDetail(sp, s) });
+  });
+}
+
+function submitSessionConclusion(sp, s, body, cb) {
+  const now = new Date().toISOString();
+  // 过期会话明确拒绝（不改变任何状态）
+  if (replaySession.isExpired(s, now)) {
+    cb({ status: 409, code: "session_expired",
+      message: "该复核会话已于 " + s.deadline +
+        " 截止，过期会话不能再提交结论" });
+    return;
+  }
+  const checked = replaySession.validateConclusion(body);
+  if (!checked.ok) {
+    cb({ status: checked.code === "note_too_large" ? 413 : 400,
+      code: checked.code, message: checked.message });
+    return;
+  }
+  const v = checked.value;
+  if (s.participants.indexOf(v.actor) === -1) {
+    cb({ status: 403, code: "not_participant",
+      message: "只有会话参与人（" + s.participants.join("、") +
+        "）才能提交结论" });
+    return;
+  }
+  // 参与人只能处理会话内的意见
+  const item = (s.items || []).find(function (it) {
+    return it.reviewId === v.reviewId;
+  });
+  if (!item) {
+    cb({ status: 404, code: "session_item_not_found",
+      message: "意见 " + v.reviewId +
+        " 不在本会话内，参与人只能处理会话内的意见" });
+    return;
+  }
+  if (item.conclusion) {
+    cb({ status: 409, code: "conclusion_exists",
+      message: "该意见已有结论（" + item.conclusion.by + "：" +
+        (replaySession.RESULT_LABELS[item.conclusion.result] ||
+         item.conclusion.result) + "），不能重复提交覆盖" });
+    return;
+  }
+  mutateReplaySpace(sp, function () {
+    const rv = findSpaceReview(sp, item.reviewId);
+    const conflict = replaySession.checkItemConflict(item, rv, sp.content);
+    if (conflict) {
+      // 标记冲突并拒绝覆盖：冲突留痕持久化，结论不写入、意见不改动
+      item.conflict = {
+        code: conflict.code,
+        message: conflict.message,
+        at: now,
+        by: v.actor,
+        result: v.result,
+        note: v.note || null
+      };
+      s.version++;
+      addSessionLogs(sp, [sessionLogEntry(s.id, "conflict", v.actor, {
+        reviewId: item.reviewId, conflict: conflict.code,
+        message: conflict.message, result: v.result
+      })]);
+      sp.rev++;
+      replayStore.rev++;
+      return { conflict: item.conflict };
+    }
+    item.conflict = null;
+    item.conclusion = {
+      result: v.result,
+      note: v.note,
+      by: v.actor,
+      at: now,
+      reviewVersion: rv.version
+    };
+    s.version++;
+    addSessionLogs(sp, [sessionLogEntry(s.id, "conclusion", v.actor, {
+      reviewId: item.reviewId, result: v.result,
+      note: v.note || null, reviewVersion: rv.version
+    })]);
+    sp.rev++;
+    replayStore.rev++;
+    return { conclusion: item.conclusion };
+  }, function (failure, out) {
+    if (failure) { cb(failure); return; }
+    if (out.conflict) {
+      cb({ status: 409, code: "session_item_conflict",
+        message: out.conflict.message,
+        conflict: out.conflict, sessionVersion: s.version });
+      return;
+    }
+    cb(null, { status: 201, session: publicSessionDetail(sp, s) });
+  });
+}
+
 /* ---------- 导出：从线上数据只读构建审计包 ---------- */
 
 function buildReplayExport(payload) {
@@ -1350,6 +1575,9 @@ function importReplayPackage(payload, actor, cb) {
     // 历史证据复核：导入后在空间内产生，不属于审计包、不改变锁定内容
     reviews: [],
     reviewLogs: [],
+    // 复核会话：同样挂在空间上，创建时锁定所选意见版本与引用摘要
+    sessions: [],
+    sessionLogs: [],
     importedAt: now,
     importedBy: actor,
     exportedAt: pkg.exportedAt,
@@ -1727,6 +1955,12 @@ function handleReplaySpaces(req, res, seg, urlObj) {
     return;
   }
 
+  /* ---- 复核会话：创建 / 列表 / 详情 / 提交结论 / 记录 / 报告导出 ---- */
+  if (seg[1] === "sessions") {
+    handleReplaySessions(req, res, sp, seg.slice(2), urlObj);
+    return;
+  }
+
   /* GET /spaces/:id/tasks/:taskId：包内锁定的单个任务（只读） */
   if (seg.length === 3 && seg[1] === "tasks" && req.method === "GET") {
     const t = sp.content.tasks.find(function (x) { return x.id === seg[2]; });
@@ -2027,6 +2261,193 @@ function handleReplayReviews(req, res, sp, seg, urlObj) {
   }
 
   apiError(res, 404, "not_found", "复核接口不存在");
+}
+
+/* ---------- 复核会话 API ---------- */
+
+// 提交结论的双重版本检查：先空间 rev（If-Match），再会话 version
+// （X-Session-Version）。任一不匹配都拒绝且绝不写盘——旧页面无法
+// 覆盖别人刚提交的结论或刚标记的冲突。
+function checkSessionVersions(res, req, sp, s) {
+  if (checkLock(res, req.headers["if-match"], sp.rev, "回放空间")) return true;
+  const expected = parseInt((req.headers["x-session-version"] != null
+    ? req.headers["x-session-version"] : ""), 10);
+  if (!Number.isInteger(expected)) {
+    apiError(res, 428, "precondition_required",
+      "提交会话结论必须携带 X-Session-Version: <会话版本号>");
+    return true;
+  }
+  if (expected !== s.version) {
+    apiError(res, 409, "session_version_conflict",
+      "该复核会话已被其他页面更新（当前版本 " + s.version +
+      "），本次操作已取消，请刷新后重试，避免覆盖较新结论",
+      { currentVersion: s.version });
+    return true;
+  }
+  return false;
+}
+
+function handleReplaySessions(req, res, sp, seg, urlObj) {
+  // seg: [] | [":sid"] | [":sid", "conclusions"] | [":sid", "logs"] | [":sid", "report"]
+  const params = urlObj.searchParams;
+
+  /* GET /spaces/:id/sessions：会话列表（实时进度与冲突数量，不缓存） */
+  if (seg.length === 0 && req.method === "GET") {
+    const now = new Date().toISOString();
+    const list = (sp.sessions || []).slice()
+      .sort(function (a, b) {
+        // 未过期在前，再按截止时间升序、创建时间升序
+        const ea = replaySession.isExpired(a, now);
+        const eb = replaySession.isExpired(b, now);
+        if (ea !== eb) return ea ? 1 : -1;
+        const da = Date.parse(a.deadline), db = Date.parse(b.deadline);
+        if (da !== db) return da - db;
+        return a.createdAt < b.createdAt ? -1 : 1;
+      })
+      .map(function (s) { return publicSession(s, now); });
+    sendJSON(res, 200, {
+      rev: replayStore.rev, spaceRev: sp.rev,
+      count: list.length, sessions: list
+    });
+    return;
+  }
+
+  /* POST /spaces/:id/sessions：按当前筛选选集创建会话（If-Match: 空间 rev） */
+  if (seg.length === 0 && req.method === "POST") {
+    if (checkLock(res, req.headers["if-match"], sp.rev, "回放空间")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body;
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      const actor = review.validateAuthor(body.actor).value;
+      createSpaceSession(sp, body, actor, function (failure, out) {
+        if (failure) {
+          const extra = {};
+          if (failure.reviewId) extra.reviewId = failure.reviewId;
+          if (failure.existingSessionId) {
+            extra.existingSessionId = failure.existingSessionId;
+          }
+          apiError(res, failure.status, failure.code, failure.message, extra);
+          return;
+        }
+        sendJSON(res, out.status, {
+          rev: replayStore.rev, spaceRev: sp.rev, session: out.session
+        });
+      });
+    });
+    return;
+  }
+
+  if (!seg.length) {
+    apiError(res, 405, "method_not_allowed", "仅支持 GET/POST");
+    return;
+  }
+
+  const s = findSpaceSession(sp, seg[0]);
+  if (!s) {
+    apiError(res, 404, "session_not_found", "复核会话不存在或已随空间删除");
+    return;
+  }
+
+  /* GET /spaces/:id/sessions/:sid：会话详情（条目/锁定摘要/结论/冲突/实时进度） */
+  if (seg.length === 1 && req.method === "GET") {
+    sendJSON(res, 200, {
+      rev: replayStore.rev, spaceRev: sp.rev,
+      session: publicSessionDetail(sp, s)
+    });
+    return;
+  }
+
+  /* POST /spaces/:id/sessions/:sid/conclusions：参与人逐条提交结论
+     （If-Match: 空间 rev + X-Session-Version: 会话版本） */
+  if (seg.length === 2 && seg[1] === "conclusions" && req.method === "POST") {
+    if (checkSessionVersions(res, req, sp, s)) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body;
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      submitSessionConclusion(sp, s, body, function (failure, out) {
+        if (failure) {
+          const extra = {};
+          if (failure.conflict) extra.conflict = failure.conflict;
+          if (failure.sessionVersion != null) {
+            extra.sessionVersion = failure.sessionVersion;
+          }
+          apiError(res, failure.status, failure.code, failure.message, extra);
+          return;
+        }
+        sendJSON(res, out.status, {
+          rev: replayStore.rev, spaceRev: sp.rev, session: out.session
+        });
+      });
+    });
+    return;
+  }
+
+  /* GET /spaces/:id/sessions/:sid/logs：会话操作记录（?from=&to=，时间倒序） */
+  if (seg.length === 2 && seg[1] === "logs" && req.method === "GET") {
+    const from = params.get("from");
+    const to = params.get("to");
+    if (from && !replay.isISODateString(from)) {
+      apiError(res, 400, "invalid_from", "起始时间不是合法 ISO 时间"); return;
+    }
+    if (to && !replay.isISODateString(to)) {
+      apiError(res, 400, "invalid_to", "结束时间不是合法 ISO 时间"); return;
+    }
+    const logs = (sp.sessionLogs || [])
+      .filter(function (l) {
+        if (l.sessionId !== s.id) return false;
+        if (from && Date.parse(l.at) < Date.parse(from)) return false;
+        if (to && Date.parse(l.at) > Date.parse(to)) return false;
+        return true;
+      })
+      .sort(function (a, b) {
+        const d = Date.parse(b.at) - Date.parse(a.at);
+        if (d) return d;
+        return a.id < b.id ? 1 : -1;
+      });
+    sendJSON(res, 200, { rev: sp.rev, sessionId: s.id, logs: logs });
+    return;
+  }
+
+  /* POST /spaces/:id/sessions/:sid/report：导出独立会话报告
+     （纯只读，不写盘、不推任何 rev；导出失败不改变意见、会话进度或回放空间） */
+  if (seg.length === 2 && seg[1] === "report" && req.method === "POST") {
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body = {};
+      if (raw) {
+        try { body = JSON.parse(raw) || {}; }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      }
+      const built = replaySession.buildReport({
+        space: sp,
+        session: s,
+        reviews: sp.reviews || [],
+        logs: sp.sessionLogs || [],
+        generatedBy: review.validateAuthor(body.actor).value
+      });
+      if (!built.ok) {
+        apiError(res, 400, built.code, built.message);
+        return;
+      }
+      const payload = JSON.stringify(built.value, null, 2);
+      const headers = { "Content-Type": "application/json; charset=utf-8" };
+      if (params.get("download") === "1") {
+        const fname = encodeURIComponent(
+          "review-session-" + s.id.slice(0, 8) + ".json");
+        headers["Content-Disposition"] =
+          "attachment; filename=\"review-session.json\"; filename*=UTF-8''" + fname;
+      }
+      res.writeHead(200, headers);
+      res.end(payload);
+    });
+    return;
+  }
+
+  apiError(res, 404, "not_found", "复核会话接口不存在");
 }
 
 
