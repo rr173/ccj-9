@@ -40,6 +40,7 @@ const core = require("./snapshot-core");
 const review = require("./review-core");
 const decision = require("./decision-core");
 const replay = require("./replay-core");
+const replayReview = require("./replay-review-core");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
@@ -880,6 +881,11 @@ try {
     replayStore.rev = dataReplay.rev;
     replayStore.spaces = dataReplay.spaces;
     replayStore.failures = Array.isArray(dataReplay.failures) ? dataReplay.failures : [];
+    // 历史证据复核（旧版数据文件缺这些字段，启动时补齐，锁定内容 content 永不变更）
+    replayStore.spaces.forEach(function (sp) {
+      if (!Array.isArray(sp.reviews)) sp.reviews = [];
+      if (!Array.isArray(sp.reviewLogs)) sp.reviewLogs = [];
+    });
   }
 } catch (e) {
   // 文件不存在/损坏：以空存储启动，损坏文件不覆盖
@@ -935,8 +941,13 @@ function publicReplaySpace(sp) {
       decisions: sp.content.decisions.length,
       executions: sp.content.executions.length,
       events: sp.content.events.length,
-      snapshots: sp.content.snapshots.length
+      snapshots: sp.content.snapshots.length,
+      reviews: (sp.reviews || []).length,
+      openReviews: (sp.reviews || []).filter(function (r) {
+        return r.status !== "closed";
+      }).length
     },
+    reviews: (sp.reviews || []).map(publicReview),
     content: sp.content // 锁定的完整历史内容
   };
 }
@@ -965,9 +976,259 @@ function publicReplaySummary(sp) {
       decisions: c.decisions.length,
       executions: c.executions.length,
       events: c.events.length,
-      snapshots: c.snapshots.length
+      snapshots: c.snapshots.length,
+      reviews: (sp.reviews || []).length,
+      openReviews: (sp.reviews || []).filter(function (r) {
+        return r.status !== "closed";
+      }).length
     }
   };
+}
+
+/* ================= 历史证据复核 =================
+ *
+ * 复核意见挂在回放空间上（reviews + reviewLogs），与审计包锁定内容严格隔离：
+ *   - content（事件/结果/快照）导入后永不被任何复核操作改动；
+ *   - 意见必须引用空间内锁定的事件（kind=event）或逐条结果（kind=result），
+ *     每次写入都重新对锁定内容解析，目标不存在一律拒绝；
+ *   - 双重乐观并发：空间 rev（If-Match）+ 意见 version（expectedVersion），
+ *     已关闭意见拒绝修改/转派，旧页面无法覆盖关闭结论；
+ *   - 所有写操作先校验、再改内存、最后原子落盘，失败回滚；
+ *   - 复核流程只读写 replayStore，绝不调用线上暂停/审批/执行接口；
+ *   - 复核清单导出是纯只读计算，失败不触碰意见与空间。
+ */
+
+function publicReview(r) {
+  return {
+    id: r.id,
+    version: r.version,
+    target: r.target,
+    targetKey: r.targetKey,
+    status: r.status,
+    reviewer: r.reviewer,
+    dueAt: r.dueAt,
+    content: r.content,
+    createdBy: r.createdBy,
+    createdAt: r.createdAt,
+    updatedAt: r.updatedAt || null,
+    updatedBy: r.updatedBy || null,
+    closedAt: r.closedAt || null,
+    closedBy: r.closedBy || null,
+    closeReason: r.closeReason || null
+  };
+}
+
+function findSpaceReview(sp, reviewId) {
+  return (sp.reviews || []).find(function (r) { return r.id === reviewId; }) || null;
+}
+
+function addReviewLogs(sp, entries) {
+  entries.forEach(function (e) { sp.reviewLogs.push(e); });
+  if (sp.reviewLogs.length > replayReview.LIMITS.REVIEW_LOGS_PER_SPACE_MAX) {
+    sp.reviewLogs.splice(0,
+      sp.reviewLogs.length - replayReview.LIMITS.REVIEW_LOGS_PER_SPACE_MAX);
+  }
+}
+
+function reviewLogEntry(reviewId, action, actor, from, to) {
+  return {
+    id: crypto.randomUUID(),
+    reviewId: reviewId,
+    at: new Date().toISOString(),
+    action: action, // create/update/close/reassign
+    actor: actor,
+    from: from || null,
+    to: to || null
+  };
+}
+
+// 从查询参数/已保存视图提取复核筛选条件（空串表示不过滤）
+function reviewFiltersFrom(source) {
+  source = source || {};
+  return {
+    status: source.rvStatus || "",
+    reviewer: source.rvReviewer || "",
+    dueFrom: source.rvDueFrom || "",
+    dueTo: source.rvDueTo || "",
+    targetKind: source.rvTargetKind || ""
+  };
+}
+
+// 原子写盘 + 回滚的通用骨架：snapshot/rollback 在同步阶段准备，
+// 落盘失败时恢复内存（空间 rev/意见/记录都不留下半截状态）。
+function mutateReplaySpace(sp, mutator, cb) {
+  const storeSnapshot = {
+    rev: replayStore.rev,
+    spaces: replayStore.spaces,
+    failures: replayStore.failures
+  };
+  const spaceIndex = replayStore.spaces.indexOf(sp);
+  // 深拷贝空间，失败时整对象还原（含 reviews/reviewLogs/view 等全部字段）
+  const spaceBackup = JSON.parse(JSON.stringify(sp));
+  let result;
+  try {
+    result = mutator();
+  } catch (e) {
+    if (spaceIndex !== -1) replayStore.spaces[spaceIndex] = spaceBackup;
+    replayStore.rev = storeSnapshot.rev;
+    cb({ status: 500, code: "internal_error", message: e.message });
+    return;
+  }
+  persistReplay(function (err) {
+    if (err) {
+      if (spaceIndex !== -1) replayStore.spaces[spaceIndex] = spaceBackup;
+      replayStore.rev = storeSnapshot.rev;
+      cb({ status: 500, code: "persist_failed",
+        message: "复核操作落盘失败，已回滚，意见与回放空间均未被改动" });
+      return;
+    }
+    cb(null, result);
+  });
+}
+
+function createSpaceReview(sp, body, actor, cb) {
+  const now = new Date().toISOString();
+  const checked = replayReview.validateCreate(body, sp.content, now);
+  if (!checked.ok) {
+    const status = (checked.code === "review_target_not_found") ? 404
+      : (checked.code === "review_too_large") ? 413 : 400;
+    cb({ status: status, code: checked.code, message: checked.message });
+    return;
+  }
+  if ((sp.reviews || []).length >= replayReview.LIMITS.REVIEWS_PER_SPACE_MAX) {
+    cb({ status: 413, code: "review_too_large",
+      message: "该回放空间的复核意见已达上限 " +
+        replayReview.LIMITS.REVIEWS_PER_SPACE_MAX });
+    return;
+  }
+  const v = checked.value;
+  // 同一锁定目标的重复意见：目标上已有未关闭意见时明确拒绝并指出既有意见
+  const dup = replayReview.findDuplicate(sp.reviews, v.targetKey);
+  if (dup) {
+    cb({ status: 409, code: "duplicate_review",
+      message: "该事件/结果上已有一条未关闭的复核意见（" + dup.id +
+        "，状态：" + (replayReview.STATUS_LABELS[dup.status] || dup.status) +
+        "）。请在原意见上更新或关闭后再提，或先将其转派。",
+      existingReviewId: dup.id });
+    return;
+  }
+  mutateReplaySpace(sp, function () {
+    const r = {
+      id: crypto.randomUUID(),
+      version: 1,
+      target: v.target,
+      targetKey: v.targetKey,
+      status: v.status,
+      reviewer: v.reviewer,
+      dueAt: v.dueAt,
+      content: v.content,
+      createdBy: actor,
+      createdAt: now,
+      updatedAt: null,
+      updatedBy: null,
+      closedAt: null,
+      closedBy: null,
+      closeReason: null
+    };
+    sp.reviews.push(r);
+    addReviewLogs(sp, [reviewLogEntry(r.id, "create", actor, null, {
+      status: r.status, reviewer: r.reviewer, dueAt: r.dueAt
+    })]);
+    sp.rev++;
+    replayStore.rev++;
+    return r;
+  }, function (failure, r) {
+    if (failure) { cb(failure); return; }
+    cb(null, { status: 201, review: publicReview(r) });
+  });
+}
+
+function updateSpaceReview(sp, rv, body, actor, cb) {
+  const now = new Date().toISOString();
+  const checked = replayReview.validatePatch(body, now);
+  if (!checked.ok) {
+    cb({ status: checked.code === "review_too_large" ? 413 : 400,
+      code: checked.code, message: checked.message });
+    return;
+  }
+  mutateReplaySpace(sp, function () {
+    const changes = checked.value;
+    const from = {};
+    const to = {};
+    if (changes.content !== undefined) { from.content = rv.content; to.content = changes.content; rv.content = changes.content; }
+    if (changes.status !== undefined && changes.status !== rv.status) {
+      from.status = rv.status; to.status = changes.status; rv.status = changes.status;
+    }
+    if (changes.dueAt !== undefined && changes.dueAt !== rv.dueAt) {
+      from.dueAt = rv.dueAt; to.dueAt = changes.dueAt; rv.dueAt = changes.dueAt;
+    }
+    if (!Object.keys(to).length) {
+      // 没有实质变化：不产生记录、不推进版本（幂等）
+      return { unchanged: true, review: rv };
+    }
+    rv.version++;
+    rv.updatedAt = now;
+    rv.updatedBy = actor;
+    addReviewLogs(sp, [reviewLogEntry(rv.id, "update", actor, from, to)]);
+    sp.rev++;
+    replayStore.rev++;
+    return { unchanged: false, review: rv };
+  }, function (failure, out) {
+    if (failure) { cb(failure); return; }
+    cb(null, { status: 200, review: publicReview(out.review), unchanged: out.unchanged });
+  });
+}
+
+function closeSpaceReview(sp, rv, body, actor, cb) {
+  const checked = replayReview.validateCloseReason(body && body.reason);
+  if (!checked.ok) {
+    cb({ status: 400, code: checked.code, message: checked.message });
+    return;
+  }
+  mutateReplaySpace(sp, function () {
+    const prev = { status: rv.status };
+    rv.status = "closed";
+    rv.version++;
+    rv.closedAt = new Date().toISOString();
+    rv.closedBy = actor;
+    rv.closeReason = checked.value;
+    addReviewLogs(sp, [reviewLogEntry(rv.id, "close", actor, prev, {
+      status: "closed", closeReason: rv.closeReason
+    })]);
+    sp.rev++;
+    replayStore.rev++;
+    return rv;
+  }, function (failure, r) {
+    if (failure) { cb(failure); return; }
+    cb(null, { status: 200, review: publicReview(r) });
+  });
+}
+
+function reassignSpaceReview(sp, rv, body, actor, cb) {
+  const checked = replayReview.validateReassign(body);
+  if (!checked.ok) {
+    cb({ status: 400, code: checked.code, message: checked.message });
+    return;
+  }
+  mutateReplaySpace(sp, function () {
+    if (rv.reviewer === checked.value.reviewer) {
+      return { unchanged: true, review: rv };
+    }
+    const from = { reviewer: rv.reviewer };
+    rv.reviewer = checked.value.reviewer;
+    rv.version++;
+    rv.updatedAt = new Date().toISOString();
+    rv.updatedBy = actor;
+    addReviewLogs(sp, [reviewLogEntry(rv.id, "reassign", actor, from,
+      { reviewer: rv.reviewer })]);
+    sp.rev++;
+    replayStore.rev++;
+    return { unchanged: false, review: rv };
+  }, function (failure, out) {
+    if (failure) { cb(failure); return; }
+    cb(null, { status: 200, review: publicReview(out.review),
+               unchanged: out.unchanged });
+  });
 }
 
 /* ---------- 导出：从线上数据只读构建审计包 ---------- */
@@ -1086,6 +1347,9 @@ function importReplayPackage(payload, actor, cb) {
     range: pkg.range,
     manifest: pkg.manifest,
     content: pkg.content,        // 锁定的历史内容（导入后永不变更）
+    // 历史证据复核：导入后在空间内产生，不属于审计包、不改变锁定内容
+    reviews: [],
+    reviewLogs: [],
     importedAt: now,
     importedBy: actor,
     exportedAt: pkg.exportedAt,
@@ -1136,6 +1400,19 @@ function saveReplayView(sp, view, cb) {
   if (next.action && typeof next.action !== "string") {
     return { error: { status: 400, code: "invalid_action", message: "事件动作筛选非法" } };
   }
+  // 复核筛选（状态/复核人/截止时间/引用类型）同样随空间持久化，重启恢复
+  const rf = replayReview.normalizeFilters({
+    status: view.rvStatus, reviewer: view.rvReviewer,
+    dueFrom: view.rvDueFrom, dueTo: view.rvDueTo, targetKind: view.rvTargetKind
+  });
+  if (!rf.ok) {
+    return { error: { status: 400, code: rf.code, message: rf.message } };
+  }
+  next.rvStatus = rf.value.status;
+  next.rvReviewer = rf.value.reviewer;
+  next.rvDueFrom = rf.value.dueFrom;
+  next.rvDueTo = rf.value.dueTo;
+  next.rvTargetKind = rf.value.targetKind;
   sp.view = next;
   sp.rev++;
   replayStore.rev++;
@@ -1371,7 +1648,7 @@ function handleReplaySpaces(req, res, seg, urlObj) {
   }
 
   /* GET /spaces/:id/timeline：按时间线返回（可 ?taskId=&category= 实时筛选，
-     不带参数时回退到空间已保存的筛选条件） */
+     不带参数时回退到空间已保存的筛选条件）；复核意见按复核筛选挂标记 */
   if (seg.length === 2 && seg[1] === "timeline" && req.method === "GET") {
     const params = urlObj.searchParams;
     const saved = sp.view || {};
@@ -1389,13 +1666,25 @@ function handleReplaySpaces(req, res, seg, urlObj) {
       apiError(res, 400, "invalid_category", "事件类型筛选非法：" + opts.category);
       return;
     }
+    // 复核筛选：显式查询参数优先，否则回退已保存复核筛选
+    const rfInput = {
+      rvStatus: params.get("rvStatus") !== null ? params.get("rvStatus") : saved.rvStatus,
+      rvReviewer: params.get("rvReviewer") !== null ? params.get("rvReviewer") : saved.rvReviewer,
+      rvDueFrom: params.get("rvDueFrom") !== null ? params.get("rvDueFrom") : saved.rvDueFrom,
+      rvDueTo: params.get("rvDueTo") !== null ? params.get("rvDueTo") : saved.rvDueTo,
+      rvTargetKind: params.get("rvTargetKind") !== null
+        ? params.get("rvTargetKind") : saved.rvTargetKind
+    };
+    const rfNorm = replayReview.normalizeFilters(reviewFiltersFrom(rfInput));
+    if (!rfNorm.ok) { apiError(res, 400, rfNorm.code, rfNorm.message); return; }
+    const marked = replayReview.filterReviews(sp.reviews || [], rfNorm.value);
     const timeline = replay.timelineByTask(sp.content, opts);
-    const taskIndex = Object.create(null);
-    sp.content.tasks.forEach(function (t) { taskIndex[t.id] = t; });
+    replayReview.attachTimelineReviews(timeline, marked, sp.content);
     sendJSON(res, 200, {
       rev: sp.rev,
       view: saved,
       applied: opts,
+      reviewFilters: rfNorm.value,
       timeline: timeline.map(function (g) {
         return {
           taskId: g.taskId,
@@ -1407,9 +1696,34 @@ function handleReplaySpaces(req, res, seg, urlObj) {
     return;
   }
 
-  /* GET /spaces/:id/conflicts：冲突原因汇总（逐条结果） */
+  /* GET /spaces/:id/conflicts：冲突原因汇总（逐条结果，挂复核标记） */
   if (seg.length === 2 && seg[1] === "conflicts" && req.method === "GET") {
-    sendJSON(res, 200, { rev: sp.rev, summary: replay.conflictSummary(sp.content) });
+    const params = urlObj.searchParams;
+    const saved = sp.view || {};
+    const rfInput = {
+      rvStatus: params.get("rvStatus") !== null ? params.get("rvStatus") : saved.rvStatus,
+      rvReviewer: params.get("rvReviewer") !== null ? params.get("rvReviewer") : saved.rvReviewer,
+      rvDueFrom: params.get("rvDueFrom") !== null ? params.get("rvDueFrom") : saved.rvDueFrom,
+      rvDueTo: params.get("rvDueTo") !== null ? params.get("rvDueTo") : saved.rvDueTo,
+      rvTargetKind: params.get("rvTargetKind") !== null
+        ? params.get("rvTargetKind") : saved.rvTargetKind
+    };
+    const rfNorm = replayReview.normalizeFilters(reviewFiltersFrom(rfInput));
+    if (!rfNorm.ok) { apiError(res, 400, rfNorm.code, rfNorm.message); return; }
+    const marked = replayReview.filterReviews(sp.reviews || [], rfNorm.value);
+    const summary = replay.conflictSummary(sp.content);
+    replayReview.attachConflictReviews(summary, marked);
+    // 汇总中另附筛选后的全部结果类复核意见，供冲突面板统一展示与导出
+    summary.resultReviews = marked
+      .filter(function (r) { return r.target.kind === "result"; })
+      .map(publicReview);
+    sendJSON(res, 200, { rev: sp.rev, reviewFilters: rfNorm.value, summary: summary });
+    return;
+  }
+
+  /* ---- 历史证据复核：意见集合 / 单条 / 关闭 / 转派 / 状态变化记录 / 清单导出 ---- */
+  if (seg[1] === "reviews") {
+    handleReplayReviews(req, res, sp, seg.slice(2), urlObj);
     return;
   }
 
@@ -1432,7 +1746,289 @@ function handleReplaySpaces(req, res, seg, urlObj) {
   apiError(res, 404, "not_found", "回放接口不存在");
 }
 
-/* ================= HTTP 工具 ================= */
+/* ---------- 历史证据复核 API ---------- */
+
+// 读取复核意见集合的查询参数（显式参数优先，否则回退空间已保存筛选）
+function reviewQueryFilters(sp, params) {
+  const saved = sp.view || {};
+  const pick = function (name, savedVal) {
+    const v = params.get(name);
+    return v !== null ? v : (savedVal || "");
+  };
+  return {
+    status: pick("status", saved.rvStatus),
+    reviewer: pick("reviewer", saved.rvReviewer),
+    dueFrom: pick("dueFrom", saved.rvDueFrom),
+    dueTo: pick("dueTo", saved.rvDueTo),
+    targetKind: pick("targetKind", saved.rvTargetKind)
+  };
+}
+
+// 复核写操作的双重版本检查：先空间 rev（If-Match），再意见 version
+// （expectedVersion）。任一不匹配都 409 且绝不写盘——旧页面无法覆盖
+// 别人的新意见，尤其无法覆盖“已关闭”的结论。
+function checkReviewVersions(res, req, sp, rv) {
+  if (checkLock(res, req.headers["if-match"], sp.rev, "回放空间")) return true;
+  const expected = parseInt((req.headers["x-review-version"] != null
+    ? req.headers["x-review-version"] : ""), 10);
+  // 创建（rv 为空）不需要意见版本
+  if (!rv) return false;
+  if (!Number.isInteger(expected)) {
+    apiError(res, 428, "precondition_required",
+      "修改/关闭/转派复核意见必须携带 X-Review-Version: <意见版本号>");
+    return true;
+  }
+  if (expected !== rv.version) {
+    apiError(res, 409, "review_version_conflict",
+      "该复核意见已被其他页面更新（当前版本 " + rv.version +
+      "），本次操作已取消，请刷新后重试，避免覆盖较新内容",
+      { currentVersion: rv.version, currentStatus: rv.status });
+    return true;
+  }
+  if (rv.status === "closed") {
+    apiError(res, 409, "review_closed",
+      "该复核意见已关闭（关闭人 " + (rv.closedBy || "—") +
+      "），关闭结论不能再被修改或转派",
+      { currentVersion: rv.version });
+    return true;
+  }
+  return false;
+}
+
+function handleReplayReviews(req, res, sp, seg, urlObj) {
+  // seg: [] | [":rid"] | [":rid", "close"] | [":rid", "reassign"] |
+  //      [":rid", "logs"] | ["export"] | ["reviewers"]
+  const params = urlObj.searchParams;
+
+  /* GET /spaces/:id/reviews/reviewers：复核人名单（供筛选下拉，只读） */
+  if (seg.length === 1 && seg[0] === "reviewers" && req.method === "GET") {
+    const set = Object.create(null);
+    (sp.reviews || []).forEach(function (r) { set[r.reviewer] = true; });
+    sendJSON(res, 200, { rev: sp.rev, reviewers: Object.keys(set).sort() });
+    return;
+  }
+
+  /* POST /spaces/:id/reviews/export：构建独立复核清单（纯只读，不写盘、不推 rev；
+     ?download=1 给附件下载头；导出失败不触碰任何意见或空间） */
+  if (seg.length === 1 && seg[0] === "export" && req.method === "POST") {
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body = {};
+      if (raw) {
+        try { body = JSON.parse(raw) || {}; }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      }
+      // 显式筛选优先；未给的字段回退空间已保存筛选
+      const saved = sp.view || {};
+      const pick = function (v, s) { return v !== undefined && v !== null ? v : (s || ""); };
+      const filters = {
+        status: pick(body.status, saved.rvStatus),
+        reviewer: pick(body.reviewer, saved.rvReviewer),
+        dueFrom: pick(body.dueFrom, saved.rvDueFrom),
+        dueTo: pick(body.dueTo, saved.rvDueTo),
+        targetKind: pick(body.targetKind, saved.rvTargetKind)
+      };
+      const built = replayReview.buildChecklist({
+        space: sp,
+        content: sp.content,
+        reviews: sp.reviews || [],
+        reviewLogs: sp.reviewLogs || [],
+        filters: filters,
+        generatedBy: review.validateAuthor(body.actor).value
+      });
+      if (!built.ok) {
+        apiError(res, 400, built.code, built.message);
+        return;
+      }
+      const payload = JSON.stringify(built.value, null, 2);
+      const headers = { "Content-Type": "application/json; charset=utf-8" };
+      if (params.get("download") === "1") {
+        const fname = encodeURIComponent(
+          "review-checklist-" + sp.id.slice(0, 8) + ".json");
+        headers["Content-Disposition"] =
+          "attachment; filename=\"review-checklist.json\"; filename*=UTF-8''" + fname;
+      }
+      res.writeHead(200, headers);
+      res.end(payload);
+    });
+    return;
+  }
+
+  /* GET /spaces/:id/reviews：复核清单列表（按状态/复核人/截止时间/引用类型筛选） */
+  if (seg.length === 0 && req.method === "GET") {
+    const filters = reviewQueryFilters(sp, params);
+    const norm = replayReview.normalizeFilters(filters);
+    if (!norm.ok) { apiError(res, 400, norm.code, norm.message); return; }
+    const nowMs = Date.now();
+    const list = replayReview.filterReviews(sp.reviews || [], norm.value)
+      .map(function (r) {
+        const pub = publicReview(r);
+        pub.overdue = r.status !== "closed" && Date.parse(r.dueAt) < nowMs;
+        return pub;
+      })
+      .sort(function (a, b) {
+        // 未关闭在前，再按截止时间升序、创建时间升序
+        if ((a.status === "closed") !== (b.status === "closed")) {
+          return a.status === "closed" ? 1 : -1;
+        }
+        var da = Date.parse(a.dueAt), db = Date.parse(b.dueAt);
+        if (da !== db) return da - db;
+        return a.createdAt < b.createdAt ? -1 : 1;
+      });
+    sendJSON(res, 200, {
+      rev: replayStore.rev, spaceRev: sp.rev,
+      filters: norm.value,
+      count: list.length,
+      total: (sp.reviews || []).length,
+      reviews: list
+    });
+    return;
+  }
+
+  /* POST /spaces/:id/reviews：新增复核意见（If-Match: 空间 rev） */
+  if (seg.length === 0 && req.method === "POST") {
+    if (checkLock(res, req.headers["if-match"], sp.rev, "回放空间")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body;
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      const actor = review.validateAuthor(body.actor).value;
+      createSpaceReview(sp, body, actor, function (failure, out) {
+        if (failure) {
+          const extra = failure.existingReviewId
+            ? { existingReviewId: failure.existingReviewId } : {};
+          apiError(res, failure.status, failure.code, failure.message, extra);
+          return;
+        }
+        sendJSON(res, out.status, {
+          rev: replayStore.rev, spaceRev: sp.rev, review: out.review
+        });
+      });
+    });
+    return;
+  }
+
+  if (!seg.length) {
+    apiError(res, 405, "method_not_allowed", "仅支持 GET/POST");
+    return;
+  }
+
+  const rv = findSpaceReview(sp, seg[0]);
+  if (!rv) {
+    apiError(res, 404, "review_not_found", "复核意见不存在或已随空间删除");
+    return;
+  }
+
+  /* GET /spaces/:id/reviews/:rid：意见详情（含引用目标快照） */
+  if (seg.length === 1 && req.method === "GET") {
+    const pub = publicReview(rv);
+    pub.target = replayReview.describeTarget(sp.content, rv.target) ||
+      { kind: rv.target.kind, missing: true };
+    sendJSON(res, 200, { rev: sp.rev, review: pub });
+    return;
+  }
+
+  /* PUT /spaces/:id/reviews/:rid：修改内容/状态/截止时间
+     （If-Match: 空间 rev + X-Review-Version: 意见版本） */
+  if (seg.length === 1 && req.method === "PUT") {
+    if (checkReviewVersions(res, req, sp, rv)) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body;
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      const actor = review.validateAuthor(body.actor).value;
+      updateSpaceReview(sp, rv, body, actor, function (failure, out) {
+        if (failure) {
+          apiError(res, failure.status, failure.code, failure.message);
+          return;
+        }
+        sendJSON(res, 200, {
+          rev: replayStore.rev, spaceRev: sp.rev,
+          review: out.review, unchanged: !!out.unchanged
+        });
+      });
+    });
+    return;
+  }
+
+  /* POST /spaces/:id/reviews/:rid/close：关闭（终态，双重版本检查） */
+  if (seg.length === 2 && seg[1] === "close" && req.method === "POST") {
+    if (checkReviewVersions(res, req, sp, rv)) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body = {};
+      if (raw) {
+        try { body = JSON.parse(raw) || {}; }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      }
+      const actor = review.validateAuthor(body.actor).value;
+      closeSpaceReview(sp, rv, body, actor, function (failure, out) {
+        if (failure) {
+          apiError(res, failure.status, failure.code, failure.message);
+          return;
+        }
+        sendJSON(res, 200, {
+          rev: replayStore.rev, spaceRev: sp.rev, review: out.review
+        });
+      });
+    });
+    return;
+  }
+
+  /* POST /spaces/:id/reviews/:rid/reassign：转派给新复核人（终态意见拒绝） */
+  if (seg.length === 2 && seg[1] === "reassign" && req.method === "POST") {
+    if (checkReviewVersions(res, req, sp, rv)) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body;
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      const actor = review.validateAuthor(body.actor).value;
+      reassignSpaceReview(sp, rv, body, actor, function (failure, out) {
+        if (failure) {
+          apiError(res, failure.status, failure.code, failure.message);
+          return;
+        }
+        sendJSON(res, 200, {
+          rev: replayStore.rev, spaceRev: sp.rev, review: out.review
+        });
+      });
+    });
+    return;
+  }
+
+  /* GET /spaces/:id/reviews/:rid/logs：该意见的状态变化记录，支持 ?from=&to= */
+  if (seg.length === 2 && seg[1] === "logs" && req.method === "GET") {
+    const from = params.get("from");
+    const to = params.get("to");
+    if (from && !replay.isISODateString(from)) {
+      apiError(res, 400, "invalid_from", "起始时间不是合法 ISO 时间"); return;
+    }
+    if (to && !replay.isISODateString(to)) {
+      apiError(res, 400, "invalid_to", "结束时间不是合法 ISO 时间"); return;
+    }
+    const logs = (sp.reviewLogs || [])
+      .filter(function (l) {
+        if (l.reviewId !== rv.id) return false;
+        if (from && Date.parse(l.at) < Date.parse(from)) return false;
+        if (to && Date.parse(l.at) > Date.parse(to)) return false;
+        return true;
+      })
+      .sort(function (a, b) {
+        // 时间倒序（与线上批次/决策记录一致），同毫秒按 id 稳定排序
+        var d = Date.parse(b.at) - Date.parse(a.at);
+        if (d) return d;
+        return a.id < b.id ? 1 : -1;
+      });
+    sendJSON(res, 200, { rev: sp.rev, reviewId: rv.id, logs: logs });
+    return;
+  }
+
+  apiError(res, 404, "not_found", "复核接口不存在");
+}
+
 
 function sendJSON(res, status, body, headers) {
   const payload = JSON.stringify(body);

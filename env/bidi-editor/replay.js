@@ -13,6 +13,7 @@
   "use strict";
 
   var Core = window.ReplayCore;
+  var RC = window.ReplayReviewCore;
 
   var CATEGORY_LABELS = {
     wait: "等待",
@@ -23,6 +24,8 @@
     cancel: "取消"
   };
   var CATEGORY_ORDER = ["wait", "approval", "config", "execute", "retry", "cancel"];
+  var REVIEW_STATUS_LABELS = RC ? RC.STATUS_LABELS : {};
+  var REVIEW_STATUS_ORDER = ["open", "in_review", "confirmed", "returned", "closed"];
 
   /* ---------- 基础工具 ---------- */
 
@@ -104,6 +107,7 @@
     options = options || {};
     var headers = { "Accept": "application/json" };
     if (options.ifMatch != null) headers["If-Match"] = String(options.ifMatch);
+    if (options.rvVersion != null) headers["X-Review-Version"] = String(options.rvVersion);
     var init = { method: method, headers: headers };
     if (options.body != null) {
       headers["Content-Type"] = "application/json; charset=utf-8";
@@ -426,7 +430,7 @@
     });
   }
 
-  /* ================= 回放空间详情（时间线） ================= */
+  /* ================= 回放空间详情（时间线 + 历史证据复核） ================= */
 
   function openSpace(spaceId) {
     var box = el("div", "replay-space-view");
@@ -437,7 +441,7 @@
     var header = el("div", "replay-detail-head");
     var note = el("div", "replay-locked-note",
       "🔒 以下为审计包锁定的历史内容（只读）。此处不会调用任何线上接口，" +
-      "不能暂停、审批或执行。");
+      "不能暂停、审批或执行。复核意见只挂在本回放空间上，不改变锁定内容。");
     var filters = el("div", "replay-filters");
     var taskSelect = el("select");
     taskSelect.appendChild(new Option("全部任务", ""));
@@ -461,19 +465,70 @@
     filters.appendChild(btnSaveView);
     filters.appendChild(spaceRevBox);
 
+    // —— 历史证据复核筛选条（状态 / 复核人 / 截止时间区间 / 引用类型） ——
+    var rvFilters = el("div", "replay-rv-filters");
+    var rvStatusSelect = el("select");
+    rvStatusSelect.appendChild(new Option("全部复核状态", ""));
+    REVIEW_STATUS_ORDER.forEach(function (s) {
+      rvStatusSelect.appendChild(new Option(REVIEW_STATUS_LABELS[s], s));
+    });
+    var rvReviewerSelect = el("select");
+    rvReviewerSelect.appendChild(new Option("全部复核人", ""));
+    var rvDueFrom = el("input"); rvDueFrom.type = "datetime-local"; rvDueFrom.step = "1";
+    var rvDueTo = el("input"); rvDueTo.type = "datetime-local"; rvDueTo.step = "1";
+    var rvKindSelect = el("select");
+    rvKindSelect.appendChild(new Option("全部引用", ""));
+    rvKindSelect.appendChild(new Option("引用：时间线事件", "event"));
+    rvKindSelect.appendChild(new Option("引用：逐条结果", "result"));
+    var btnRvApply = button("应用复核筛选");
+    var btnRvClear = button("清除复核筛选");
+    var btnExportChecklist = button("⬇ 导出复核清单", "primary");
+    rvFilters.appendChild(el("label", null, "复核："));
+    rvFilters.appendChild(rvStatusSelect);
+    rvFilters.appendChild(rvReviewerSelect);
+    rvFilters.appendChild(el("label", null, "截止自"));
+    rvFilters.appendChild(rvDueFrom);
+    rvFilters.appendChild(el("label", null, "至"));
+    rvFilters.appendChild(rvDueTo);
+    rvFilters.appendChild(rvKindSelect);
+    rvFilters.appendChild(btnRvApply);
+    rvFilters.appendChild(btnRvClear);
+    rvFilters.appendChild(btnExportChecklist);
+
     var summary = el("div", "replay-detail-summary");
+    var rvSection = el("div", "replay-rv-section");
     var timeline = el("div", "replay-timeline");
     box.appendChild(header);
     box.appendChild(note);
     box.appendChild(filters);
+    box.appendChild(rvFilters);
     box.appendChild(summary);
+    box.appendChild(rvSection);
     box.appendChild(timeline);
 
     var view = { rev: 1, taskId: "", category: "", action: "" };
+    var currentSpace = null;
+
+    function rvQuery() {
+      var q = {};
+      if (rvStatusSelect.value) q.rvStatus = rvStatusSelect.value;
+      if (rvReviewerSelect.value) q.rvReviewer = rvReviewerSelect.value;
+      if (rvDueFrom.value) q.rvDueFrom = new Date(rvDueFrom.value).toISOString();
+      if (rvDueTo.value) q.rvDueTo = new Date(rvDueTo.value).toISOString();
+      if (rvKindSelect.value) q.rvTargetKind = rvKindSelect.value;
+      return q;
+    }
+    function rvQueryString(prefix) {
+      var q = rvQuery();
+      return Object.keys(q).map(function (k) {
+        return encodeURIComponent(k) + "=" + encodeURIComponent(q[k]);
+      }).join("&");
+    }
 
     function loadDetail() {
       return api("GET", "/api/replay/spaces/" + spaceId).then(function (r) {
         var sp = r.data.space;
+        currentSpace = sp;
         view.rev = sp.rev;
         spaceRevBox.textContent = "空间版本 " + sp.rev;
         modal.setTitle("回放：" + sp.name);
@@ -492,6 +547,9 @@
         val.appendChild(el("span", "replay-badge",
           "事件链头 " + (sp.validation.chainHead || "").slice(0, 20) + "…"));
         val.appendChild(el("span", "replay-badge", "事件 " + sp.validation.eventCount));
+        val.appendChild(el("span", "replay-badge",
+          "复核意见 " + (sp.counts.reviews || 0) + "（未关闭 " +
+          (sp.counts.openReviews || 0) + "）"));
         header.appendChild(val);
 
         // 任务下拉
@@ -504,13 +562,28 @@
         });
         taskSelect.value = prevTask;
 
-        // 恢复已保存筛选
+        // 恢复已保存筛选（事件 + 复核）
         if (sp.view) {
           taskSelect.value = sp.view.taskId || "";
           catSelect.value = sp.view.category || "";
+          rvStatusSelect.value = sp.view.rvStatus || "";
+          rvKindSelect.value = sp.view.rvTargetKind || "";
         }
         return sp;
       });
+    }
+
+    function refreshReviewerOptions() {
+      return api("GET", "/api/replay/spaces/" + spaceId + "/reviews/reviewers")
+        .then(function (r) {
+          var prev = rvReviewerSelect.value;
+          rvReviewerSelect.innerHTML = "";
+          rvReviewerSelect.appendChild(new Option("全部复核人", ""));
+          (r.data.reviewers || []).forEach(function (name) {
+            rvReviewerSelect.appendChild(new Option(name, name));
+          });
+          rvReviewerSelect.value = prev;
+        }).catch(function () {});
     }
 
     function loadTimeline() {
@@ -518,6 +591,8 @@
       if (taskSelect.value) q.push("taskId=" + encodeURIComponent(taskSelect.value));
       if (catSelect.value) q.push("category=" + encodeURIComponent(catSelect.value));
       if (actionSelect.value) q.push("action=" + encodeURIComponent(actionSelect.value));
+      var rvq = rvQueryString();
+      if (rvq) q.push(rvq);
       timeline.textContent = "加载时间线…";
       return api("GET", "/api/replay/spaces/" + spaceId + "/timeline" +
         (q.length ? "?" + q.join("&") : "")).then(function (r) {
@@ -535,7 +610,76 @@
           actionSelect.appendChild(new Option(a, a));
         });
         actionSelect.value = prevAction;
-        renderTimeline(timeline, d, spaceId);
+        renderTimeline(timeline, d, spaceId, ui);
+      });
+    }
+
+    function loadReviewsPanel() {
+      var rvq = rvQueryString();
+      return api("GET", "/api/replay/spaces/" + spaceId + "/reviews" +
+        (rvq ? "?" + rvq : "")).then(function (r) {
+        renderReviewsPanel(rvSection, r.data, function (id) { ui.openReview(id); });
+      });
+    }
+
+    var ui = {
+      spaceId: function () { return spaceId; },
+      spaceRev: function () { return view.rev; },
+      bumpSpaceRev: function (rev) {
+        view.rev = rev;
+        spaceRevBox.textContent = "空间版本 " + rev;
+      },
+      // 在指定锁定目标上新建复核意见
+      addReview: function (target) { openReviewEditor(spaceId, target, ui, afterReviewChange); },
+      openReview: function (id) { openReviewDetail(spaceId, id, ui, afterReviewChange); },
+      reloadAll: function () { afterReviewChange(); }
+    };
+
+    function afterReviewChange() {
+      // 详情先刷新（拿到最新空间 rev），再并行刷新三个视图；任何一个失败不影响其他
+      return loadDetail().then(function () {
+        return Promise.all([
+          refreshReviewerOptions().catch(function () {}),
+          loadTimeline().catch(function (e) { toast("时间线刷新失败：" + e.message, "error"); }),
+          loadReviewsPanel().catch(function (e) { toast("复核列表刷新失败：" + e.message, "error"); }),
+          loadConflicts().catch(function (e) { toast("冲突刷新失败：" + e.message, "error"); })
+        ]);
+      });
+    }
+
+    function loadConflicts() {
+      var rvq = rvQueryString();
+      return api("GET", "/api/replay/spaces/" + spaceId + "/conflicts" +
+        (rvq ? "?" + rvq : "")).then(function (cr) {
+        summary.innerHTML = "";
+        var sum = cr.data.summary;
+        if (sum.items && sum.items.length) {
+          var cbox = el("div", "replay-conflict-box");
+          cbox.appendChild(el("b", null, "冲突条目 " + sum.items.length + " 条（点击可对逐条结果复核）："));
+          Object.keys(sum.counts).forEach(function (reason) {
+            cbox.appendChild(el("span", "replay-badge replay-badge-danger",
+              reason + " × " + sum.counts[reason]));
+          });
+          sum.items.forEach(function (item) {
+            var row = el("div", "replay-conflict-item");
+            row.appendChild(el("code", null, (item.annotationId || "").slice(0, 8)));
+            row.appendChild(el("span", null, " " + item.reason));
+            var addBtn = button("＋ 复核此结果", "replay-link", function () {
+              ui.addReview({ kind: "result",
+                executionId: item.executionId, annotationId: item.annotationId });
+            });
+            row.appendChild(addBtn);
+            (item.reviews || []).forEach(function (m) {
+              var tag = el("button", "replay-rv-mini replay-rv-status-" + m.status,
+                REVIEW_STATUS_LABELS[m.status] + " · " + m.reviewer);
+              tag.title = "查看复核意见 " + m.id;
+              tag.addEventListener("click", function () { ui.openReview(m.id); });
+              row.appendChild(tag);
+            });
+            cbox.appendChild(row);
+          });
+          summary.appendChild(cbox);
+        }
       });
     }
 
@@ -543,10 +687,14 @@
       loadTimeline().catch(function (e) { toast(e.message, "error"); });
     });
     btnSaveView.addEventListener("click", function () {
-      api("PUT", "/api/replay/spaces/" + spaceId + "/view", {
+      var body = {
         taskId: taskSelect.value, category: catSelect.value,
         action: actionSelect.value, annotationId: ""
-      }, { ifMatch: view.rev }).then(function (r) {
+      };
+      var q = rvQuery();
+      Object.keys(q).forEach(function (k) { body[k] = q[k]; });
+      api("PUT", "/api/replay/spaces/" + spaceId + "/view", body,
+        { ifMatch: view.rev }).then(function (r) {
         view.rev = r.data.spaceRev;
         spaceRevBox.textContent = "空间版本 " + view.rev;
         toast("筛选条件已保存，重启后仍恢复");
@@ -557,31 +705,80 @@
         } else toast("保存筛选失败：" + e.message, "error");
       });
     });
+    btnRvApply.addEventListener("click", function () {
+      Promise.all([loadTimeline(), loadReviewsPanel(), loadConflicts()])
+        .catch(function (e) { toast(e.message, "error"); });
+    });
+    btnRvClear.addEventListener("click", function () {
+      rvStatusSelect.value = ""; rvReviewerSelect.value = "";
+      rvDueFrom.value = ""; rvDueTo.value = ""; rvKindSelect.value = "";
+      Promise.all([loadTimeline(), loadReviewsPanel(), loadConflicts()]);
+    });
+    btnExportChecklist.addEventListener("click", function () {
+      exportChecklist(spaceId, rvQuery());
+    });
 
-    loadDetail().then(function (sp) {
-      // 默认载入已保存筛选对应的时间线
-      return loadTimeline().then(function () {
-        // 冲突摘要
-        return api("GET", "/api/replay/spaces/" + spaceId + "/conflicts");
-      }).then(function (cr) {
-        var sum = cr.data.summary;
-        if (sum.items && sum.items.length) {
-          var cbox = el("div", "replay-conflict-box");
-          cbox.appendChild(el("b", null, "冲突条目 " + sum.items.length + " 条："));
-          Object.keys(sum.counts).forEach(function (reason) {
-            cbox.appendChild(el("span", "replay-badge replay-badge-danger",
-              reason + " × " + sum.counts[reason]));
-          });
-          summary.appendChild(cbox);
+    loadDetail()
+      .then(refreshReviewerOptions)
+      .then(function () {
+        // 恢复已保存的复核人筛选
+        if (currentSpace && currentSpace.view && currentSpace.view.rvReviewer) {
+          rvReviewerSelect.value = currentSpace.view.rvReviewer;
         }
-        return sp;
+        return Promise.all([loadTimeline(), loadReviewsPanel(), loadConflicts()]);
+      })
+      .catch(function (e) {
+        timeline.textContent = "加载失败：" + e.message;
       });
-    }).catch(function (e) {
-      timeline.textContent = "加载失败：" + e.message;
+  }
+
+  /* ---------- 复核意见列表面板 ---------- */
+
+  function renderReviewsPanel(container, data, onOpen) {
+    container.innerHTML = "";
+    var head = el("div", "replay-rv-head");
+    var title = el("b", null, "📝 历史证据复核");
+    head.appendChild(title);
+    head.appendChild(el("span", "snap-note",
+      "命中 " + data.count + " / 共 " + data.total + " 条（按状态/复核人/截止时间筛选）"));
+    container.appendChild(head);
+
+    if (!data.reviews.length) {
+      container.appendChild(el("div", "replay-empty",
+        "当前筛选下没有复核意见。可在时间线事件或冲突结果上点击“＋ 复核”添加。"));
+      return;
+    }
+    data.reviews.forEach(function (rv) {
+      var card = el("div", "replay-rv-card replay-rv-status-" + rv.status);
+      var top = el("div", "replay-rv-card-top");
+      top.appendChild(el("span", "replay-badge replay-rv-badge replay-rv-badge-" + rv.status,
+        REVIEW_STATUS_LABELS[rv.status] || rv.status));
+      top.appendChild(el("span", null, "复核人：" + rv.reviewer));
+      top.appendChild(el("span", null, "截止 " + formatTime(rv.dueAt) +
+        (rv.overdue ? "（已逾期）" : "")));
+      top.appendChild(el("span", "snap-rev", "v" + rv.version));
+      if (rv.status === "closed") {
+        top.appendChild(el("span", null, "关闭于 " + formatTime(rv.closedAt)));
+      }
+      var targetTag = rv.target.kind === "event"
+        ? "事件 " + rv.target.eventId.slice(0, 8)
+        : "结果 " + rv.target.executionId.slice(0, 8) + "/" +
+          (rv.target.annotationId || "").slice(0, 8);
+      top.appendChild(el("code", "replay-rv-target", targetTag));
+      card.appendChild(top);
+      card.appendChild(el("div", "replay-rv-content", rv.content));
+      if (rv.closeReason) card.appendChild(el("div", "replay-rv-close-reason",
+        "关闭说明：" + rv.closeReason));
+      var actions = el("div", "replay-rv-card-actions");
+      actions.appendChild(button("查看/处理", "replay-link", function () {
+        onOpen(rv.id);
+      }));
+      card.appendChild(actions);
+      container.appendChild(card);
     });
   }
 
-  function renderTimeline(container, d, spaceId) {
+  function renderTimeline(container, d, spaceId, ui) {
     container.innerHTML = "";
     var total = 0;
     d.timeline.forEach(function (g) { total += g.events.length; });
@@ -629,11 +826,314 @@
           refs.appendChild(snapLink);
         }
         if (refs.children.length) li.appendChild(refs);
+
+        // —— 复核标记（已应用复核筛选，可能为空） ——
+        var rvLine = el("div", "replay-tl-rvs");
+        (ev.reviews || []).forEach(function (m) {
+          var tag = el("button", "replay-rv-mini replay-rv-status-" + m.status,
+            "🔍 " + (REVIEW_STATUS_LABELS[m.status] || m.status) + " · " + m.reviewer +
+            (m.closedAt ? "（已关闭）" : ""));
+          tag.title = "查看复核意见 " + m.id;
+          tag.addEventListener("click", function () { ui.openReview(m.id); });
+          rvLine.appendChild(tag);
+        });
+        var addBtn = el("button", "replay-link replay-rv-add", "＋ 复核此事件");
+        addBtn.title = "针对此锁定事件新增复核意见（历史内容仍只读）";
+        addBtn.addEventListener("click", function () {
+          ui.addReview({ kind: "event", eventId: ev.id });
+        });
+        rvLine.appendChild(addBtn);
+        li.appendChild(rvLine);
+
         ul.appendChild(li);
       });
       group.appendChild(ul);
       container.appendChild(group);
     });
+  }
+
+  /* ---------- 历史证据复核：新建/详情弹窗、清单导出 ---------- */
+
+  function dtLocalNow(offsetMs) {
+    var d = new Date(Date.now() + (offsetMs || 86400000));
+    var p = function (n) { return String(n).padStart(2, "0"); };
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+      "T" + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+
+  function targetLabel(target) {
+    return target.kind === "event"
+      ? "锁定事件 " + target.eventId.slice(0, 8)
+      : "锁定逐条结果 " + target.executionId.slice(0, 8) + "/" +
+        (target.annotationId || "").slice(0, 8);
+  }
+
+  // 新建复核意见（目标必须为空间内锁定事件/结果，表单内可见目标摘要）
+  function openReviewEditor(spaceId, target, ui, onDone) {
+    var box = el("div", "replay-rv-editor");
+    box.appendChild(el("div", "replay-locked-note",
+      "🔒 复核引用：" + targetLabel(target) +
+      "。复核意见只属于本回放空间，不会改动锁定历史，也不会调用任何线上接口。"));
+
+    var reviewerInput = el("input");
+    reviewerInput.type = "text"; reviewerInput.maxLength = 50;
+    reviewerInput.placeholder = "复核人（必填，最长 50 字符）";
+    var contentInput = el("textarea");
+    contentInput.rows = 4; contentInput.maxLength = 2000;
+    contentInput.placeholder = "复核意见（必填，最长 2000 字符）";
+    var dueInput = el("input");
+    dueInput.type = "datetime-local"; dueInput.step = "1";
+    dueInput.value = dtLocalNow(86400000);
+    var statusSelect = el("select");
+    [["open", "待复核"], ["in_review", "复核中"], ["confirmed", "已确认"],
+     ["returned", "已退回"]].forEach(function (p) {
+      statusSelect.appendChild(new Option(p[1], p[0]));
+    });
+    var errBox = el("div", "replay-rv-err");
+
+    function field(label, input) {
+      var row = el("div", "replay-rv-field");
+      row.appendChild(el("label", null, label));
+      row.appendChild(input);
+      return row;
+    }
+    box.appendChild(field("复核人", reviewerInput));
+    box.appendChild(field("复核意见", contentInput));
+    box.appendChild(field("截止时间（必填，须晚于当前）", dueInput));
+    box.appendChild(field("初始状态", statusSelect));
+    box.appendChild(errBox);
+
+    var modal2;
+    var btnSubmit = button("提交复核意见", "primary", function () {
+      errBox.textContent = "";
+      var dueVal = dueInput.value ? new Date(dueInput.value).toISOString() : null;
+      btnSubmit.disabled = true;
+      api("POST", "/api/replay/spaces/" + spaceId + "/reviews", {
+        target: target,
+        reviewer: reviewerInput.value,
+        content: contentInput.value,
+        dueAt: dueVal,
+        status: statusSelect.value,
+        actor: "负责人"
+      }, { ifMatch: ui.spaceRev() }).then(function (r) {
+        ui.bumpSpaceRev(r.data.spaceRev);
+        toast("复核意见已添加");
+        modal2.close();
+        onDone();
+      }).catch(function (e) {
+        btnSubmit.disabled = false;
+        if (e.code === "version_conflict") {
+          toast("空间版本已变化，已自动刷新", "error");
+          modal2.close(); ui.reloadAll();
+        } else if (e.code === "duplicate_review") {
+          errBox.textContent = "该事件/结果上已有未关闭的复核意见" +
+            (e.data && e.data.existingReviewId ? "（" + e.data.existingReviewId.slice(0, 8) + "）" : "") +
+            "，请在原意见上更新或先关闭。";
+          toast("重复复核意见已被拒绝", "error");
+        } else {
+          errBox.textContent = "提交失败：" + e.message;
+        }
+      });
+    });
+    modal2 = openModal("新增历史证据复核", box, {
+      buttons: [btnSubmit, button("取消", null, function () {})]
+    });
+  }
+
+  // 复核意见详情：查看引用目标、修改内容/状态/截止、转派、关闭、状态变化记录
+  function openReviewDetail(spaceId, reviewId, ui, onDone) {
+    api("GET", "/api/replay/spaces/" + spaceId + "/reviews/" + reviewId).then(function (r) {
+      var rv = r.data.review;
+      var closed = rv.status === "closed";
+      var box = el("div", "replay-rv-detail");
+
+      var top = el("div", "replay-rv-card-top");
+      top.appendChild(el("span", "replay-badge replay-rv-badge replay-rv-badge-" + rv.status,
+        REVIEW_STATUS_LABELS[rv.status] || rv.status));
+      top.appendChild(el("span", null, "复核人：" + rv.reviewer));
+      top.appendChild(el("span", "snap-rev", "版本 v" + rv.version));
+      box.appendChild(top);
+      box.appendChild(el("div", "snap-note",
+        "引用：" + targetLabel(rv.target) +
+        (rv.target && rv.target.missing ? "（目标缺失）" : "")));
+
+      // 引用目标快照（只读）
+      if (rv.target && rv.target.kind === "event" && rv.target.event) {
+        var e = rv.target.event;
+        var evBox = el("div", "replay-rv-target-box");
+        evBox.appendChild(el("div", null, "锁定事件（只读）"));
+        evBox.appendChild(el("code", null,
+          formatTime(e.at) + " · " + e.action + " · " + (e.actor || "—")));
+        if (e.detail) evBox.appendChild(el("div", "replay-tl-detail", e.detail));
+        box.appendChild(evBox);
+      } else if (rv.target && rv.target.kind === "result" && rv.target.result) {
+        var res = rv.target.result;
+        var resBox = el("div", "replay-rv-target-box");
+        resBox.appendChild(el("div", null, "锁定逐条结果（只读）"));
+        resBox.appendChild(el("code", null,
+          "批注 " + (res.annotationId || "").slice(0, 8) + " · " + res.result +
+          (res.reason ? " · " + res.reason : "")));
+        box.appendChild(resBox);
+      }
+
+      if (closed) {
+        box.appendChild(el("div", "replay-rv-content", rv.content));
+        box.appendChild(el("div", "snap-note",
+          "🔒 已关闭于 " + formatTime(rv.closedAt) + "（" + (rv.closedBy || "—") + "）" +
+          (rv.closeReason ? "：" + rv.closeReason : "")));
+        box.appendChild(el("div", "replay-locked-note",
+          "已关闭的意见为终态，不能再修改或转派（旧页面提交会被服务端拒绝）。"));
+      } else {
+        var contentInput = el("textarea");
+        contentInput.rows = 3; contentInput.maxLength = 2000;
+        contentInput.value = rv.content;
+        var statusSelect = el("select");
+        [["open", "待复核"], ["in_review", "复核中"], ["confirmed", "已确认"],
+         ["returned", "已退回"]].forEach(function (p) {
+          var o = new Option(p[1], p[0]);
+          if (p[0] === rv.status) o.selected = true;
+          statusSelect.appendChild(o);
+        });
+        var dueInput = el("input");
+        dueInput.type = "datetime-local"; dueInput.step = "1";
+        // datetime-local 使用本地时间
+        dueInput.value = (function () {
+          var d = new Date(rv.dueAt); var p = function (n) { return String(n).padStart(2, "0"); };
+          return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+            "T" + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+        })();
+
+        var row1 = el("div", "replay-rv-field");
+        row1.appendChild(el("label", null, "意见内容")); row1.appendChild(contentInput);
+        var row2 = el("div", "replay-rv-field");
+        row2.appendChild(el("label", null, "状态")); row2.appendChild(statusSelect);
+        var row3 = el("div", "replay-rv-field");
+        row3.appendChild(el("label", null, "截止时间")); row3.appendChild(dueInput);
+        box.appendChild(row1); box.appendChild(row2); box.appendChild(row3);
+      }
+
+      var errBox = el("div", "replay-rv-err");
+      box.appendChild(errBox);
+
+      // 状态变化记录
+      var logBox = el("div", "replay-rv-logs");
+      logBox.appendChild(el("b", null, "状态变化记录"));
+      api("GET", "/api/replay/spaces/" + spaceId + "/reviews/" + reviewId + "/logs")
+        .then(function (lr) {
+          (lr.data.logs || []).forEach(function (l) {
+            var line = el("div", "replay-rv-log");
+            line.appendChild(el("span", null, formatTime(l.at) + " "));
+            line.appendChild(el("code", null, l.action));
+            line.appendChild(el("span", null, " " + l.actor));
+            if (l.to) line.appendChild(el("span", "snap-note",
+              " → " + JSON.stringify(l.to)));
+            logBox.appendChild(line);
+          });
+        }).catch(function () {});
+      box.appendChild(logBox);
+
+      var modal2;
+      function handleConflict(e, action) {
+        if (e.code === "review_closed") {
+          errBox.textContent = "该意见已被其他页面关闭，终态不能覆盖。窗口将自动刷新。";
+          toast("意见已关闭，操作被拒绝", "error");
+          setTimeout(function () { modal2.close(); onDone(); }, 900);
+        } else if (e.code === "review_version_conflict") {
+          errBox.textContent = "意见版本已变化（当前 v" +
+            (e.data && e.data.currentVersion) + "），旧表单不能覆盖。窗口将自动刷新。";
+          toast("复核意见版本冲突", "error");
+          setTimeout(function () {
+            modal2.close();
+            openReviewDetail(spaceId, reviewId, ui, onDone);
+            onDone();
+          }, 900);
+        } else if (e.code === "version_conflict") {
+          toast("空间版本已变化，已自动刷新", "error");
+          modal2.close(); ui.reloadAll();
+        } else {
+          errBox.textContent = action + "失败：" + e.message;
+        }
+      }
+      function versions() {
+        return { ifMatch: ui.spaceRev(), rvVersion: rv.version };
+      }
+
+      var buttons = [button("关闭窗口", null, function () {})];
+      if (!closed) {
+        var btnSave = button("保存修改");
+        btnSave.addEventListener("click", function () {
+          var body = { actor: "负责人" };
+          var changed = false;
+          if (contentInput.value.trim() !== rv.content) {
+            body.content = contentInput.value; changed = true;
+          }
+          if (statusSelect.value !== rv.status) {
+            body.status = statusSelect.value; changed = true;
+          }
+          var newDue = new Date(dueInput.value).toISOString();
+          if (newDue !== rv.dueAt) { body.dueAt = newDue; changed = true; }
+          if (!changed) { toast("内容没有变化"); return; }
+          btnSave.disabled = true;
+          api("PUT", "/api/replay/spaces/" + spaceId + "/reviews/" + reviewId, body,
+            { ifMatch: versions().ifMatch, rvVersion: versions().rvVersion })
+            .then(function (pr) {
+              ui.bumpSpaceRev(pr.data.spaceRev);
+              rv.version = pr.data.review.version;
+              toast(pr.data.unchanged ? "内容无变化" : "复核意见已更新");
+              modal2.close(); onDone();
+            }).catch(function (e) { btnSave.disabled = false; handleConflict(e, "保存"); });
+        });
+        var btnReassign = button("转派…");
+        btnReassign.addEventListener("click", function () {
+          var name = window.prompt("转派给哪位复核人？", "");
+          if (name === null) return;
+          api("POST",
+            "/api/replay/spaces/" + spaceId + "/reviews/" + reviewId + "/reassign",
+            { reviewer: name, actor: "负责人" },
+            { ifMatch: ui.spaceRev(), rvVersion: rv.version })
+            .then(function (pr) {
+              ui.bumpSpaceRev(pr.data.spaceRev);
+              toast(pr.data.unchanged ? "复核人本就是 " + pr.data.review.reviewer
+                                      : "已转派给 " + pr.data.review.reviewer);
+              modal2.close(); onDone();
+            }).catch(function (e) { handleConflict(e, "转派"); });
+        });
+        var btnClose = button("关闭意见", "danger", function () {
+          var reason = window.prompt("关闭说明（可留空）：", "");
+          if (reason === null) return;
+          api("POST",
+            "/api/replay/spaces/" + spaceId + "/reviews/" + reviewId + "/close",
+            { reason: reason, actor: "负责人" },
+            { ifMatch: ui.spaceRev(), rvVersion: rv.version })
+            .then(function (pr) {
+              ui.bumpSpaceRev(pr.data.spaceRev);
+              toast("复核意见已关闭（终态）");
+              modal2.close(); onDone();
+            }).catch(function (e) { handleConflict(e, "关闭"); });
+        });
+        buttons = [btnSave, btnReassign, btnClose].concat(buttons);
+      }
+      modal2 = openModal("复核意见 " + reviewId.slice(0, 8), box, { buttons: buttons });
+    }).catch(function (e) { toast("加载复核意见失败：" + e.message, "error"); });
+  }
+
+  // 导出独立复核清单：纯只读下载；服务端不写盘、失败不改变空间
+  function exportChecklist(spaceId, filters) {
+    fetch("/api/replay/spaces/" + spaceId + "/reviews/export?download=1", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.assign({ actor: "负责人" }, filters))
+    }).then(function (res) {
+      if (!res.ok) return res.json().then(function (j) { throw new Error(j.message); });
+      return res.blob().then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url; a.download = "review-checklist-" + spaceId.slice(0, 8) + ".json";
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+        toast("已导出独立复核清单（只读，不改变回放空间与任何意见）");
+      });
+    }).catch(function (e) { toast("复核清单导出失败（已有意见未被改动）：" + e.message, "error"); });
   }
 
   // 快照详情（包内锁定，只读）
