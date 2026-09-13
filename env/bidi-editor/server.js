@@ -43,6 +43,7 @@ const replay = require("./replay-core");
 const replayReview = require("./replay-review-core");
 const replaySession = require("./replay-session-core");
 const replayArchive = require("./replay-archive-core");
+const replayReconcile = require("./replay-reconcile-core");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
@@ -59,6 +60,9 @@ const REPLAY_FILE = process.env.REPLAY_SPACES_FILE ||
 // 复核会话归档中心：与回放空间、线上四集合完全隔离的独立存储
 const ARCHIVE_FILE = process.env.REPLAY_ARCHIVES_FILE ||
   path.join(ROOT, "data", "replay-archives.json");
+// 归档差异与纠错对账中心：差异结果 / 纠错批次 / 纠错归档 / 审批记录 / 失败留痕
+const RECONCILE_FILE = process.env.REPLAY_RECONCILE_FILE ||
+  path.join(ROOT, "data", "replay-reconcile.json");
 const REQUEST_BODY_LIMIT = 4 * 1024 * 1024; // 传输字节上限（校验逻辑另有字符上限）
 // 审计包内含锁定文本，允许更大的导入请求体（可用环境变量覆盖）
 const REPLAY_BODY_LIMIT = Number(process.env.REPLAY_BODY_LIMIT_BYTES) ||
@@ -898,6 +902,9 @@ try {
   // 文件不存在/损坏：以空存储启动，损坏文件不覆盖
 }
 
+// 对账中心崩溃对账依赖 reconcileStore，实际清理在 reconcileStore 载入后执行
+// （见下方 reconcileCrashRecovery）。
+
 /* ================= 复核会话归档中心（独立存储） =================
  *
  * 归档中心与回放空间、线上四集合完全隔离：
@@ -963,6 +970,146 @@ try {
 
 function findArchive(id) {
   return archiveStore.records.find(function (r) { return r.id === id; }) || null;
+}
+
+/* ================= 归档差异与纠错对账中心（独立存储） =================
+ *
+ * 与归档中心同样独立于线上四集合：
+ *   - 差异比较只读取两个不可变归档（各自先过完整性校验），不修改任何数据；
+ *   - 纠错批次记录版本、负责人、截止时间、审批人，提交/执行前重新校验两个归档
+ *     未被替换且差异指纹未变化；
+ *   - 审批通过后两阶段落盘：先把“纠错后的新只读回放空间”写入 replayStore，
+ *     再把纠错归档/批次结果写入 reconcileStore；任一步失败整体回滚；
+ *   - 原归档（archiveStore）、原空间、原会话与线上暂停/审批/执行数据全程只读。
+ */
+
+const reconcileStore = {
+  rev: 0,
+  diffs: [],       // 差异结果（ok 与 invalid 都持久化）
+  batches: [],     // 纠错批次（含审批记录/失败原因）
+  corrections: [], // 审批通过生成的只读纠错归档
+  logs: []         // 对账操作记录（含全部失败留痕）
+};
+
+function persistReconcile(cb) {
+  // 串行化：markBatchFailed 等路径会先尽力留痕再做主写入，两个写盘若并发会在
+  // 同一个 .tmp 路径上互相重命名（ENOENT），因此全部排队按顺序原子替换。
+  persistReconcile.queue = persistReconcile.queue || Promise.resolve();
+  const run = persistReconcile.queue.then(function () {
+    return new Promise(function (resolve) {
+      const tmp = RECONCILE_FILE + ".tmp";
+      fs.mkdir(path.dirname(RECONCILE_FILE), { recursive: true }, function () {
+        fs.writeFile(tmp, JSON.stringify(reconcileStore), function (err) {
+          if (err) { resolve(err); return; }
+          fs.rename(tmp, RECONCILE_FILE, function (e) { resolve(e || null); });
+        });
+      });
+    });
+  });
+  persistReconcile.queue = run.then(function () { return null; },
+                                    function () { return null; });
+  run.then(function (err) { cb(err || null); });
+}
+
+try {
+  const rawRec = fs.readFileSync(RECONCILE_FILE, "utf8");
+  const dataRec = JSON.parse(rawRec);
+  if (Number.isInteger(dataRec.rev) && Array.isArray(dataRec.batches)) {
+    reconcileStore.rev = dataRec.rev;
+    reconcileStore.diffs = Array.isArray(dataRec.diffs) ? dataRec.diffs : [];
+    reconcileStore.batches = dataRec.batches;
+    reconcileStore.corrections = Array.isArray(dataRec.corrections)
+      ? dataRec.corrections : [];
+    reconcileStore.logs = Array.isArray(dataRec.logs) ? dataRec.logs : [];
+  }
+} catch (e) {
+  // 文件不存在/损坏：以空存储启动，损坏文件不覆盖
+}
+
+// 崩溃对账：审批通过是“先写回放空间、再写纠错归档”的两阶段。停机发生在两步之间时，
+// 已写入 replayStore 但没有对应纠错归档的“纠错空间”就是孤儿，启动时移除并回滚
+// replayStore.rev（此阶段服务尚未对外服务，直接落盘一次即可）。
+(function reconcileCrashRecovery() {
+  const owned = {};
+  reconcileStore.corrections.forEach(function (c) {
+    if (c.restoredSpaceId) owned[c.restoredSpaceId] = true;
+  });
+  const orphans = replayStore.spaces.filter(function (sp) {
+    return sp.correctedFromCorrectionId && !owned[sp.id];
+  });
+  if (!orphans.length) return;
+  orphans.forEach(function (sp) {
+    const i = replayStore.spaces.indexOf(sp);
+    if (i !== -1) replayStore.spaces.splice(i, 1);
+  });
+  replayStore.rev++;
+  try { fs.writeFileSync(REPLAY_FILE + ".recover.tmp", JSON.stringify(replayStore));
+        fs.renameSync(REPLAY_FILE + ".recover.tmp", REPLAY_FILE); }
+  catch (e) { /* 首次写盘目录可能尚不存在，忽略 */ }
+})();
+
+function findReconcileDiff(id) {
+  return reconcileStore.diffs.find(function (d) { return d.id === id; }) || null;
+}
+function findReconcileBatch(id) {
+  return reconcileStore.batches.find(function (b) { return b.id === id; }) || null;
+}
+function findCorrection(id) {
+  return reconcileStore.corrections.find(function (c) { return c.id === id; }) || null;
+}
+
+function addReconcileLog(entry) {
+  const e = Object.assign({
+    id: crypto.randomUUID(),
+    at: new Date().toISOString()
+  }, entry);
+  reconcileStore.logs.push(e);
+  if (reconcileStore.logs.length > replayReconcile.LIMITS.LOGS_MAX) {
+    reconcileStore.logs.splice(0,
+      reconcileStore.logs.length - replayReconcile.LIMITS.LOGS_MAX);
+  }
+  return e;
+}
+
+// 对账中心自身的内存修改 + 原子落盘（失败回滚）
+function mutateReconcile(mutator, cb) {
+  const backup = JSON.parse(JSON.stringify({
+    rev: reconcileStore.rev, diffs: reconcileStore.diffs,
+    batches: reconcileStore.batches, corrections: reconcileStore.corrections,
+    logs: reconcileStore.logs
+  }));
+  let result;
+  try { result = mutator(); }
+  catch (e) {
+    restoreReconcile(backup);
+    cb({ status: 500, code: "internal_error", message: e.message });
+    return;
+  }
+  persistReconcile(function (err) {
+    if (err) {
+      restoreReconcile(backup);
+      cb({ status: 500, code: "persist_failed",
+        message: "对账操作落盘失败，已回滚，任何数据均未被改动" });
+      return;
+    }
+    cb(null, result);
+  });
+}
+
+function restoreReconcile(backup) {
+  reconcileStore.rev = backup.rev;
+  reconcileStore.diffs = backup.diffs;
+  reconcileStore.batches = backup.batches;
+  reconcileStore.corrections = backup.corrections;
+  reconcileStore.logs = backup.logs;
+}
+
+// 失败也尽力留痕（落盘失败只保留在内存，不改变业务结果）
+function persistReconcileLog(entry, cb) {
+  const stored = addReconcileLog(entry);
+  persistReconcile(function (err) {
+    if (cb) cb(err || null, stored);
+  });
 }
 
 function addArchiveLog(entry) {
@@ -1065,6 +1212,12 @@ function publicReplaySpace(sp) {
     originPackageId: sp.originPackageId || null,
     restoredAt: sp.restoredAt || null,
     restoredBy: sp.restoredBy || null,
+    // 纠错对账溯源（普通导入/归档恢复空间为 null）
+    correctedFromCorrectionId: sp.correctedFromCorrectionId || null,
+    correctedFromDiffId: sp.correctedFromDiffId || null,
+    correctedFromBatchId: sp.correctedFromBatchId || null,
+    correctedFromArchiveIds: Array.isArray(sp.correctedFromArchiveIds)
+      ? sp.correctedFromArchiveIds.slice() : null,
     validation: {
       verified: true,
       contentHash: sp.manifest && sp.manifest.contentHash,
@@ -1109,6 +1262,9 @@ function publicReplaySummary(sp) {
     originPackageId: sp.originPackageId || null,
     restoredAt: sp.restoredAt || null,
     restoredBy: sp.restoredBy || null,
+    correctedFromCorrectionId: sp.correctedFromCorrectionId || null,
+    correctedFromDiffId: sp.correctedFromDiffId || null,
+    correctedFromBatchId: sp.correctedFromBatchId || null,
     manifest: {
       contentHash: sp.manifest.contentHash,
       chainHead: sp.manifest.chainHead,
@@ -1428,6 +1584,9 @@ function publicSession(s, nowIso) {
     filters: s.filters || null,
     archived: !!s.archived,
     restoredFromArchive: !!s.restoredFromArchive,
+    corrected: !!s.corrected,
+    correctedFromDiffId: s.correctedFromDiffId || null,
+    correctedFromBatchId: s.correctedFromBatchId || null,
     progress: replaySession.sessionProgress(s, nowIso || new Date().toISOString())
   };
 }
@@ -1444,7 +1603,8 @@ function publicSessionDetail(sp, s) {
       targetSummary: it.targetSummary || null,
       review: rv ? publicReview(rv) : null,
       conclusion: it.conclusion || null,
-      conflict: it.conflict || null
+      conflict: it.conflict || null,
+      manual: it.manual || null
     };
   });
   return pub;
@@ -1942,6 +2102,12 @@ function handleReplay(req, res, parts, urlObj) {
   /* ---- 复核会话归档中心：/api/replay/archives... ---- */
   if (seg[0] === "archives") {
     handleReplayArchives(req, res, seg, urlObj);
+    return;
+  }
+
+  /* ---- 归档差异与纠错对账中心：/api/replay/reconcile... ---- */
+  if (seg[0] === "reconcile") {
+    handleReconcile(req, res, seg.slice(1), urlObj);
     return;
   }
 
@@ -3102,6 +3268,921 @@ function handleSpaceSessionArchive(req, res, sp, s, urlObj) {
   });
 }
 
+/* ================= 归档差异与纠错对账中心 API =================
+ *
+ * 路由（挂在 /api/replay/reconcile 下，与线上数据完全隔离）：
+ *   POST   /diff                         比较两个归档 {aId,bId,actor}（If-Match）
+ *   GET    /diffs                        差异结果列表
+ *   GET    /diffs/:id                    差异详情
+ *   POST   /batches                      从差异创建纠错批次（If-Match，逐差异裁决）
+ *   GET    /batches                      批次列表
+ *   GET    /batches/:id                  批次详情
+ *   PUT    /batches/:id                 修改拟定/驳回批次（If-Match + X-Batch-Version）
+ *   POST   /batches/:id/submit           提交审批（重新校验归档未替换、差异指纹未变）
+ *   POST   /batches/:id/approvals        审批通过/驳回 {decision,actor,reason?}
+ *   POST   /batches/:id/execute          审批通过后执行（审批不足也在此明确整批失败）
+ *   GET    /corrections                  纠错归档列表
+ *   GET    /corrections/:id              纠错归档详情
+ *   GET    /corrections/:id/download     下载纠错归档 JSON（只读）
+ *   GET    /logs                         对账操作记录（?from=&to=，时间倒序）
+ */
+
+function recordsById() {
+  const map = {};
+  archiveStore.records.forEach(function (r) { map[r.id] = r; });
+  return map;
+}
+
+/* ---------- POST /diff：确定性差异比较（损坏明确标出，不继续合并） ---------- */
+
+function createDiff(body, actor, cb) {
+  const aId = typeof body.aId === "string" ? body.aId : null;
+  const bId = typeof body.bId === "string" ? body.bId : null;
+  if (!aId || !bId) {
+    cb({ status: 400, code: "missing_archive", message: "必须提供两个归档 id（aId/bId）" });
+    return;
+  }
+  const ra = findArchive(aId), rb = findArchive(bId);
+  if (!ra || !rb) {
+    const which = !ra ? aId : bId;
+    cb({ status: 404, code: "archive_not_found",
+      message: "归档不存在或已被删除：" + which, missingArchiveId: which });
+    return;
+  }
+  if (ra.id === rb.id) {
+    cb({ status: 400, code: "diff_same_archive",
+      message: "必须选择两个不同的归档进行差异比较" });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  if (reconcileStore.diffs.length >= replayReconcile.LIMITS.DIFFS_MAX) {
+    persistReconcileLog({
+      action: "diff", ok: false, code: "diff_too_large", actor: actor,
+      aId: aId, bId: bId, message: "差异结果数量已达上限"
+    });
+    cb({ status: 413, code: "diff_too_large",
+      message: "差异结果数量已达上限 " + replayReconcile.LIMITS.DIFFS_MAX });
+    return;
+  }
+
+  const built = replayReconcile.buildDiff({ a: ra, b: rb, actor: actor, now: now });
+
+  if (!built.ok) {
+    // 损坏/缺引用/摘要不一致：明确标出原因；同时持久化一条 invalid 差异结果供查询
+    const invalid = replayReconcile.buildInvalidDiff(
+      { a: ra, b: rb, actor: actor, now: now }, built.problems);
+    mutateReconcile(function () {
+      reconcileStore.diffs.push(invalid);
+      reconcileStore.rev++;
+      addReconcileLog({ action: "diff", ok: false, code: built.code, actor: actor,
+        aId: aId, bId: bId, diffId: invalid.id,
+        problems: built.problems.map(function (p) {
+          return { side: p.side, archiveId: p.archiveId, code: p.code };
+        }),
+        message: built.message });
+      return invalid;
+    }, function (failure) {
+      if (failure) { cb(failure); return; }
+      cb({ status: 409, code: built.code, message: built.message,
+        diffId: invalid.id, problems: built.problems || [] });
+    });
+    return;
+  }
+
+  const diff = built.value;
+  // 同对归档（同 id + 同差异指纹）幂等；同对但状态/内容变化 -> 明确冲突，不覆盖
+  const existing = reconcileStore.diffs.find(function (d) {
+    return d.status === "ok" &&
+      ((d.a.archiveId === diff.a.archiveId && d.b.archiveId === diff.b.archiveId) ||
+       (d.a.archiveId === diff.b.archiveId && d.b.archiveId === diff.a.archiveId));
+  });
+  if (existing) {
+    if (existing.fingerprint === diff.fingerprint) {
+      cb(null, { status: 200, diff: existing, idempotent: true });
+      return;
+    }
+    persistReconcileLog({
+      action: "diff", ok: false, code: "diff_conflict", actor: actor,
+      aId: aId, bId: bId, existingDiffId: existing.id,
+      message: "同一对归档的差异指纹已变化（归档被恢复或替换）"
+    });
+    cb({ status: 409, code: "diff_conflict",
+      message: "同一对归档已有不同差异指纹的比较结果（归档恢复状态或内容已变化），" +
+        "不能覆盖；请基于最新结果重新创建批次",
+      existingDiffId: existing.id });
+    return;
+  }
+
+  mutateReconcile(function () {
+    reconcileStore.diffs.push(diff);
+    reconcileStore.rev++;
+    addReconcileLog({ action: "diff", ok: true, actor: actor,
+      aId: diff.a.archiveId, bId: diff.b.archiveId, diffId: diff.id,
+      detail: { total: diff.counts.total, resolvable: diff.counts.resolvable } });
+    return diff;
+  }, function (failure, out) {
+    if (failure) { cb(failure); return; }
+    cb(null, { status: 201, diff: out, idempotent: false });
+  });
+}
+
+/* ---------- POST /batches：从差异结果创建纠错批次 ---------- */
+
+function createBatch(body, actor, cb) {
+  const diffId = typeof body.diffId === "string" ? body.diffId : "";
+  const diff = findReconcileDiff(diffId);
+  if (!diff) { cb({ status: 404, code: "diff_not_found", message: "差异结果不存在" }); return; }
+  if (diff.status !== "ok") {
+    cb({ status: 409, code: "diff_invalid",
+      message: "差异结果因归档校验失败而无效，不能创建纠错批次", diffId: diffId });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  if (reconcileStore.batches.length >= replayReconcile.LIMITS.BATCHES_MAX) {
+    cb({ status: 413, code: "batch_too_large",
+      message: "纠错批次数量已达上限 " + replayReconcile.LIMITS.BATCHES_MAX });
+    return;
+  }
+
+  const checked = replayReconcile.validateBatchInput(Object.assign({}, body, {
+    diff: diff
+  }), now);
+  if (!checked.ok) {
+    persistReconcileLog({ action: "batch_create", ok: false, code: checked.code,
+      actor: actor, diffId: diffId, message: checked.message });
+    cb(Object.assign({ status: 400, code: checked.code, message: checked.message },
+      checked.unresolved ? { unresolved: checked.unresolved } : {},
+      checked.reviewId ? { reviewId: checked.reviewId } : {}));
+    return;
+  }
+  const v = checked.value;
+
+  // 创建时同样校验两个归档未被替换且差异指纹未变化（拒绝基于陈旧差异创建批次）
+  const re = replayReconcile.recheckDiff(diff, recordsById());
+  if (!re.ok) {
+    persistReconcileLog({ action: "batch_create", ok: false, code: re.code,
+      actor: actor, diffId: diffId, message: re.message });
+    cb(Object.assign({ status: 409, code: re.code, message: re.message },
+      re.problems ? { problems: re.problems } : {}));
+    return;
+  }
+
+  const batch = {
+    id: "btc_" + crypto.randomUUID().replace(/-/g, ""),
+    version: 1,
+    name: v.name,
+    owner: v.owner,
+    note: v.note,
+    deadline: v.deadline,
+    approvers: v.approvers,
+    baseArchiveId: v.baseArchiveId,
+    status: "draft",
+    diffId: diff.id,
+    items: v.items,
+    approvals: [],
+    approvalRound: 0,
+    createdAt: now,
+    createdBy: actor,
+    submittedAt: null,
+    decidedAt: null,
+    decidedBy: null,
+    rejectReason: null,
+    failureCode: null,
+    failureMessage: null,
+    correctionId: null,
+    newSpaceId: null
+  };
+
+  mutateReconcile(function () {
+    reconcileStore.batches.push(batch);
+    reconcileStore.rev++;
+    addReconcileLog({ action: "batch_create", ok: true, actor: actor,
+      diffId: diff.id, batchId: batch.id,
+      detail: { items: batch.items.length, approvers: batch.approvers.length } });
+    return batch;
+  }, function (failure, out) {
+    if (failure) { cb(failure); return; }
+    cb(null, { status: 201, batch: out });
+  });
+}
+
+/* ---------- PUT /batches/:id：拟定中/被驳回批次可改信息与裁决 ---------- */
+
+function updateBatch(batch, body, cb) {
+  if (["draft", "rejected"].indexOf(batch.status) === -1) {
+    cb({ status: 409, code: "batch_not_editable",
+      message: "只有拟定中或被驳回的批次可以修改（当前状态：" + batch.status + "）" });
+    return;
+  }
+  const diff = findReconcileDiff(batch.diffId);
+  const merged = {
+    diff: diff,
+    name: body.name !== undefined ? body.name : batch.name,
+    owner: body.owner !== undefined ? body.owner : batch.owner,
+    note: body.note !== undefined ? body.note : batch.note,
+    deadline: body.deadline !== undefined ? body.deadline : batch.deadline,
+    approvers: body.approvers !== undefined ? body.approvers : batch.approvers,
+    baseArchiveId: body.baseArchiveId !== undefined ? body.baseArchiveId
+      : batch.baseArchiveId,
+    items: body.items !== undefined ? body.items : batch.items
+  };
+  const checked = replayReconcile.validateBatchInput(merged, diff, new Date().toISOString());
+  if (!checked.ok) { cb({ status: 400, code: checked.code, message: checked.message }); return; }
+
+  mutateReconcile(function () {
+    batch.name = checked.value.name;
+    batch.owner = checked.value.owner;
+    batch.note = checked.value.note;
+    batch.deadline = checked.value.deadline;
+    batch.approvers = checked.value.approvers;
+    batch.baseArchiveId = checked.value.baseArchiveId;
+    batch.items = checked.value.items;
+    batch.version++;
+    if (batch.status === "rejected") batch.status = "draft";
+    addReconcileLog({ action: "batch_update", ok: true, actor: batch.owner,
+      batchId: batch.id, detail: { version: batch.version } });
+    return batch;
+  }, function (failure, out) {
+    if (failure) { cb(failure); return; }
+    cb(null, { status: 200, batch: out });
+  });
+}
+
+/* ---------- POST /batches/:id/submit：提交前强制重校验 ---------- */
+
+function submitBatch(batch, actor, cb) {
+  if (batch.status !== "draft") {
+    cb({ status: 409, code: "batch_not_submittable",
+      message: "只有拟定中的批次可以提交（当前状态：" + batch.status + "）" });
+    return;
+  }
+  const diff = findReconcileDiff(batch.diffId);
+  if (!diff) { cb({ status: 404, code: "diff_not_found", message: "差异结果不存在" }); return; }
+
+  const re = replayReconcile.recheckDiff(diff, recordsById());
+  if (!re.ok) {
+    markBatchFailed(batch, actor, "submit", re, function (failure, out) {
+      if (failure) { cb(failure); return; }
+      cb(Object.assign({ status: 409, code: re.code, message: re.message },
+        re.problems ? { problems: re.problems } : {}));
+    });
+    return;
+  }
+
+  // 截止时间不能早于提交时刻
+  if (Date.parse(batch.deadline) <= Date.now()) {
+    cb({ status: 409, code: "deadline_passed",
+      message: "批次截止时间已过，不能提交；请修改截止时间" });
+    return;
+  }
+
+  mutateReconcile(function () {
+    batch.status = "submitted";
+    batch.submittedAt = new Date().toISOString();
+    batch.approvalRound = (batch.approvalRound || 0) + 1;
+    batch.version++;
+    addReconcileLog({ action: "batch_submit", ok: true, actor: actor,
+      batchId: batch.id, diffId: batch.diffId,
+      detail: { round: batch.approvalRound } });
+    return batch;
+  }, function (failure, out) {
+    if (failure) { cb(failure); return; }
+    cb(null, { status: 200, batch: out });
+  });
+}
+
+// 校验失败/审批不足等“整批拒绝”：批次置 failed 并持久化失败原因
+function markBatchFailed(batch, actor, action, failure, done) {
+  persistReconcileLog({
+    action: action, ok: false, code: failure.code, actor: actor,
+    batchId: batch.id, diffId: batch.diffId, message: failure.message,
+    problems: failure.problems || null
+  });
+  mutateReconcile(function () {
+    batch.status = "failed";
+    batch.failureCode = failure.code;
+    batch.failureMessage = failure.message;
+    batch.decidedAt = new Date().toISOString();
+    batch.decidedBy = actor;
+    batch.version++;
+    addReconcileLog({ action: action + "_reject", ok: false, code: failure.code,
+      actor: actor, batchId: batch.id, message: failure.message });
+    return batch;
+  }, function (err, out) { done(err, out); });
+}
+
+/* ---------- POST /batches/:id/approvals：记名审批通过/驳回 ---------- */
+
+function approveBatch(batch, body, actor, cb) {
+  const decision = body.decision;
+  if (batch.status !== "submitted") {
+    cb({ status: 409, code: "batch_not_in_approval",
+      message: "只有待审批批次可以审批（当前状态：" + batch.status + "）" });
+    return;
+  }
+  if (batch.approvers.indexOf(actor) === -1) {
+    cb({ status: 403, code: "not_approver",
+      message: "只有批次指定的审批人可以审批" });
+    return;
+  }
+  if (decision !== "approve" && decision !== "reject") {
+    cb({ status: 400, code: "invalid_decision",
+      message: "decision 必须是 approve 或 reject" });
+    return;
+  }
+  const round = batch.approvalRound || 1;
+  if (batch.approvals.some(function (a) {
+    return a.by === actor && a.round === round;
+  })) {
+    cb({ status: 409, code: "approval_exists",
+      message: "你在本轮已经审批过该批次，不能重复审批" });
+    return;
+  }
+
+  if (decision === "reject") {
+    const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+    mutateReconcile(function () {
+      batch.approvals.push({ by: actor, decision: "reject", reason: reason,
+        at: new Date().toISOString(), round: round });
+      batch.status = "rejected";
+      batch.rejectReason = reason || null;
+      batch.decidedAt = new Date().toISOString();
+      batch.decidedBy = actor;
+      batch.version++;
+      addReconcileLog({ action: "approval", ok: true, decision: "reject",
+        actor: actor, batchId: batch.id, detail: { reason: reason, round: round } });
+      return batch;
+    }, function (failure, out) {
+      if (failure) { cb(failure); return; }
+      cb(null, { status: 200, batch: out });
+    });
+    return;
+  }
+
+  // approve：记名通过；达到全体一致即 approved（等待显式执行）
+  mutateReconcile(function () {
+    batch.approvals.push({ by: actor, decision: "approve", reason: null,
+      at: new Date().toISOString(), round: round });
+    const approveList = batch.approvals.filter(function (a) {
+      return a.decision === "approve" && a.round === round;
+    });
+    const uniqueApprovers = {};
+    approveList.forEach(function (a) { uniqueApprovers[a.by] = true; });
+    const passed = batch.approvers.every(function (ap) {
+      return uniqueApprovers[ap];
+    });
+    if (passed) {
+      batch.status = "approved";
+      batch.decidedAt = new Date().toISOString();
+      batch.decidedBy = actor;
+    }
+    batch.version++;
+    addReconcileLog({ action: "approval", ok: true, decision: "approve",
+      actor: actor, batchId: batch.id,
+      detail: { passed: passed, approvals: Object.keys(uniqueApprovers).length,
+        required: batch.approvers.length, round: round } });
+    return batch;
+  }, function (failure, out) {
+    if (failure) { cb(failure); return; }
+    cb(null, { status: 200, batch: out });
+  });
+}
+
+/* ---------- POST /batches/:id/execute：审批通过后执行两阶段纠错 ----------
+ * 执行前重校验全部前置条件；任一失败 -> 整批 failed + 失败留痕，不写任何空间。
+ */
+function executeBatch(batch, actor, cb) {
+  if (batch.status === "failed") {
+    cb({ status: 409, code: "batch_failed",
+      message: "批次已被整批拒绝：" + (batch.failureCode || "") });
+    return;
+  }
+  if (batch.status === "approved" || batch.status === "submitted") {
+    // 继续
+  } else {
+    cb({ status: 409, code: "batch_not_executable",
+      message: "批次当前状态不能执行：" + batch.status });
+    return;
+  }
+
+  const diff = findReconcileDiff(batch.diffId);
+  if (!diff) {
+    markBatchFailed(batch, actor, "execute",
+      { code: "diff_not_found", message: "差异结果已不存在" }, function (f) {
+        cb(f || { status: 404, code: "diff_not_found", message: "差异结果不存在" });
+      });
+    return;
+  }
+
+  // 审批不足：submitted 但本轮未全员通过 -> 整批拒绝（failed + 可查询记录）
+  if (batch.status === "submitted") {
+    const round = batch.approvalRound || 1;
+    const approvedBy = batch.approvals.filter(function (a) {
+      return a.decision === "approve" && a.round === round;
+    }).map(function (a) { return a.by; });
+    const enough = batch.approvers.every(function (ap) {
+      return approvedBy.indexOf(ap) !== -1;
+    });
+    if (!enough) {
+      markBatchFailed(batch, actor, "execute", {
+        code: "approval_insufficient",
+        message: "审批不足：需要 " + batch.approvers.length +
+          " 名审批人全部通过，当前 " + approvedBy.length + " 名"
+      }, function (failure) {
+        if (failure) { cb(failure); return; }
+        cb({ status: 409, code: "approval_insufficient",
+          message: "审批不足，整批拒绝", required: batch.approvers, approvedBy: approvedBy });
+      });
+      return;
+    }
+  }
+
+  // 截止时间
+  if (Date.parse(batch.deadline) <= Date.now()) {
+    markBatchFailed(batch, actor, "execute", {
+      code: "deadline_passed", message: "批次已过截止时间，拒绝执行"
+    }, function () {
+      cb({ status: 409, code: "deadline_passed", message: "批次已过截止时间，整批拒绝" });
+    });
+    return;
+  }
+
+  // 归档未替换 + 差异指纹未变化（最终一道校验）
+  const map = recordsById();
+  const re = replayReconcile.recheckDiff(diff, map);
+  if (!re.ok) {
+    markBatchFailed(batch, actor, "execute", re, function (failure) {
+      if (failure) { cb(failure); return; }
+      cb(Object.assign({ status: 409, code: re.code, message: re.message },
+        re.problems ? { problems: re.problems } : {}));
+    });
+    return;
+  }
+
+  const recA = map[diff.a.archiveId];
+  const recB = map[diff.b.archiveId];
+  const now = new Date().toISOString();
+  const newSpaceId = crypto.randomUUID();
+  const built = replayReconcile.buildCorrection({
+    batch: batch, diff: diff, recA: recA, recB: recB,
+    now: now, actor: actor, spaceId: newSpaceId
+  });
+  if (!built.ok) {
+    markBatchFailed(batch, actor, "execute", built, function (failure) {
+      if (failure) { cb(failure); return; }
+      cb(Object.assign({ status: 409, code: built.code, message: built.message },
+        built.reviewId ? { reviewId: built.reviewId } : {},
+        built.embeddedCode ? { embeddedCode: built.embeddedCode } : {}));
+    });
+    return;
+  }
+  // 目标标识冲突（与现有空间）
+  const target = replayReconcile.validateCorrectionTarget(built.value, replayStore.spaces);
+  if (!target.ok) {
+    markBatchFailed(batch, actor, "execute", target, function (failure) {
+      if (failure) { cb(failure); return; }
+      cb(Object.assign({ status: 409, code: target.code, message: target.message },
+        target.existingSpaceId ? { existingSpaceId: target.existingSpaceId } : {}));
+    });
+    return;
+  }
+
+  const correction = built.value.record;
+  // 同一纠错内容已执行过（崩溃重试/重复请求）：幂等冲突拒绝
+  if (findCorrection(correction.id)) {
+    cb({ status: 409, code: "correction_exists",
+      message: "该纠错内容已生成过纠错归档：" + correction.id,
+      existingCorrectionId: correction.id });
+    return;
+  }
+
+  const newSp = replayReconcile.buildCorrectionSpace(built.value, batch, {
+    id: newSpaceId, now: now, actor: actor,
+    name: batch.name + "（纠错空间）"
+  });
+  correction.restoredSpaceId = newSpaceId;
+
+  /* 两阶段事务：
+   *   1) replayStore 写入新空间并落盘（失败 -> 什么都不写）；
+   *   2) reconcileStore 写纠错归档 + 批次结果并落盘（失败 -> 撤回新空间）。
+   * 崩溃在两步之间由启动时崩溃对账清理孤儿空间。
+   */
+  const replayBackup = { rev: replayStore.rev, count: replayStore.spaces.length };
+  replayStore.spaces.push(newSp);
+  replayStore.rev++;
+  persistReplay(function (perr) {
+    if (perr) {
+      const i = replayStore.spaces.indexOf(newSp);
+      if (i !== -1) replayStore.spaces.splice(i, 1);
+      replayStore.rev = replayBackup.rev;
+      markBatchFailed(batch, actor, "execute", {
+        code: "persist_failed",
+        message: "纠错空间落盘失败，已整体回滚：" + perr.message
+      }, function () {
+        cb({ status: 500, code: "persist_failed",
+          message: "纠错空间写入失败，整批拒绝，原数据未改动" });
+      });
+      return;
+    }
+
+    const reconcileBackup = JSON.parse(JSON.stringify({
+      rev: reconcileStore.rev, diffs: reconcileStore.diffs,
+      batches: reconcileStore.batches, corrections: reconcileStore.corrections,
+      logs: reconcileStore.logs
+    }));
+    try {
+      reconcileStore.corrections.push(correction);
+      if (reconcileStore.corrections.length > replayReconcile.LIMITS.CORRECTIONS_MAX) {
+        throw new Error("correction_too_large");
+      }
+      batch.status = "approved";
+      batch.correctionId = correction.id;
+      batch.newSpaceId = newSpaceId;
+      batch.version++;
+      reconcileStore.rev++;
+      addReconcileLog({ action: "execute", ok: true, actor: actor,
+        batchId: batch.id, diffId: batch.diffId, correctionId: correction.id,
+        newSpaceId: newSpaceId,
+        detail: { packageId: correction.manifest.packageId,
+          contentHash: correction.manifest.contentHash,
+          manualCount: correction.manifest.manualCount } });
+    } catch (e) {
+      // 写入前异常：撤回新空间并回滚对账内存（correction 可能已 push）
+      undoNewSpace(newSp, replayBackup);
+      restoreReconcile(reconcileBackup);
+      persistReplay(function () {
+        const fresh = findReconcileBatch(batch.id);
+        if (fresh) {
+          markBatchFailed(fresh, actor, "execute", {
+            code: e.message === "correction_too_large"
+              ? "correction_too_large" : "internal_error",
+            message: "纠错结果写入失败，已整体回滚"
+          }, function () {});
+        }
+        const code = e.message === "correction_too_large"
+          ? "correction_too_large" : "internal_error";
+        cb({ status: code === "correction_too_large" ? 413 : 500,
+          code: code, message: "纠错结果写入失败，已整体回滚" });
+      });
+      return;
+    }
+
+    persistReconcile(function (rerr) {
+      if (rerr) {
+        // 第二步失败：撤回新空间，回滚 reconcile 内存，整体“未执行”。
+        // 回滚后 batch 对象已脱离存储（数组被深拷贝替换），必须重新查找再标记失败。
+        undoNewSpace(newSp, replayBackup);
+        restoreReconcile(reconcileBackup);
+        persistReplay(function () {
+          const fresh = findReconcileBatch(batch.id);
+          if (fresh) {
+            markBatchFailed(fresh, actor, "execute", {
+              code: "persist_failed",
+              message: "纠错归档落盘失败，已撤回新空间并整体回滚：" + rerr.message
+            }, function () {
+              cb({ status: 500, code: "persist_failed",
+                message: "纠错归档保存失败，整批拒绝，新空间未保留、原数据未改动" });
+            });
+          } else {
+            cb({ status: 500, code: "persist_failed",
+              message: "纠错归档保存失败，整批拒绝，已回滚" });
+          }
+        });
+        return;
+      }
+      cb(null, { status: 201, correction: correction, space: newSp });
+    });
+  });
+}
+
+function undoNewSpace(newSp, replayBackup) {
+  const j = replayStore.spaces.indexOf(newSp);
+  if (j !== -1) replayStore.spaces.splice(j, 1);
+  replayStore.rev = replayBackup.rev;
+}
+
+/* ---------- 路由 ---------- */
+
+function handleReconcile(req, res, tail, urlObj) {
+  const params = urlObj.searchParams;
+
+  /* GET /logs：对账操作记录（时间倒序） */
+  if (tail.length === 1 && tail[0] === "logs" && req.method === "GET") {
+    const from = params.get("from"), to = params.get("to");
+    if (from && !replayReconcile.isISODateString(from)) {
+      apiError(res, 400, "invalid_from", "起始时间不是合法 ISO 时间"); return;
+    }
+    if (to && !replayReconcile.isISODateString(to)) {
+      apiError(res, 400, "invalid_to", "结束时间不是合法 ISO 时间"); return;
+    }
+    if (from && to && Date.parse(from) > Date.parse(to)) {
+      apiError(res, 400, "invalid_range", "起始时间晚于结束时间"); return;
+    }
+    const logs = reconcileStore.logs.filter(function (l) {
+      if (from && Date.parse(l.at) < Date.parse(from)) return false;
+      if (to && Date.parse(l.at) > Date.parse(to)) return false;
+      return true;
+    }).slice().sort(function (a, b) {
+      const d = Date.parse(b.at) - Date.parse(a.at);
+      if (d) return d;
+      return a.id < b.id ? 1 : -1;
+    });
+    sendJSON(res, 200, { rev: reconcileStore.rev, count: logs.length, logs: logs });
+    return;
+  }
+
+  /* POST /diff */
+  if (tail.length === 1 && tail[0] === "diff" && req.method === "POST") {
+    if (checkLock(res, req.headers["if-match"], reconcileStore.rev, "对账中心")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body = {};
+      if (raw) {
+        try { body = JSON.parse(raw) || {}; }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      }
+      const actor = review.validateAuthor(body.actor).value;
+      createDiff(body, actor, function (failure, out) {
+        if (failure) {
+          const extra = {};
+          if (failure.problems) extra.problems = failure.problems;
+          if (failure.missingArchiveId) extra.missingArchiveId = failure.missingArchiveId;
+          if (failure.existingDiffId) extra.existingDiffId = failure.existingDiffId;
+          apiError(res, failure.status, failure.code, failure.message, extra);
+          return;
+        }
+        sendJSON(res, out.status, {
+          rev: reconcileStore.rev,
+          diff: replayReconcile.publicDiff(out.diff),
+          idempotent: out.idempotent
+        });
+      });
+    });
+    return;
+  }
+
+  /* GET /diffs */
+  if (tail.length === 1 && tail[0] === "diffs" && req.method === "GET") {
+    let list = reconcileStore.diffs.slice().sort(function (a, b) {
+      const d = Date.parse(b.createdAt) - Date.parse(a.createdAt);
+      if (d) return d;
+      return a.id < b.id ? 1 : -1;
+    });
+    const status = params.get("status");
+    if (status && status !== "ok" && status !== "invalid") {
+      apiError(res, 400, "invalid_status", "差异状态筛选只支持 ok 或 invalid");
+      return;
+    }
+    if (status) list = list.filter(function (d) { return d.status === status; });
+    sendJSON(res, 200, {
+      rev: reconcileStore.rev, count: list.length,
+      diffs: list.map(replayReconcile.publicDiff)
+    });
+    return;
+  }
+
+  /* POST /batches */
+  if (tail.length === 1 && tail[0] === "batches" && req.method === "POST") {
+    if (checkLock(res, req.headers["if-match"], reconcileStore.rev, "对账中心")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body = {};
+      if (raw) {
+        try { body = JSON.parse(raw) || {}; }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      }
+      const actor = review.validateAuthor(body.actor).value;
+      createBatch(body, actor, function (failure, out) {
+        if (failure) {
+          apiError(res, failure.status, failure.code, failure.message,
+            failure.unresolved ? { unresolved: failure.unresolved } :
+            failure.reviewId ? { reviewId: failure.reviewId } :
+            failure.problems ? { problems: failure.problems } : null);
+          return;
+        }
+        sendJSON(res, out.status, { rev: reconcileStore.rev,
+          batch: replayReconcile.publicBatch(out.batch) });
+      });
+    });
+    return;
+  }
+
+  /* GET /batches */
+  if (tail.length === 1 && tail[0] === "batches" && req.method === "GET") {
+    const list = reconcileStore.batches.slice().sort(function (a, b) {
+      const d = Date.parse(b.createdAt) - Date.parse(a.createdAt);
+      if (d) return d;
+      return a.id < b.id ? 1 : -1;
+    });
+    sendJSON(res, 200, { rev: reconcileStore.rev, count: list.length,
+      batches: list.map(replayReconcile.publicBatch) });
+    return;
+  }
+
+  /* GET /corrections */
+  if (tail.length === 1 && tail[0] === "corrections" && req.method === "GET") {
+    const list = reconcileStore.corrections.slice().sort(function (a, b) {
+      const d = Date.parse(b.createdAt) - Date.parse(a.createdAt);
+      if (d) return d;
+      return a.id < b.id ? 1 : -1;
+    });
+    sendJSON(res, 200, { rev: reconcileStore.rev, count: list.length,
+      corrections: list.map(replayReconcile.publicCorrection) });
+    return;
+  }
+
+  /* ---- /diffs/:id ---- */
+  if (tail.length === 2 && tail[0] === "diffs") {
+    const diff = findReconcileDiff(tail[1]);
+    if (!diff) { apiError(res, 404, "diff_not_found", "差异结果不存在"); return; }
+    if (req.method === "GET") {
+      sendJSON(res, 200, { rev: reconcileStore.rev,
+        diff: replayReconcile.publicDiff(diff) });
+      return;
+    }
+  }
+
+  /* ---- /corrections/:id（含 download） ---- */
+  if (tail.length >= 2 && tail[0] === "corrections") {
+    const corr = findCorrection(tail[1]);
+    if (!corr) { apiError(res, 404, "correction_not_found", "纠错归档不存在"); return; }
+    if (tail.length === 2 && req.method === "GET") {
+      sendJSON(res, 200, { rev: reconcileStore.rev,
+        correction: replayReconcile.publicCorrectionDetail(corr) });
+      return;
+    }
+    if (tail.length === 3 && tail[2] === "download" && req.method === "GET") {
+      const payload = JSON.stringify({
+        correction: corr,
+        verification: replayReconcile.correctionVerificationSummary(corr)
+      }, null, 2);
+      const fname = encodeURIComponent(corr.id + ".correction.json");
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+        "Content-Disposition":
+          "attachment; filename=\"correction.json\"; filename*=UTF-8''" + fname
+      });
+      res.end(payload);
+      return;
+    }
+  }
+
+  /* ---- /batches/:id[/...] ---- */
+  if (tail.length >= 2 && tail[0] === "batches") {
+    const batch = findReconcileBatch(tail[1]);
+    if (!batch) { apiError(res, 404, "batch_not_found", "纠错批次不存在"); return; }
+
+    if (tail.length === 2 && req.method === "GET") {
+      sendJSON(res, 200, { rev: reconcileStore.rev,
+        batch: replayReconcile.publicBatch(batch) });
+      return;
+    }
+
+    if (tail.length === 2 && req.method === "PUT") {
+      if (checkLock(res, req.headers["if-match"], reconcileStore.rev, "对账中心")) return;
+      const their = parseInt(req.headers["x-batch-version"], 10);
+      if (!Number.isInteger(their)) {
+        apiError(res, 428, "precondition_required",
+          "修改批次必须携带 X-Batch-Version 批次版本号");
+        return;
+      }
+      if (their !== batch.version) {
+        apiError(res, 409, "batch_version_conflict",
+          "批次已被其他页面更新（当前版本 " + batch.version + "），本次修改已取消",
+          { currentVersion: batch.version });
+        return;
+      }
+      readBody(req, function (err, raw) {
+        if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+        let body = {};
+        if (raw) {
+          try { body = JSON.parse(raw) || {}; }
+          catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+        }
+        updateBatch(batch, body, function (failure, out) {
+          if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+          sendJSON(res, 200, { rev: reconcileStore.rev,
+            batch: replayReconcile.publicBatch(out.batch) });
+        });
+      });
+      return;
+    }
+
+    if (tail.length === 3 && tail[2] === "submit" && req.method === "POST") {
+      if (checkLock(res, req.headers["if-match"], reconcileStore.rev, "对账中心")) return;
+      const their = parseInt(req.headers["x-batch-version"], 10);
+      if (!Number.isInteger(their)) {
+        apiError(res, 428, "precondition_required",
+          "提交批次必须携带 X-Batch-Version 批次版本号");
+        return;
+      }
+      if (their !== batch.version) {
+        apiError(res, 409, "batch_version_conflict",
+          "批次已被其他页面更新（当前版本 " + batch.version + "），请刷新后重试",
+          { currentVersion: batch.version });
+        return;
+      }
+      readBody(req, function (err, raw) {
+        if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+        let body = {};
+        if (raw) {
+          try { body = JSON.parse(raw) || {}; }
+          catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+        }
+        const actor = review.validateAuthor(body.actor).value;
+        submitBatch(batch, actor, function (failure, out) {
+          if (failure) {
+            apiError(res, failure.status, failure.code, failure.message,
+              failure.problems ? { problems: failure.problems } : null);
+            return;
+          }
+          sendJSON(res, 200, { rev: reconcileStore.rev,
+            batch: replayReconcile.publicBatch(out.batch) });
+        });
+      });
+      return;
+    }
+
+    if (tail.length === 3 && tail[2] === "approvals" && req.method === "POST") {
+      if (checkLock(res, req.headers["if-match"], reconcileStore.rev, "对账中心")) return;
+      const their = parseInt(req.headers["x-batch-version"], 10);
+      if (!Number.isInteger(their)) {
+        apiError(res, 428, "precondition_required",
+          "审批必须携带 X-Batch-Version 批次版本号");
+        return;
+      }
+      if (their !== batch.version) {
+        apiError(res, 409, "batch_version_conflict",
+          "批次已被更新（当前版本 " + batch.version + "），审批已取消",
+          { currentVersion: batch.version });
+        return;
+      }
+      readBody(req, function (err, raw) {
+        if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+        let body = {};
+        if (raw) {
+          try { body = JSON.parse(raw) || {}; }
+          catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+        }
+        const actor = review.validateAuthor(body.actor).value;
+        approveBatch(batch, body, actor, function (failure, out) {
+          if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+          sendJSON(res, 200, { rev: reconcileStore.rev,
+            batch: replayReconcile.publicBatch(out.batch) });
+        });
+      });
+      return;
+    }
+
+    if (tail.length === 3 && tail[2] === "execute" && req.method === "POST") {
+      if (checkLock(res, req.headers["if-match"], reconcileStore.rev, "对账中心")) return;
+      const their = parseInt(req.headers["x-batch-version"], 10);
+      if (!Number.isInteger(their)) {
+        apiError(res, 428, "precondition_required",
+          "执行必须携带 X-Batch-Version 批次版本号");
+        return;
+      }
+      if (their !== batch.version) {
+        apiError(res, 409, "batch_version_conflict",
+          "批次已被更新（当前版本 " + batch.version + "），执行已取消",
+          { currentVersion: batch.version });
+        return;
+      }
+      readBody(req, function (err, raw) {
+        if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+        let body = {};
+        if (raw) {
+          try { body = JSON.parse(raw) || {}; }
+          catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+        }
+        const actor = review.validateAuthor(body.actor).value;
+        executeBatch(batch, actor, function (failure, out) {
+          if (failure) {
+            const extra = {};
+            if (failure.problems) extra.problems = failure.problems;
+            if (failure.existingSpaceId) extra.existingSpaceId = failure.existingSpaceId;
+            if (failure.required) extra.required = failure.required;
+            if (failure.approvedBy) extra.approvedBy = failure.approvedBy;
+            apiError(res, failure.status, failure.code, failure.message, extra);
+            return;
+          }
+          sendJSON(res, out.status, {
+            rev: reconcileStore.rev, replayRev: replayStore.rev,
+            correction: replayReconcile.publicCorrection(out.correction),
+            space: publicReplaySummary(out.space)
+          });
+        });
+      });
+      return;
+    }
+  }
+
+  apiError(res, 404, "not_found", "对账接口不存在");
+}
+
 function sendJSON(res, status, body, headers) {
   const payload = JSON.stringify(body);
   const h = Object.assign({
@@ -3112,6 +4193,7 @@ function sendJSON(res, status, body, headers) {
     "X-Decision-Rev": String(decisionStore.rev),
     "X-Replay-Rev": String(replayStore.rev),
     "X-Archive-Rev": String(archiveStore.rev),
+    "X-Reconcile-Rev": String(reconcileStore.rev),
     "Cache-Control": "no-store"
   }, headers || {});
   res.writeHead(status, h);

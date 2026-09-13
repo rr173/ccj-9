@@ -28,6 +28,19 @@
 冲突，任一失败整次拒绝不写入；恢复后历史只读、可继续创建新会话）；归档/预览/恢复/
 筛选全程留痕持久化，失败绝不改动原空间、原会话或线上暂停/审批/执行数据。
 
+在复核会话归档中心之上再提供**归档差异与纠错对账中心**：负责人选择两个已生成的归档做
+**确定性差异比较**，按锁定意见、逐条结论、冲突记录、操作时间线、空间内容指纹与恢复状态
+六个维度产出**可定位差异项**；交换两个归档的比较顺序结果完全一致（按归档 id 归一化为
+A/B）；归档被篡改、缺失引用或校验摘要不一致时明确标出原因，绝不继续合并。负责人可从
+差异结果创建**纠错批次**：为每条可裁决差异指定保留 A 侧、采用 B 侧（目标归档）或标记
+人工复核；批次记录版本、负责人、截止时间与审批人，提交与执行前重新校验两个归档未被
+替换且差异指纹未变化。审批通过后两阶段生成一个内容寻址、只读的**纠错归档**和一个
+**新的回放空间**（新包标识、锁定内容取自基线归档、内容指纹与链头不变、历史纠错会话
+只读但可继续新建会话）；原归档、原空间、原会话与线上暂停/审批/执行数据全程不被改写；
+任一差异项缺少引用、审批不足、目标标识冲突或写入失败时**整批拒绝**（批次 failed 并
+留下可查询的失败原因与操作记录）。差异结果、纠错批次、审批记录、纠错归档与失败原因
+独立持久化到 `data/replay-reconcile.json`，服务重启后仍可继续查看与处理。
+
 ## 双向编辑的需求与实现对照
 
 | 需求 | 实现方式 |
@@ -641,6 +654,118 @@ POST   /api/replay/archives/:aid/restore        校验通过后恢复为新回�
 归档集合使用独立响应头 `X-Archive-Rev`。
 
 
+## 归档差异与纠错对账中心（独立于归档中心、回放空间与线上数据）
+
+负责人选择**两个已生成的复核会话归档**做确定性差异比较，并从差异结果创建纠错批次；
+审批通过后生成一个只读纠错归档与一个新的回放空间。对账中心与归档中心、回放空间、
+线上四集合完全隔离，使用独立数据文件 `./data/replay-reconcile.json`
+（`REPLAY_RECONCILE_FILE` 覆盖）与独立版本号（响应头 `X-Reconcile-Rev`）。
+
+### 确定性差异比较（六维可定位差异项，交换顺序结果一致）
+
+`POST /api/replay/reconcile/diff`（`If-Match: X-Reconcile-Rev`）传入两个归档 id：
+
+1. 两侧先分别跑归档中心完整性校验（结构/manifest/FNV+SHA-256/重复标识/缺失引用/
+   时间线/内嵌审计包/锁定指纹）。任一侧被篡改、缺引用或摘要不一致都**明确标出原因**
+   （`problems[]` 含 side/code/message/embeddedCode），返回 409 `diff_archive_invalid`
+   且**绝不继续合并**；同时持久化一条 `status:"invalid"` 的差异结果供查询。
+2. 通过后两侧按**归档 id 升序归一化为 A/B**——因此交换入参顺序得到完全相同的差异 id、
+   差异指纹与差异项（`a` 始终是较小 id 一侧）。
+3. 差异项按六个维度生成，每项有稳定 id（`dit_<fnv1a64(维度,定位键)>`）、中文标签与
+   **定位器 locator**（会话字段 / 意见 id + 字段 / 时间线代表条目 / 指纹字段）：
+
+| 维度 | 定位内容 | 可逐条裁决 |
+|---|---|---|
+| `locked_opinion` 锁定意见 | 会话头（id/版本/名称/参与人/截止/筛选/创建人/时间）、每条意见的锁定三元组（lockedVersion/lockedStatus/targetSummary）、归档瞬间当前意见快照逐字段（版本/状态/复核人/截止/内容/关闭信息…）与存在性 | 是 |
+| `conclusion` 逐条结论 | confirm/reject/need_evidence、备注、提交人/时间/意见版本，及结论存在性 | 是 |
+| `conflict` 冲突记录 | review_closed/updated_outside/target_missing/review_missing、说明、标记人/时间，及存在性 | 是 |
+| `timeline` 操作时间线 | 会话与相关意见日志按规范化内容做多重集比较（与传入顺序无关），差异项给出两侧计数与代表日志 id | 否（信息性） |
+| `fingerprint` 空间内容指纹 | packageId/producerId/contentHash/contentHashSha256/chainHead/chainHeadId/eventCount/归档时空间版本与会话版本 | 否（信息性） |
+| `restore` 恢复状态 | 归档 active/restored 状态、恢复空间 id/时间/操作人 | 否（信息性） |
+
+差异结果 `fingerprint` 覆盖两侧归档 id/载荷摘要/恢复状态与全部差异项（不含墙钟），
+同对归档同状态重复比较幂等（200 `idempotent:true`）；同对归档此后被恢复（状态变化）
+或被替换（payloadHash 变化）导致差异指纹变化时返回 409 `diff_conflict`，不覆盖旧结果。
+
+### 纠错批次（版本/负责人/截止/审批人 + 逐差异裁决）
+
+`POST /api/replay/reconcile/batches`（`If-Match`）从一个有效差异结果创建批次：
+
+- 每条**可裁决差异**必须且只能裁决为 `keep_a`（保留 A 侧）、`keep_b`（采用 B 侧/
+  目标归档）或 `manual`（人工复核：不自动合并，取基线值并在纠错条目上打 `manual`
+  标记）；不可裁决项（时间线/指纹/恢复）不能裁决。缺裁决 400 `unresolved_items`、
+  重复裁决 400 `duplicate_resolution`、裁决不存在项 404 `diff_item_not_found`。
+- 批次记录名称、**版本 version**（修改/提交/审批/执行都推进，`X-Batch-Version` 乐观锁）、
+  **负责人 owner**、**截止时间 deadline**、1~3 名**审批人 approvers**（去重、负责人
+  不能同时担任审批人）。
+- 两侧**锁定内容 contentHash 不同**时必须指定 `baseArchiveId` 作为纠错基线
+  （400 `missing_base_archive`），其锁定内容成为纠错空间内容；内容相同时基线默认
+  归一化 A 侧。
+- 创建与提交（`POST …/submit`）前都重新执行 `recheckDiff`：归档 id 仍在、
+  payloadHash 与比较时一致、完整性校验通过、差异指纹未变化。归档被替换 -> 409
+  `diff_archive_replaced`；恢复状态等导致差异指纹变化 -> 409
+  `diff_fingerprint_changed`（批次置 failed 并留痕）。
+
+### 审批与执行（审批不足整批拒绝；两阶段写盘）
+
+- `POST …/batches/:id/approvals`：只有指定审批人可审批（403 `not_approver`），
+  记名 `approve`/`reject`，同一轮重复审批 409 `approval_exists`；驳回后批次
+  `rejected`，可 `PUT` 修改后重新提交（审批按轮次 approvalRound 记录）；
+  全部审批人通过后批次 `approved`。
+- `POST …/batches/:id/execute`：执行前再做全部前置校验。**审批不足**（submitted
+  但本轮未全员通过）-> 409 `approval_insufficient`，批次置 **failed** 且不新增空间。
+  合成纠错结果时：同 id 意见两侧引用目标不同 -> 409 `correction_target_conflict`；
+  裁决导致条目保留但意见缺失 -> 409 `correction_missing_reference`；新包标识与已有
+  空间冲突 -> 409 `correction_target_conflict`。任一失败**整批拒绝**、批次 failed、
+  失败码与原因持久化可查询。
+- 成功执行是**两阶段事务**：先向 replayStore 写入新回放空间并落盘，再向
+  reconcileStore 写纠错归档、批次结果并落盘；第二步失败撤回新空间并整体回滚。
+  若进程恰在两步之间崩溃，重启时崩溃对账自动删除没有对应纠错归档的孤儿纠错空间。
+
+### 纠错归档与新回放空间（只读、内容寻址、锁定内容不变）
+
+- 纠错归档 `crc_<fnv1a64>`：id 与 payloadHash 完全由合并内容决定（不含审批墙钟），
+  含来源两归档 id/载荷摘要、基线、逐差异裁决、合并后的锁定意见/会话条目/两侧并集
+  时间线（日志 id 按来源归档加 `1:`/`2:` 命名空间前缀，按内容去重、确定性排序）、
+  意见摘要、进度（含人工复核数）、内嵌审计包与确定性校验摘要，自洽校验规则与归档中心
+  同级（哈希/重复标识/缺失引用/时间线重建/内嵌包/指纹/意见目标可解析）。
+- 新回放空间使用**新包标识** `car_…`（由批次与合并内容确定性导出），锁定内容一字不动，
+  因此 contentHash/chainHead 与基线归档一致；带入的纠错会话标记 `archived`+`corrected`
+  永久只读（提交结论 409 `session_archived_readonly`），但可继续创建新的复核会话。
+- 原归档、原回放空间、原会话与线上暂停/审批/执行数据全程只读，绝不被改写。
+
+### HTTP API 摘要
+
+```
+POST   /api/replay/reconcile/diff                       比较两个归档 {aId,bId,actor}（If-Match）
+GET    /api/replay/reconcile/diffs                      差异结果列表（?status=ok|invalid）
+GET    /api/replay/reconcile/diffs/:id                  差异详情（六维差异项/失败原因）
+POST   /api/replay/reconcile/batches                    创建纠错批次（If-Match；逐差异裁决）
+GET    /api/replay/reconcile/batches                    批次列表
+GET    /api/replay/reconcile/batches/:id                批次详情（裁决/审批记录/失败原因/结果）
+PUT    /api/replay/reconcile/batches/:id                修改 draft/rejected 批次（If-Match + X-Batch-Version）
+POST   /api/replay/reconcile/batches/:id/submit         提交审批（重校验归档与差异指纹）
+POST   /api/replay/reconcile/batches/:id/approvals      审批 {decision:approve|reject,actor,reason?}
+POST   /api/replay/reconcile/batches/:id/execute        审批通过后执行（整批成功或整批拒绝）
+GET    /api/replay/reconcile/corrections                纠错归档列表
+GET    /api/replay/reconcile/corrections/:id            纠错归档详情（校验摘要/时间线/裁决）
+GET    /api/replay/reconcile/corrections/:id/download   下载纠错归档 JSON（纯只读）
+GET    /api/replay/reconcile/logs[?from=&to=]           对账操作记录（时间倒序，含全部失败留痕）
+```
+
+错误码：400 `missing_archive`/`diff_same_archive`/`missing_name`/`missing_owner`/
+`missing_deadline`/`invalid_deadline`/`deadline_in_past`/`missing_approver`/
+`duplicate_approver`/`approver_is_owner`/`too_many_approvers`/`missing_base_archive`/
+`invalid_base_archive`/`invalid_resolution`/`duplicate_resolution`/`unresolved_items`/
+`item_not_resolvable`/`no_resolvable_items`/`invalid_decision`；
+409 `diff_conflict`/`diff_archive_invalid`/`diff_invalid`/`diff_archive_replaced`/
+`diff_fingerprint_changed`/`batch_not_editable`/`batch_not_submittable`/
+`batch_not_in_approval`/`batch_not_executable`/`approval_exists`/`approval_insufficient`/
+`deadline_passed`/`correction_target_conflict`/`correction_missing_reference`；
+403 `not_approver`；404 `archive_not_found`/`diff_not_found`/`batch_not_found`/
+`correction_not_found`/`diff_item_not_found`；428 缺 `If-Match` 或
+`X-Batch-Version`；409 `batch_version_conflict`/`version_conflict` 旧版本。
+
 ### 差异位置为什么不会被 RTL 标反
 
 - 差异算法（LCS）在 `snapshot-core.js` 中以**码点数组**为输入，偏移即数组下标，
@@ -670,7 +795,10 @@ node server.js          # http://localhost:8080
 `./data/replay-spaces.json`（`REPLAY_SPACES_FILE` 覆盖，与线上四集合完全隔离），
 **复核会话归档中心**（归档/操作记录/已保存筛选）独立写到
 `./data/replay-archives.json`（`REPLAY_ARCHIVES_FILE` 覆盖，与回放空间及线上
-四集合完全隔离，集合版本号为响应头 `X-Archive-Rev`），
+四集合完全隔离，集合版本号为响应头 `X-Archive-Rev`），**归档差异与纠错对账中心**
+（差异结果/纠错批次/审批记录/纠错归档/失败留痕）独立写到
+`./data/replay-reconcile.json`（`REPLAY_RECONCILE_FILE` 覆盖，集合版本号为
+响应头 `X-Reconcile-Rev`，两阶段写盘失败重启自动对账清理孤儿纠错空间），
 导入请求体上限可用 `REPLAY_BODY_LIMIT_BYTES` 调整（默认 32MB）；
 定时轮询间隔用 `DECISION_SCHEDULER_INTERVAL_MS` 调整（默认 1000 毫秒）。
 
@@ -702,6 +830,8 @@ node --test test/
 - `test/replay-archive-core.test.js`：归档资格（进行中拒绝/完成或过期）、归档内容（锁定意见/逐条结论/冲突/操作日志时间线/当前意见摘要/内容指纹/内嵌审计包/纯函数不改输入/缺引用拒绝）、内容寻址 id 与跨墙钟幂等、空间/会话版本不同即冲突、完整性校验（篡改内容/伪造哈希/重复标识/缺失引用/时间线外来与重排/内嵌包损坏/高版本/manifest 不一致）、确定性校验摘要、恢复前校验（损坏/重复恢复/目标冲突）、恢复空间（新标识同内容指纹、历史会话只读但可新建会话、意见引用仍可解析）、列表筛选
 - `test/replay-session-api.test.js`：真实起服务走完线上流程并导入回放空间，覆盖创建（锁定意见版本与引用摘要、create 留痕；空选集/重复加入/非法截止/缺参与人 400/409/404、缺 If-Match 428、旧空间版本 409）、提交结论（成功推进进度与版本并留痕；缺 X-Session-Version 428、旧会话版本 409、非参与人 403、非法结论 400、会话外意见 404、重复结论 409、备注超长 413）、冲突（会话外关闭/更新意见后提交 -> 409 标记冲突且意见不被覆盖、冲突数实时可见）、过期会话拒绝提交且意见可重选新会话、会话报告导出（只读不推空间/会话/线上 rev、下载头、不存在会话 404 不改变空间）、归档恢复会话只读（session_archived_readonly）且不阻止新建会话、重启后会话/结论/冲突/记录恢复且版本检查仍生效、会话路径无线上动作接口、删除空间级联移除会话
 - `test/replay-archive-api.test.js`：真实起服务走完线上任务→导出导入→意见→会话→结论，覆盖生成归档（进行中 409、缺 If-Match 428、旧空间版本 409、完成/过期成功且不推源空间与线上 rev、同内容幂等 200、内容或版本变化 409 archive_conflict 且不改既有归档）、归档详情（完整时间线/进度快照/意见摘要/内容指纹/确定性校验摘要）、列表按空间/参与人/时间范围/状态筛选与非法参数、筛选保存持久化与回退、下载只读、恢复预览（不写空间、留痕）、恢复（新标识同内容哈希与链头、归档标记 restored、历史会话只读、新空间可新建会话并提交结论）、重复恢复 409、损坏/伪造哈希整次拒绝不写空间且留痕、两阶段崩溃对账、归档/预览/恢复/筛选操作记录时间筛选与重启恢复、回放路径无线上动作接口
+- `test/replay-reconcile-core.test.js`：六维差异（锁定意见/逐条结论/冲突/时间线/指纹/恢复，定位器与标签）、交换入参顺序结果完全一致（按归档 id 归一化 A/B）、损坏/篡改/缺引用/指纹不一致明确失败不合并、差异指纹与恢复状态变化、批次输入校验（负责人/截止/审批人 1~3 名/负责人不得自审/内容指纹不同必须选基线/逐差异裁决）、提交前重校验（归档替换/删除/指纹变化）、纠错合成（keep_a/keep_b/manual 人工标记、新标识同内容指纹、意见剔除导致缺引用整批拒绝、同 id 不同 targetKey 目标标识冲突）、纠错归档完整性校验与确定性摘要、目标冲突、新空间（只读纠错会话+可新建会话+意见引用可解析）、纯函数不改输入
+- `test/replay-reconcile-api.test.js`：真实起服务走完线上任务→导入→归档→恢复空间再归档得到同内容两归档，覆盖差异比较（六维定位/交换顺序幂等/缺 If-Match 428/缺归档 404/同一归档 400/不推进归档与线上 rev）、批次校验与创建、X-Batch-Version 双重锁、提交重校验、审批（非审批人 403/非法 decision 400/本轮重复 409/驳回后修改重提/全员通过）、审批不足执行整批 failed 留痕不新增空间、审批通过执行（只读纠错归档+新包标识+新回放空间、内容指纹同基线、人工标记、纠错会话只读、可继续新建会话）、原归档/原空间/线上不变、归档恢复后旧差异 409 diff_conflict 与旧批次提交 failed、纠错归档下载只读、两阶段崩溃孤儿空间重启清理、差异/批次/审批/失败原因重启恢复、对账路径无线上动作接口
 
 ## Docker 部署
 
@@ -736,7 +866,9 @@ replay-session-core.js 复核会话纯逻辑（浏览器与 Node 共用，依赖
 replay-archive-core.js 复核会话归档中心纯逻辑（浏览器与 Node 共用，依赖 replay-core/replay-review-core/replay-session-core）：归档资格（完成/过期）、不可变归档构建（锁定意见/逐条结论/冲突/操作日志时间线/意见摘要/内容指纹/内嵌审计包，内容寻址 id）、归档完整性校验（哈希/重复标识/缺失引用/时间线/内嵌包/指纹）、确定性校验摘要、恢复前校验（损坏/重复标识/缺失引用/目标空间冲突）、新标识恢复空间构建、列表筛选
 replay.js         执行回放 UI：按时间范围导出并下载审计包、本地选文件导入（校验失败保留原因）、回放空间列表、只读时间线（按任务/事件类型筛选并可记住筛选）、锁定快照查看；历史证据复核（事件/冲突结果上添加意见、复核筛选与已保存筛选、修改/转派/关闭带版本冲突处理、状态变化记录、复核清单下载）；复核会话（按当前筛选选集创建、实时进度与冲突数量轮询刷新、逐条结论提交与冲突展示、操作记录、会话报告下载、归档入口）；无任何暂停/审批/执行入口
 replay-archive.js 复核会话归档中心 UI：归档中心（按空间/参与人/时间/状态筛选、记住筛选、操作记录）、从已完成/过期会话生成归档（幂等/冲突提示）、归档详情（完整时间线/进度快照/逐条结论与冲突/意见摘要/内容指纹/确定性校验摘要）、下载归档、先预览再恢复到新回放空间（损坏/冲突整次拒绝展示）、恢复后进入新空间
-server.js         零依赖服务：静态文件 + 快照、批注、审阅批次、审阅决策、执行队列（依赖/审批门控）JSON API（四集合乐观锁、原子落盘、定时执行调度器与门控对账）+ 执行回放（审计包只读导出、全量校验后导入独立回放空间、失败记录、筛选条件与校验结果持久化）+ 历史证据复核（空间 rev 与意见 version 双重乐观锁、引用存在性校验、终态保护、状态记录、清单纯只读导出、随回放空间原子持久化）+ 复核会话（创建锁定意见版本与引用摘要、空间 rev 与会话 version 双重乐观锁、结论冲突标记拒绝覆盖、过期拒绝、操作记录、报告纯只读导出、随回放空间原子持久化）+ 复核会话归档中心（独立存储与 X-Archive-Rev；会话状态与空间版本校验、内容寻址幂等/版本冲突、归档完整性校验、先预览后两阶段事务恢复到新回放空间、归档/预览/恢复/筛选操作记录、崩溃对账、重启恢复）
+replay-reconcile-core.js 归档差异与纠错对账中心纯逻辑（浏览器与 Node 共用，依赖 replay-core/replay-review-core/replay-archive-core）：两归档完整性预检（损坏/缺引用/摘要不一致明确失败不合并）、按归档 id 归一化的确定性六维差异（锁定意见/逐条结论/冲突/时间线多重集/内容指纹/恢复状态，稳定差异 id 与定位器、交换顺序结果一致）、差异指纹、纠错批次输入校验（负责人/截止/审批人/基线归档/逐条 keep_a/keep_b/manual 裁决）、提交前重校验（归档未替换+差异指纹未变）、纠错合成（意见/条目/时间线合并、目标标识冲突、缺引用整批拒绝、内容寻址纠错归档与新标识审计包）、纠错归档完整性校验、新纠错空间构建
+replay-reconcile.js 归档差异与纠错对账中心 UI：新建差异比较（选两个归档）、差异详情（六维分组、A/B 对照、损坏原因展示）、创建纠错批次（逐差异选择保留 A/采用 B/人工复核、负责人/截止/审批人/基线）、批次提交/记名审批通过驳回/执行、失败原因与审批记录、纠错归档详情（校验摘要/裁决/新空间溯源）/下载、操作记录
+server.js         零依赖服务：静态文件 + 快照、批注、审阅批次、审阅决策、执行队列（依赖/审批门控）JSON API（四集合乐观锁、原子落盘、定时执行调度器与门控对账）+ 执行回放（审计包只读导出、全量校验后导入独立回放空间、失败记录、筛选条件与校验结果持久化）+ 历史证据复核（空间 rev 与意见 version 双重乐观锁、引用存在性校验、终态保护、状态记录、清单纯只读导出、随回放空间原子持久化）+ 复核会话（创建锁定意见版本与引用摘要、空间 rev 与会话 version 双重乐观锁、结论冲突标记拒绝覆盖、过期拒绝、操作记录、报告纯只读导出、随回放空间原子持久化）+ 复核会话归档中心（独立存储与 X-Archive-Rev；会话状态与空间版本校验、内容寻址幂等/版本冲突、归档完整性校验、先预览后两阶段事务恢复到新回放空间、归档/预览/恢复/筛选操作记录、崩溃对账、重启恢复）+ 归档差异与纠错对账中心（独立存储与 X-Reconcile-Rev；两归档完整性预检、确定性六维差异、批次双重乐观锁、提交/执行前归档未替换与差异指纹重校验、记名审批轮次、审批不足/缺引用/目标标识冲突整批 failed 留痕、两阶段事务生成只读纠错归档与新回放空间、孤儿纠错空间崩溃对账、重启恢复）
 test/             node:test 单元与集成测试
 Dockerfile        node:20-alpine，EXPOSE 8080，数据卷 /app/data
 ```

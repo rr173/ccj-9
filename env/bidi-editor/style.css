@@ -1653,3 +1653,27 @@ tr.rp-added { background: #f0fdf4; }
 }
 .archive-preview-bad ul { margin: 6px 0 0 18px; font-size: 12px; }
 .archive-fingerprint { margin-top: 4px; }
+
+/* ================= 归档差异与纠错对账中心 ================= */
+.reconcile-center .reconcile-lists { margin-top: 10px; display: flex; flex-direction: column; gap: 12px; }
+.reconcile-section > div { margin-top: 6px; }
+.reconcile-diff-item .archive-detail-actions { margin-top: 8px; }
+.reconcile-items { display: flex; flex-direction: column; gap: 12px; margin-top: 10px; }
+.reconcile-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; table-layout: fixed; }
+.reconcile-table th, .reconcile-table td {
+  border: 1px solid var(--border, #ddd); padding: 6px 8px; vertical-align: top;
+  text-align: start; word-break: break-word;
+}
+.reconcile-table th { background: rgba(0,0,0,0.03); }
+.reconcile-table td:nth-child(2), .reconcile-table td:nth-child(3) { width: 38%; }
+.reconcile-loc-label { font-weight: 600; }
+.reconcile-loc { color: #666; font-size: 11px; margin-top: 2px; }
+.reconcile-side-empty, .reconcile-side-absent { color: #999; font-style: italic; }
+.reconcile-side-absent { color: #b45309; }
+.reconcile-side-val { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+.reconcile-decide { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
+.reconcile-decide-line { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 0; border-bottom: 1px dashed rgba(0,0,0,0.08); }
+.reconcile-decide-info { flex: 1; min-width: 0; }
+.reconcile-decide-line select { flex-shrink: 0; }
+.archive-log-ok { color: #166534; }
+.archive-log-bad { color: #991b1b; }
