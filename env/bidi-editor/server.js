@@ -42,6 +42,7 @@ const decision = require("./decision-core");
 const replay = require("./replay-core");
 const replayReview = require("./replay-review-core");
 const replaySession = require("./replay-session-core");
+const replayArchive = require("./replay-archive-core");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
@@ -55,6 +56,9 @@ const DECISION_FILE = process.env.REVIEW_DECISIONS_FILE ||
   path.join(ROOT, "data", "review-decisions.json");
 const REPLAY_FILE = process.env.REPLAY_SPACES_FILE ||
   path.join(ROOT, "data", "replay-spaces.json");
+// 复核会话归档中心：与回放空间、线上四集合完全隔离的独立存储
+const ARCHIVE_FILE = process.env.REPLAY_ARCHIVES_FILE ||
+  path.join(ROOT, "data", "replay-archives.json");
 const REQUEST_BODY_LIMIT = 4 * 1024 * 1024; // 传输字节上限（校验逻辑另有字符上限）
 // 审计包内含锁定文本，允许更大的导入请求体（可用环境变量覆盖）
 const REPLAY_BODY_LIMIT = Number(process.env.REPLAY_BODY_LIMIT_BYTES) ||
@@ -894,6 +898,129 @@ try {
   // 文件不存在/损坏：以空存储启动，损坏文件不覆盖
 }
 
+/* ================= 复核会话归档中心（独立存储） =================
+ *
+ * 归档中心与回放空间、线上四集合完全隔离：
+ *   - 归档生成只读取源回放空间（reviews/sessions/content/manifest），
+ *     绝不修改源空间、源会话，也不触碰 batch/decision/ann/snapshot 四集合；
+ *   - 归档不可变：id 与全部哈希由内容确定性决定，同内容重复生成幂等，
+ *     内容或版本不同返回 409 archive_conflict；
+ *   - 恢复（restore）在任何写盘之前完成全部校验（归档完整性、重复标识、
+ *     缺失引用、锁定内容指纹、目标空间冲突），任一失败整次拒绝：
+ *     archiveStore 与 replayStore 都不写入；
+ *   - 恢复成功后写入一个“新的”回放空间（独立包标识，锁定内容一字不动），
+ *     其中归档带入的历史会话只读，但可继续创建新的复核会话；
+ *   - 归档/预览/恢复/筛选的操作记录只增不改，随本文件原子落盘，重启可续。
+ */
+
+const archiveStore = {
+  rev: 0,
+  records: [],   // 不可变归档记录（含 payload/manifest）
+  logs: [],      // 归档中心操作记录（create/preview/restore/filter，含失败留痕）
+  filters: { spaceId: "", participant: "", from: "", to: "", status: "" }
+};
+
+function persistArchives(cb) {
+  const tmp = ARCHIVE_FILE + ".tmp";
+  fs.mkdir(path.dirname(ARCHIVE_FILE), { recursive: true }, function () {
+    fs.writeFile(tmp, JSON.stringify(archiveStore), function (err) {
+      if (err) { cb(err); return; }
+      fs.rename(tmp, ARCHIVE_FILE, cb); // 同目录原子替换
+    });
+  });
+}
+
+try {
+  const rawArc = fs.readFileSync(ARCHIVE_FILE, "utf8");
+  const dataArc = JSON.parse(rawArc);
+  if (Number.isInteger(dataArc.rev) && Array.isArray(dataArc.records)) {
+    archiveStore.rev = dataArc.rev;
+    archiveStore.records = dataArc.records;
+    archiveStore.logs = Array.isArray(dataArc.logs) ? dataArc.logs : [];
+    archiveStore.filters = dataArc.filters && typeof dataArc.filters === "object"
+      ? dataArc.filters
+      : { spaceId: "", participant: "", from: "", to: "", status: "" };
+
+    // 崩溃对账：恢复是“先写回放空间、再标记归档”的两阶段。若停机发生在两步之间，
+    // 重启时把已存在恢复空间但未标记的归档补齐（不产生重复日志），避免孤儿新空间。
+    archiveStore.records.forEach(function (rec) {
+      // 只处理“仍是 active 但已存在恢复空间”的半成品记录
+      if (rec.status === "restored" || rec.restoredSpaceId) return;
+      const target = replayStore.spaces.find(function (sp) {
+        return sp.restoredFromArchiveId === rec.id;
+      });
+      if (target) {
+        rec.status = "restored";
+        rec.restoredSpaceId = target.id;
+        rec.restoredAt = target.restoredAt || target.importedAt || null;
+        rec.restoredBy = target.restoredBy || null;
+      }
+    });
+  }
+} catch (e) {
+  // 文件不存在/损坏：以空存储启动，损坏文件不覆盖
+}
+
+function findArchive(id) {
+  return archiveStore.records.find(function (r) { return r.id === id; }) || null;
+}
+
+function addArchiveLog(entry) {
+  const e = Object.assign({
+    id: crypto.randomUUID(),
+    at: new Date().toISOString()
+  }, entry);
+  archiveStore.logs.push(e);
+  if (archiveStore.logs.length > replayArchive.LIMITS.ARCHIVE_LOGS_MAX) {
+    archiveStore.logs.splice(0,
+      archiveStore.logs.length - replayArchive.LIMITS.ARCHIVE_LOGS_MAX);
+  }
+  return e;
+}
+
+// 归档中心自身的内存修改 + 原子落盘（失败回滚 rev/records/logs）
+function mutateArchives(mutator, cb) {
+  const backup = JSON.parse(JSON.stringify({
+    rev: archiveStore.rev, records: archiveStore.records,
+    logs: archiveStore.logs, filters: archiveStore.filters
+  }));
+  let result;
+  try { result = mutator(); }
+  catch (e) {
+    archiveStore.rev = backup.rev;
+    archiveStore.records = backup.records;
+    archiveStore.logs = backup.logs;
+    archiveStore.filters = backup.filters;
+    cb({ status: 500, code: "internal_error", message: e.message });
+    return;
+  }
+  persistArchives(function (err) {
+    if (err) {
+      archiveStore.rev = backup.rev;
+      archiveStore.records = backup.records;
+      archiveStore.logs = backup.logs;
+      archiveStore.filters = backup.filters;
+      cb({ status: 500, code: "persist_failed",
+        message: "归档操作落盘失败，已回滚，任何归档与回放空间均未被改动" });
+      return;
+    }
+    cb(null, result);
+  });
+}
+
+// 尽力而为落盘一条记录（如失败留痕本身失败，不改变业务结果，仅记录到内存）
+function persistArchiveLog(entry, cb) {
+  const stored = addArchiveLog(entry);
+  persistArchives(function (err) {
+    if (err) {
+      // 落盘失败：保留内存中的记录，服务重启前仍可查；不阻断主流程
+      if (cb) cb(err);
+      return;
+    }
+    if (cb) cb(null, stored);
+  });
+}
+
 function findReplaySpace(id) {
   return replayStore.spaces.find(function (s) { return s.id === id; });
 }
@@ -932,6 +1059,12 @@ function publicReplaySpace(sp) {
     range: sp.range,
     manifest: sp.manifest,
     view: sp.view || { taskId: "", category: "", action: "", annotationId: "" },
+    // 归档恢复溯源（普通导入空间为 null）
+    restoredFromArchiveId: sp.restoredFromArchiveId || null,
+    originSpaceId: sp.originSpaceId || null,
+    originPackageId: sp.originPackageId || null,
+    restoredAt: sp.restoredAt || null,
+    restoredBy: sp.restoredBy || null,
     validation: {
       verified: true,
       contentHash: sp.manifest && sp.manifest.contentHash,
@@ -971,6 +1104,11 @@ function publicReplaySummary(sp) {
     exportedAt: sp.exportedAt,
     range: sp.range,
     view: sp.view || { taskId: "", category: "", action: "", annotationId: "" },
+    // 归档恢复溯源（普通导入空间这些字段为 undefined -> 序列化缺省）
+    restoredFromArchiveId: sp.restoredFromArchiveId || null,
+    originPackageId: sp.originPackageId || null,
+    restoredAt: sp.restoredAt || null,
+    restoredBy: sp.restoredBy || null,
     manifest: {
       contentHash: sp.manifest.contentHash,
       chainHead: sp.manifest.chainHead,
@@ -1288,6 +1426,8 @@ function publicSession(s, nowIso) {
     createdBy: s.createdBy,
     createdAt: s.createdAt,
     filters: s.filters || null,
+    archived: !!s.archived,
+    restoredFromArchive: !!s.restoredFromArchive,
     progress: replaySession.sessionProgress(s, nowIso || new Date().toISOString())
   };
 }
@@ -1319,7 +1459,10 @@ function createSpaceSession(sp, body, actor, cb) {
     return;
   }
   const checked = replaySession.validateCreate(
-    body, sp.reviews || [], sp.sessions || [], now);
+    body, sp.reviews || [],
+    // 归档恢复带入的历史会话（archived）永久只读，其意见可以被新会话重新选取
+    (sp.sessions || []).filter(function (x) { return !x.archived; }),
+    now);
   if (!checked.ok) {
     const status = checked.code === "review_not_found" ? 404
       : (checked.code === "already_in_session" ||
@@ -1369,6 +1512,13 @@ function createSpaceSession(sp, body, actor, cb) {
 
 function submitSessionConclusion(sp, s, body, cb) {
   const now = new Date().toISOString();
+  // 归档恢复带入的历史会话永久只读，不能再提交结论（可在新空间另建新会话）
+  if (s.archived) {
+    cb({ status: 409, code: "session_archived_readonly",
+      message: "该会话来自归档恢复，是只读的历史会话，不能再提交结论；" +
+        "可在本回放空间创建新的复核会话" });
+    return;
+  }
   // 过期会话明确拒绝（不改变任何状态）
   if (replaySession.isExpired(s, now)) {
     cb({ status: 409, code: "session_expired",
@@ -1786,6 +1936,12 @@ function handleReplay(req, res, parts, urlObj) {
   if (seg[0] === "failures" && req.method === "GET") {
     sendJSON(res, 200, { rev: replayStore.rev,
       failures: replayStore.failures.slice().reverse() });
+    return;
+  }
+
+  /* ---- 复核会话归档中心：/api/replay/archives... ---- */
+  if (seg[0] === "archives") {
+    handleReplayArchives(req, res, seg, urlObj);
     return;
   }
 
@@ -2362,6 +2518,15 @@ function handleReplaySessions(req, res, sp, seg, urlObj) {
   /* POST /spaces/:id/sessions/:sid/conclusions：参与人逐条提交结论
      （If-Match: 空间 rev + X-Session-Version: 会话版本） */
   if (seg.length === 2 && seg[1] === "conclusions" && req.method === "POST") {
+    // 归档恢复带入的历史会话永久只读：优先于版本检查直接拒绝
+    if (s.archived) {
+      readBody(req, function () {
+        apiError(res, 409, "session_archived_readonly",
+          "该会话来自归档恢复，是只读的历史会话，不能再提交结论；" +
+          "可在本回放空间创建新的复核会话");
+      });
+      return;
+    }
     if (checkSessionVersions(res, req, sp, s)) return;
     readBody(req, function (err, raw) {
       if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
@@ -2414,8 +2579,7 @@ function handleReplaySessions(req, res, sp, seg, urlObj) {
 
   /* POST /spaces/:id/sessions/:sid/report：导出独立会话报告
      （纯只读，不写盘、不推任何 rev；导出失败不改变意见、会话进度或回放空间） */
-  if (seg.length === 2 && seg[1] === "report" && req.method === "POST") {
-    readBody(req, function (err, raw) {
+  if (seg.length === 2 && seg[1] === "report" && req.method === "POST") {    readBody(req, function (err, raw) {
       if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
       let body = {};
       if (raw) {
@@ -2447,9 +2611,496 @@ function handleReplaySessions(req, res, sp, seg, urlObj) {
     return;
   }
 
+  /* POST /spaces/:id/sessions/:sid/archive：生成不可变归档
+     （If-Match: 源空间 rev；只读取空间，校验会话状态与版本，不改变源空间） */
+  if (seg.length === 2 && seg[1] === "archive" && req.method === "POST") {
+    handleSpaceSessionArchive(req, res, sp, s, urlObj);
+    return;
+  }
+
   apiError(res, 404, "not_found", "复核会话接口不存在");
 }
 
+/* ================= 复核会话归档中心 API =================
+ *
+ * 路由（挂在 /api/replay/archives 下，与线上数据完全隔离）：
+ *   GET    /api/replay/archives[?spaceId=&participant=&from=&to=&status=]
+ *   PUT    /api/replay/archives/view                 保存列表筛选（持久化、留痕）
+ *   POST   /api/replay/spaces/:id/sessions/:sid/archive
+ *                                                  生成归档（If-Match: 源空间 rev）
+ *   GET    /api/replay/archives/:aid                归档详情（时间线/进度快照/校验摘要）
+ *   GET    /api/replay/archives/:aid/download       下载归档 JSON（只读，不写任何存储）
+ *   POST   /api/replay/archives/:aid/preview        恢复前预览（完整校验，不写盘，留痕）
+ *   POST   /api/replay/archives/:aid/restore        校验通过后恢复为新回放空间（整次拒绝）
+ *   GET    /api/replay/archives/logs[?from=&to=]    归档中心操作记录
+ */
+
+// 生成归档：校验会话状态与空间版本；同内容幂等；内容/版本不同明确冲突。
+// 全程只读取源回放空间，成功也不改变源空间 rev。
+function createSessionArchive(sp, s, body, actor, cb) {
+  const now = new Date().toISOString();
+  if (archiveStore.records.length >= replayArchive.LIMITS.ARCHIVES_MAX) {
+    persistArchiveLog({
+      action: "create", ok: false, code: "archive_too_large",
+      actor: actor, sourceSpaceId: sp.id, sourceSessionId: s.id,
+      message: "归档数量已达上限"
+    });
+    cb({ status: 413, code: "archive_too_large",
+      message: "归档中心归档数量已达上限 " + replayArchive.LIMITS.ARCHIVES_MAX });
+    return;
+  }
+  if (s.archived) {
+    persistArchiveLog({
+      action: "create", ok: false, code: "session_archived_readonly",
+      actor: actor, sourceSpaceId: sp.id, sourceSessionId: s.id,
+      message: "历史只读会话不能再次归档"
+    });
+    cb({ status: 409, code: "session_archived_readonly",
+      message: "该会话是归档恢复带入的只读历史会话，不能再次归档" });
+    return;
+  }
+
+  const built = replayArchive.buildArchive({
+    space: sp, session: s, actor: actor, now: now
+  });
+  if (!built.ok) {
+    const status = built.code === "session_not_found" ? 404
+      : built.code === "archive_broken_reference" ? 409
+      : built.code === "session_not_archivable" ? 409
+      : 400;
+    persistArchiveLog({
+      action: "create", ok: false, code: built.code,
+      actor: actor, sourceSpaceId: sp.id, sourceSessionId: s.id,
+      message: built.message, detail: built.progress
+        ? { progress: built.progress } : null
+    });
+    cb(Object.assign({ status: status, code: built.code, message: built.message },
+      built.progress ? { progress: built.progress } : {}));
+    return;
+  }
+  const rec = built.value;
+
+  // 幂等 / 冲突判定（键：源空间 + 源会话）
+  const existing = archiveStore.records.find(function (x) {
+    return x.sourceSpaceId === rec.sourceSpaceId &&
+           x.sourceSessionId === rec.sourceSessionId;
+  });
+  if (existing) {
+    if (existing.id === rec.id &&
+        existing.manifest.payloadHash === rec.manifest.payloadHash) {
+      // 同一会话、相同内容与版本：幂等返回既有归档，不新建、不留新记录
+      cb(null, { status: 200, record: existing, idempotent: true });
+      return;
+    }
+    // 会话已变化（新增结论/冲突标记/意见变化）——内容或版本不同，明确冲突
+    persistArchiveLog({
+      action: "create", ok: false, code: "archive_conflict",
+      actor: actor, sourceSpaceId: sp.id, sourceSessionId: s.id,
+      archiveId: existing.id,
+      message: "该会话已有不同内容/版本的归档；归档不可变，本次拒绝"
+    });
+    cb({ status: 409, code: "archive_conflict",
+      message: "该会话已归档（" + existing.id +
+        "），且当前会话内容或版本与既有归档不同。归档不可变，不能覆盖；" +
+        "如需保留当前状态，请在新会话完成后归档。",
+      existingArchiveId: existing.id });
+    return;
+  }
+
+  mutateArchives(function () {
+    archiveStore.records.push(rec);
+    archiveStore.rev++;
+    addArchiveLog({
+      action: "create", ok: true, actor: actor,
+      sourceSpaceId: sp.id, sourceSessionId: s.id,
+      archiveId: rec.id,
+      detail: {
+        reason: rec.archivedReason,
+        payloadHash: rec.manifest.payloadHash,
+        contentHash: rec.manifest.contentHash,
+        chainHead: rec.manifest.chainHead,
+        conclusionCount: rec.manifest.conclusionCount,
+        conflictCount: rec.manifest.conflictCount
+      }
+    });
+    return rec;
+  }, function (failure, out) {
+    if (failure) { cb(failure); return; }
+    cb(null, { status: 201, record: out, idempotent: false });
+  });
+}
+
+// 恢复前预览：跑完整校验但绝不写盘（archiveStore 与 replayStore 都不动）。
+function previewArchiveRestore(rec, actor, cb) {
+  const verified = replayArchive.verifyArchiveRecord(rec);
+  if (!verified.ok) {
+    persistArchiveLog({
+      action: "preview", ok: false, code: verified.code,
+      actor: actor, archiveId: rec.id, message: verified.message,
+      errors: verified.errors || []
+    }, function () {
+      cb({ status: 409, code: verified.code, message: verified.message,
+        errors: verified.errors || [], embeddedCode: verified.embeddedCode || null });
+    });
+    return;
+  }
+  const check = replayArchive.validateRestore(rec, replayStore.spaces);
+  if (!check.ok) {
+    const status = check.code === "restore_target_conflict" ? 409 : 400;
+    persistArchiveLog({
+      action: "preview", ok: false, code: check.code,
+      actor: actor, archiveId: rec.id, message: check.message,
+      existingSpaceId: check.existingSpaceId || null
+    }, function () {
+      cb(Object.assign({ status: status, code: check.code, message: check.message },
+        check.existingSpaceId ? { existingSpaceId: check.existingSpaceId } : {}));
+    });
+    return;
+  }
+  // 预览留痕（成功）：纯校验结果，不产生任何空间写入
+  persistArchiveLog({
+    action: "preview", ok: true, actor: actor, archiveId: rec.id,
+    detail: { wouldCreatePackageId: check.value.pkg.packageId }
+  }, function () {
+    cb(null, {
+      archive: replayArchive.publicArchiveDetail(rec),
+      canRestore: true,
+      checks: replayArchive.verificationSummary(rec),
+      target: {
+        name: (rec.sessionName ? rec.sessionName + "（归档恢复）" : "归档恢复空间"),
+        packageId: check.value.pkg.packageId,
+        originPackageId: check.value.originPackageId,
+        producerId: check.value.pkg.producerId,
+        contentHash: check.value.pkg.manifest.contentHash,
+        chainHead: check.value.pkg.manifest.chainHead,
+        eventCount: check.value.pkg.manifest.eventCount,
+        reviewCount: rec.manifest.reviewCount,
+        sessionCount: 1
+      }
+    });
+  });
+}
+
+// 恢复：所有写盘前校验通过后，两步原子化落盘（先 replayStore，再 archiveStore），
+// 任一失败都整次回滚——原回放空间、原会话、线上数据绝不被改变。
+function restoreArchive(rec, body, actor, cb) {
+  const verified = replayArchive.verifyArchiveRecord(rec);
+  if (!verified.ok) {
+    // 恢复失败留痕；不写任何空间
+    persistArchiveLog({
+      action: "restore", ok: false, code: verified.code,
+      actor: actor, archiveId: rec.id, message: verified.message,
+      errors: verified.errors || []
+    });
+    cb({ status: 409, code: verified.code, message: verified.message,
+      errors: verified.errors || [], embeddedCode: verified.embeddedCode || null });
+    return;
+  }
+  if (rec.status === "restored" || rec.restoredSpaceId) {
+    persistArchiveLog({
+      action: "restore", ok: false, code: "archive_already_restored",
+      actor: actor, archiveId: rec.id, message: "归档已恢复，不能重复恢复",
+      existingSpaceId: rec.restoredSpaceId
+    });
+    cb({ status: 409, code: "archive_already_restored",
+      message: "归档 " + rec.id + " 已恢复为回放空间 " + rec.restoredSpaceId +
+        "，不能重复恢复",
+      existingSpaceId: rec.restoredSpaceId });
+    return;
+  }
+  const check = replayArchive.validateRestore(rec, replayStore.spaces);
+  if (!check.ok) {
+    persistArchiveLog({
+      action: "restore", ok: false, code: check.code,
+      actor: actor, archiveId: rec.id, message: check.message,
+      existingSpaceId: check.existingSpaceId || null
+    });
+    cb(Object.assign({ status: 409, code: check.code, message: check.message },
+      check.existingSpaceId ? { existingSpaceId: check.existingSpaceId } : {}));
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const name = typeof body.name === "string" && body.name.trim()
+    ? body.name.trim().slice(0, replayArchive.LIMITS.NAME_MAX_CHARS)
+    : (rec.sessionName ? rec.sessionName + "（归档恢复）" : "归档恢复空间");
+  const newSp = replayArchive.buildRestoredSpace(rec, check.value, {
+    id: crypto.randomUUID(), now: now, actor: actor, name: name
+  });
+
+  // 第一步：写 replayStore（先备份，失败整体回滚）
+  const replayBackup = { rev: replayStore.rev, count: replayStore.spaces.length };
+  replayStore.spaces.push(newSp);
+  replayStore.rev++;
+  persistReplay(function (perr) {
+    if (perr) {
+      const i = replayStore.spaces.indexOf(newSp);
+      if (i !== -1) replayStore.spaces.splice(i, 1);
+      replayStore.rev = replayBackup.rev;
+      persistArchiveLog({
+        action: "restore", ok: false, code: "persist_failed",
+        actor: actor, archiveId: rec.id,
+        message: "恢复空间落盘失败，已整体回滚：" + perr.message
+      });
+      cb({ status: 500, code: "persist_failed",
+        message: "恢复空间保存失败，已整体回滚，原回放空间与归档均未被改动" });
+      return;
+    }
+
+    // 第二步：标记归档已恢复 + 留痕（archiveStore 失败则撤回刚写的空间）
+    const archiveBackup = JSON.parse(JSON.stringify({
+      rev: archiveStore.rev, records: archiveStore.records, logs: archiveStore.logs
+    }));
+    rec.status = "restored";
+    rec.restoredAt = now;
+    rec.restoredBy = actor;
+    rec.restoredSpaceId = newSp.id;
+    archiveStore.rev++;
+    addArchiveLog({
+      action: "restore", ok: true, actor: actor, archiveId: rec.id,
+      newSpaceId: newSp.id,
+      detail: {
+        packageId: newSp.packageId,
+        originPackageId: check.value.originPackageId,
+        contentHash: newSp.manifest.contentHash,
+        chainHead: newSp.manifest.chainHead
+      }
+    });
+    persistArchives(function (aerr) {
+      if (aerr) {
+        // 归档状态落盘失败：撤回新空间，保持“恢复未发生”
+        const j = replayStore.spaces.indexOf(newSp);
+        if (j !== -1) replayStore.spaces.splice(j, 1);
+        replayStore.rev = replayBackup.rev;
+        archiveStore.rev = archiveBackup.rev;
+        archiveStore.records = archiveBackup.records;
+        archiveStore.logs = archiveBackup.logs;
+        persistReplay(function () {
+          cb({ status: 500, code: "persist_failed",
+            message: "恢复标记落盘失败，已整体回滚，新空间未保留、原数据未改动" });
+        });
+        return;
+      }
+      cb(null, { status: 201, space: newSp, archive: rec });
+    });
+  });
+}
+
+// 归档中心集合 / 单项 / 预览 / 恢复 / 记录 路由
+function handleReplayArchives(req, res, seg, urlObj) {
+  // seg（去掉 "api","replay" 后）形如 ["archives", ...]，先归一化为去掉前缀的 tail：
+  //   []（archives 本身）| [":aid"] | [":aid","preview"|"restore"|"download"]
+  //   ["logs"] | ["view"]
+  const tail = seg[0] === "archives" ? seg.slice(1) : seg;
+  const params = urlObj.searchParams;
+
+  /* PUT /api/replay/archives/view：保存列表筛选（持久化、留痕、可重启恢复） */
+  if (tail.length === 1 && tail[0] === "view" && req.method === "PUT") {
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body = {};
+      if (raw) {
+        try { body = JSON.parse(raw) || {}; }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      }
+      const norm = replayArchive.normalizeArchiveFilters(body);
+      if (!norm.ok) { apiError(res, 400, norm.code, norm.message); return; }
+      mutateArchives(function () {
+        archiveStore.filters = norm.value;
+        archiveStore.rev++;
+        addArchiveLog({ action: "filter", ok: true,
+          actor: review.validateAuthor(body.actor).value, detail: norm.value });
+        return norm.value;
+      }, function (failure, filters) {
+        if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+        sendJSON(res, 200, { rev: archiveStore.rev, filters: filters });
+      });
+    });
+    return;
+  }
+
+  /* GET /api/replay/archives/logs：归档中心操作记录（?from=&to=，时间倒序） */
+  if (tail.length === 1 && tail[0] === "logs" && req.method === "GET") {
+    const from = params.get("from");
+    const to = params.get("to");
+    if (from && !replayArchive.isISODateString(from)) {
+      apiError(res, 400, "invalid_from", "起始时间不是合法 ISO 时间"); return;
+    }
+    if (to && !replayArchive.isISODateString(to)) {
+      apiError(res, 400, "invalid_to", "结束时间不是合法 ISO 时间"); return;
+    }
+    if (from && to && Date.parse(from) > Date.parse(to)) {
+      apiError(res, 400, "invalid_range", "起始时间晚于结束时间"); return;
+    }
+    const logs = archiveStore.logs.filter(function (l) {
+      if (from && Date.parse(l.at) < Date.parse(from)) return false;
+      if (to && Date.parse(l.at) > Date.parse(to)) return false;
+      return true;
+    }).slice().sort(function (a, b) {
+      var d = Date.parse(b.at) - Date.parse(a.at);
+      if (d) return d;
+      return a.id < b.id ? 1 : -1;
+    });
+    sendJSON(res, 200, { rev: archiveStore.rev, count: logs.length, logs: logs });
+    return;
+  }
+
+  /* GET /api/replay/archives：归档列表（空间/参与人/时间范围/状态筛选） */
+  if (tail.length === 0 && req.method === "GET") {
+    // 显式查询参数优先；缺省回退已保存筛选（重启后仍可继续）
+    const saved = archiveStore.filters || {};
+    const pick = function (name) {
+      const v = params.get(name);
+      return v !== null ? v : (saved[name] || "");
+    };
+    const opts = {
+      spaceId: pick("spaceId"), participant: pick("participant"),
+      from: pick("from"), to: pick("to"), status: pick("status")
+    };
+    const norm = replayArchive.normalizeArchiveFilters(opts);
+    if (!norm.ok) { apiError(res, 400, norm.code, norm.message); return; }
+    const list = replayArchive.filterArchives(archiveStore.records, norm.value)
+      .slice()
+      .sort(function (a, b) {
+        var d = Date.parse(b.archivedAt) - Date.parse(a.archivedAt);
+        if (d) return d;
+        return a.id < b.id ? 1 : -1;
+      })
+      .map(replayArchive.publicArchive);
+    sendJSON(res, 200, {
+      rev: archiveStore.rev,
+      filters: norm.value,
+      count: list.length,
+      total: archiveStore.records.length,
+      archives: list
+    });
+    return;
+  }
+
+  if (tail.length < 1) {
+    apiError(res, 404, "not_found", "归档接口不存在");
+    return;
+  }
+
+  const rec = findArchive(tail[0]);
+  if (!rec) {
+    apiError(res, 404, "archive_not_found", "归档不存在或已被删除");
+    return;
+  }
+
+  /* GET /api/replay/archives/:aid：归档详情（完整时间线/进度快照/校验摘要） */
+  if (tail.length === 1 && req.method === "GET") {
+    sendJSON(res, 200, {
+      rev: archiveStore.rev,
+      archive: replayArchive.publicArchiveDetail(rec)
+    });
+    return;
+  }
+
+  /* GET /api/replay/archives/:aid/download：下载归档 JSON（纯只读，不写任何存储） */
+  if (tail.length === 2 && tail[1] === "download" && req.method === "GET") {
+    // 下载前不强制校验（损坏归档也应能取出排查）；响应体内带校验摘要
+    const payload = JSON.stringify({
+      archive: rec,
+      verification: replayArchive.verificationSummary(rec)
+    }, null, 2);
+    const fname = encodeURIComponent(rec.id + ".archive.json");
+    res.writeHead(200, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      "Content-Disposition":
+        "attachment; filename=\"session-archive.json\"; filename*=UTF-8''" + fname
+    });
+    res.end(payload);
+    return;
+  }
+
+  /* POST /api/replay/archives/:aid/preview：恢复前预览（完整校验、不写盘、留痕） */
+  if (tail.length === 2 && tail[1] === "preview" && req.method === "POST") {
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body = {};
+      if (raw) {
+        try { body = JSON.parse(raw) || {}; }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      }
+      const actor = review.validateAuthor(body.actor).value;
+      previewArchiveRestore(rec, actor, function (failure, out) {
+        if (failure) {
+          const extra = {};
+          if (failure.errors) extra.errors = failure.errors;
+          if (failure.embeddedCode) extra.embeddedCode = failure.embeddedCode;
+          if (failure.existingSpaceId) extra.existingSpaceId = failure.existingSpaceId;
+          apiError(res, failure.status, failure.code, failure.message, extra);
+          return;
+        }
+        sendJSON(res, 200, Object.assign({ rev: archiveStore.rev }, out));
+      });
+    });
+    return;
+  }
+
+  /* POST /api/replay/archives/:aid/restore：恢复为新回放空间（整次拒绝或整次成功） */
+  if (tail.length === 2 && tail[1] === "restore" && req.method === "POST") {
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body = {};
+      if (raw) {
+        try { body = JSON.parse(raw) || {}; }
+        catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      }
+      const actor = review.validateAuthor(body.actor).value;
+      restoreArchive(rec, body, actor, function (failure, out) {
+        if (failure) {
+          const extra = {};
+          if (failure.errors) extra.errors = failure.errors;
+          if (failure.embeddedCode) extra.embeddedCode = failure.embeddedCode;
+          if (failure.existingSpaceId) extra.existingSpaceId = failure.existingSpaceId;
+          apiError(res, failure.status, failure.code, failure.message, extra);
+          return;
+        }
+        sendJSON(res, out.status, {
+          rev: archiveStore.rev,
+          replayRev: replayStore.rev,
+          archive: replayArchive.publicArchive(out.archive),
+          space: publicReplaySummary(out.space),
+          idempotent: false
+        });
+      });
+    });
+    return;
+  }
+
+  apiError(res, 404, "not_found", "归档接口不存在");
+}
+
+// 在回放空间内生成会话归档（先空间版本校验，再走归档中心）
+function handleSpaceSessionArchive(req, res, sp, s, urlObj) {
+  if (checkLock(res, req.headers["if-match"], sp.rev, "回放空间")) return;
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body = {};
+    if (raw) {
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    }
+    const actor = review.validateAuthor(body.actor).value;
+    createSessionArchive(sp, s, body, actor, function (failure, out) {
+      if (failure) {
+        const extra = {};
+        if (failure.progress) extra.progress = failure.progress;
+        if (failure.existingArchiveId) extra.existingArchiveId = failure.existingArchiveId;
+        apiError(res, failure.status, failure.code, failure.message, extra);
+        return;
+      }
+      sendJSON(res, out.status, {
+        rev: archiveStore.rev,
+        archive: replayArchive.publicArchive(out.record),
+        idempotent: out.idempotent
+      });
+    });
+  });
+}
 
 function sendJSON(res, status, body, headers) {
   const payload = JSON.stringify(body);
@@ -2460,6 +3111,7 @@ function sendJSON(res, status, body, headers) {
     "X-Batch-Rev": String(batchStore.rev),
     "X-Decision-Rev": String(decisionStore.rev),
     "X-Replay-Rev": String(replayStore.rev),
+    "X-Archive-Rev": String(archiveStore.rev),
     "Cache-Control": "no-store"
   }, headers || {});
   res.writeHead(status, h);

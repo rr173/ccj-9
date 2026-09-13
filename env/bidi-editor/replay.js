@@ -1423,8 +1423,14 @@
     var btnExport = button("⬇ 导出会话报告", null, function () {
       exportSessionReport(spaceId, sessionId, sessionData && sessionData.name);
     });
+    var btnArchive = button("🗄 归档此会话", null, function () {
+      archiveSession(spaceId, sessionId, ui, function () {
+        load().catch(function () {});
+        if (onChange) onChange();
+      });
+    });
     var modal2 = openModal("复核会话加载中…", box, {
-      buttons: [btnExport, button("关闭", null, function () {})],
+      buttons: [btnExport, btnArchive, button("关闭", null, function () {})],
       onCancel: stopTimer
     });
 
@@ -1458,6 +1464,17 @@
       }
       headBox.appendChild(progressBar(p));
       headBox.appendChild(progressLine(p));
+
+      // 归档入口：仅已完成（全部有结论或冲突）或已过期的会话可归档；
+      // 归档恢复带入的历史会话只读，不提供归档
+      var archivable = !s.archived &&
+        ((p.total > 0 && p.pending === 0) || p.expired);
+      btnArchive.disabled = !archivable;
+      btnArchive.title = s.archived
+        ? "该会话来自归档恢复，是只读历史会话"
+        : archivable
+          ? "生成不可变归档（相同内容幂等）"
+          : "只有已完成或已过期的会话才能归档";
 
       itemsBox.innerHTML = "";
       s.items.forEach(function (it) { itemsBox.appendChild(renderItem(it, p.expired)); });
@@ -1641,6 +1658,38 @@
       });
     }).catch(function (e) {
       toast("会话报告导出失败（会话、意见与回放空间均未被改动）：" + e.message, "error");
+    });
+  }
+
+  // 归档当前会话：生成不可变归档（服务端校验会话状态与空间版本）。
+  // 归档是只读源空间的操作，失败不会改变任何会话/意见/线上数据。
+  function archiveSession(spaceId, sessionId, ui, onDone) {
+    var rev = ui.spaceRev();
+    api("POST", "/api/replay/spaces/" + spaceId + "/sessions/" + sessionId + "/archive",
+      { actor: "负责人" }, { ifMatch: rev }).then(function (r) {
+      if (r.status === 200 && r.data.idempotent) {
+        toast("该归档此前已生成（相同内容幂等返回同一份）");
+      } else {
+        toast("已生成不可变归档：" + r.data.archive.id);
+      }
+      if (window.ReplayArchiveUI) {
+        window.ReplayArchiveUI.openDetail(r.data.archive.id, function () {
+          if (onDone) onDone();
+        });
+      } else {
+        if (onDone) onDone();
+      }
+    }).catch(function (e) {
+      if (e.code === "archive_conflict") {
+        toast("归档冲突：该会话已有不同内容/版本的归档（" +
+          (e.data && e.data.existingArchiveId) + "），归档不可变、未覆盖", "error");
+      } else if (e.code === "session_not_archivable") {
+        toast("只有已完成（全部条目有结论或冲突）或已过期的会话才能归档", "error");
+      } else if (e.code === "version_conflict") {
+        toast("空间版本已变化，请刷新会话后重试（本次未写入）", "error");
+      } else {
+        toast("归档失败（会话、意见与回放空间均未改动）：" + e.message, "error");
+      }
     });
   }
 
