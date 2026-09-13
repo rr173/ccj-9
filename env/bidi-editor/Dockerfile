@@ -2,7 +2,7 @@
 FROM node:20-alpine
 
 WORKDIR /app
-COPY server.js snapshot-core.js review-core.js decision-core.js replay-core.js app.js snapshots.js annotations.js batches.js decisions.js replay.js index.html style.css ./
+COPY server.js snapshot-core.js review-core.js decision-core.js replay-core.js replay-review-core.js app.js snapshots.js annotations.js batches.js decisions.js replay.js index.html style.css ./
 
 # 快照、批注、审阅批次、审阅决策与执行回放数据持久化目录（可挂卷覆盖：-v bidi-editor-data:/app/data）
 RUN mkdir -p /app/data
