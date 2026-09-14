@@ -1171,11 +1171,23 @@
     }
 
     function cancelScheduledTemplate(id, planId) {
+      var t = state.templates.find(function (x) { return x.id === id; });
+      if (!t) return;
+      // 取消请求必须携带计划锁定的 templateVersion/draftVersion（服务端严格校验），
+      // 从负责人视图 publishPlans 里按 planId 取待执行计划，不能用草稿/发布版本现凑。
+      var plan = (t.publishPlans || []).find(function (p) {
+        return p.planId === planId && p.status === "pending";
+      });
+      if (!plan) {
+        toast("未找到待执行的发布计划，已刷新为最新状态", "error");
+        loadTemplates();
+        return;
+      }
       if (!window.confirm("确认取消该计划发布？草稿会保留为未发布状态。")) return;
       api("POST", "/api/permissions/request-templates/" + id +
           "/publish-plans/" + planId + "/cancel",
-        { body: { templateVersion: t.publishedVersion,
-          draftVersion: t.draft && t.draft.draftVersion },
+        { body: { templateVersion: plan.templateVersion,
+          draftVersion: plan.draftVersion },
           ifMatch: state.templateRev }).then(function (r) {
           state.templateRev = r.tplRev;
           toast("计划发布已取消");
@@ -1413,6 +1425,12 @@
         loadTemplates();
       } else if (e.code === "template_disabled") {
         toast("模板已停用，不能再修改或发起新申请", "error");
+        loadTemplates();
+      } else if (e.code === "template_version_changed" ||
+                 e.code === "publish_plan_not_pending" ||
+                 e.code === "publish_plan_not_found") {
+        // 本地模板/计划状态已过期（如计划到点已执行）：提示后刷新出最新草稿与计划状态
+        toast(e.message, "error");
         loadTemplates();
       } else {
         toast(e.message, "error");
