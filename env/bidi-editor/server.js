@@ -44,6 +44,7 @@ const replayReview = require("./replay-review-core");
 const replaySession = require("./replay-session-core");
 const replayArchive = require("./replay-archive-core");
 const replayReconcile = require("./replay-reconcile-core");
+const permissionCore = require("./permission-core");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
@@ -63,6 +64,9 @@ const ARCHIVE_FILE = process.env.REPLAY_ARCHIVES_FILE ||
 // 归档差异与纠错对账中心：差异结果 / 纠错批次 / 纠错归档 / 审批记录 / 失败留痕
 const RECONCILE_FILE = process.env.REPLAY_RECONCILE_FILE ||
   path.join(ROOT, "data", "replay-reconcile.json");
+// 角色委派与操作权限：委派记录（授予/撤销/有效期/拒绝原因/操作记录）
+const PERMISSION_FILE = process.env.PERMISSIONS_FILE ||
+  path.join(ROOT, "data", "permissions.json");
 const REQUEST_BODY_LIMIT = 4 * 1024 * 1024; // 传输字节上限（校验逻辑另有字符上限）
 // 审计包内含锁定文本，允许更大的导入请求体（可用环境变量覆盖）
 const REPLAY_BODY_LIMIT = Number(process.env.REPLAY_BODY_LIMIT_BYTES) ||
@@ -1047,6 +1051,275 @@ try {
         fs.renameSync(REPLAY_FILE + ".recover.tmp", REPLAY_FILE); }
   catch (e) { /* 首次写盘目录可能尚不存在，忽略 */ }
 })();
+
+/* ================= 角色委派与操作权限（独立存储） =================
+ *
+ * 负责人为回放空间 / 复核会话 / 纠错批次配置四类角色
+ * （view 查看 / review 复核 / approve 审批 / execute 执行），
+ * 每条委派记录成员、角色、生效/失效时间与授予人；撤销只置 revoked，
+ * 记录永久保留。权限校验规则（纯逻辑在 permission-core.js）：
+ *   - 资源从未配置过任何委派时不强制（保持既有流程可用）；一旦有过委派，
+ *     资源即受权限管控，即使撤销全部委派，也只有负责人能继续操作/重新配置；
+ *   - 每次请求按当前墙钟实时计算角色：未生效 -> role_not_active，
+ *     已失效 -> role_expired，无角色 -> unauthorized；角色变更后下一个请求
+ *     立即使用最新权限（内存即权威，落盘只为重启恢复）；
+ *   - 重复委派、approve/execute 同成员时间窗冲突、负责人自审（approver_is_owner
+ *     /owner_self_approval）都明确拒绝；
+ *   - 未授权/过期/冲突的拒绝尝试全部持久化到 denials（含原因），与授予/撤销
+ *     操作一起可按时间查询；服务重启后有效期、拒绝原因与操作记录仍可查询。
+ */
+
+const permissionStore = {
+  rev: 0,
+  delegations: [], // 全部资源的委派记录（active/revoked；过期由时间实时判定）
+  logs: [],        // 授予/撤销操作记录
+  denials: []      // 被权限校验拒绝的请求记录（含原因，只增不改）
+};
+
+function persistPermissions(cb) {
+  persistPermissions.queue = persistPermissions.queue || Promise.resolve();
+  const run = persistPermissions.queue.then(function () {
+    return new Promise(function (resolve) {
+      const tmp = PERMISSION_FILE + ".tmp";
+      fs.mkdir(path.dirname(PERMISSION_FILE), { recursive: true }, function () {
+        fs.writeFile(tmp, JSON.stringify(permissionStore), function (err) {
+          if (err) { resolve(err); return; }
+          fs.rename(tmp, PERMISSION_FILE, function (e) { resolve(e || null); });
+        });
+      });
+    });
+  });
+  persistPermissions.queue = run.then(function () { return null; },
+                                      function () { return null; });
+  run.then(function (err) { cb(err || null); });
+}
+
+try {
+  const rawPerm = fs.readFileSync(PERMISSION_FILE, "utf8");
+  const dataPerm = JSON.parse(rawPerm);
+  if (Number.isInteger(dataPerm.rev) && Array.isArray(dataPerm.delegations)) {
+    permissionStore.rev = dataPerm.rev;
+    permissionStore.delegations = dataPerm.delegations;
+    permissionStore.logs = Array.isArray(dataPerm.logs) ? dataPerm.logs : [];
+    permissionStore.denials = Array.isArray(dataPerm.denials) ? dataPerm.denials : [];
+  }
+} catch (e) {
+  // 文件不存在/损坏：以空存储启动，损坏文件不覆盖
+}
+
+// 某资源上的全部委派记录（含已撤销/已过期，过期由时间实时判定）
+function delegationsOf(scope, resourceId) {
+  return permissionStore.delegations.filter(function (d) {
+    return d.scope === scope && d.resourceId === resourceId;
+  });
+}
+
+function findDelegation(id) {
+  return permissionStore.delegations.find(function (d) { return d.id === id; }) || null;
+}
+
+function addPermissionLog(entry) {
+  const e = Object.assign({
+    id: crypto.randomUUID(),
+    at: new Date().toISOString()
+  }, entry);
+  permissionStore.logs.push(e);
+  if (permissionStore.logs.length > permissionCore.LIMITS.LOGS_MAX) {
+    permissionStore.logs.splice(0,
+      permissionStore.logs.length - permissionCore.LIMITS.LOGS_MAX);
+  }
+  return e;
+}
+
+// 拒绝尝试留痕：best-effort 落盘，落盘失败只保留内存、不影响主拒绝响应
+function recordPermissionDenial(rec) {
+  const e = Object.assign({
+    id: crypto.randomUUID(),
+    at: new Date().toISOString()
+  }, rec);
+  permissionStore.denials.push(e);
+  if (permissionStore.denials.length > permissionCore.LIMITS.LOGS_MAX) {
+    permissionStore.denials.splice(0,
+      permissionStore.denials.length - permissionCore.LIMITS.LOGS_MAX);
+  }
+  persistPermissions(function () {});
+  return e;
+}
+
+// 权限存储自身的内存修改 + 串行原子落盘（失败回滚）
+function mutatePermissions(mutator, cb) {
+  const backup = JSON.parse(JSON.stringify({
+    rev: permissionStore.rev,
+    delegations: permissionStore.delegations,
+    logs: permissionStore.logs,
+    denials: permissionStore.denials
+  }));
+  let result;
+  try { result = mutator(); }
+  catch (e) {
+    permissionStore.rev = backup.rev;
+    permissionStore.delegations = backup.delegations;
+    permissionStore.logs = backup.logs;
+    permissionStore.denials = backup.denials;
+    cb({ status: 500, code: "internal_error", message: e.message });
+    return;
+  }
+  persistPermissions(function (err) {
+    if (err) {
+      permissionStore.rev = backup.rev;
+      permissionStore.delegations = backup.delegations;
+      permissionStore.logs = backup.logs;
+      permissionStore.denials = backup.denials;
+      cb({ status: 500, code: "persist_failed",
+        message: "权限配置落盘失败，已回滚，任何委派均未被改动" });
+      return;
+    }
+    cb(null, result);
+  });
+}
+
+/* ---------- 资源归属与成员身份 ---------- */
+
+// 系统级负责人主体：历史数据（导入人缺省“负责人”、创建人缺省“负责人”）
+// 与无成员头的既有流程都以“负责人”身份操作；它是唯一的跨资源超管主体，
+// 其他成员一律按委派角色判定。
+const SUPER_OWNER = "负责人";
+
+// 三类资源的负责人（只有负责人能配置该资源的角色委派）
+function resourceOwner(scope, resourceId) {
+  if (scope === "space") {
+    const sp = findReplaySpace(resourceId);
+    return sp ? (sp.importedBy || SUPER_OWNER) : null;
+  }
+  if (scope === "session") {
+    const found = findSessionAnySpace(resourceId);
+    return found ? (found.session.createdBy ||
+                    found.space.importedBy || SUPER_OWNER) : null;
+  }
+  if (scope === "batch") {
+    const b = findReconcileBatch(resourceId);
+    return b ? b.owner : null;
+  }
+  return null;
+}
+
+// 会话挂在回放空间上：跨空间查找会话与其所属空间
+function findSessionAnySpace(sessionId) {
+  for (const sp of replayStore.spaces) {
+    const s = (sp.sessions || []).find(function (x) { return x.id === sessionId; });
+    if (s) return { space: sp, session: s };
+  }
+  return null;
+}
+
+// 资源是否存在（配置委派前必须能定位资源）
+function resourceExists(scope, resourceId) {
+  if (scope === "space") return !!findReplaySpace(resourceId);
+  if (scope === "session") return !!findSessionAnySpace(resourceId);
+  if (scope === "batch") return !!findReconcileBatch(resourceId);
+  return false;
+}
+
+// 当前请求成员：X-Member 头优先，其次 ?as= 查询参数（注意不能用 ?member=，
+// 因为委派清单的 member= 是筛选参数）；都没有时按系统负责人主体处理
+// （既有流程向后兼容）。浏览器头只能是 Latin-1，前端对非 ASCII 成员名做
+// 百分号编码（见 permissions.js）。
+function decodeMember(raw) {
+  if (typeof raw !== "string") return "";
+  const v = raw.trim();
+  if (!v) return "";
+  if (v.indexOf("%") !== -1) {
+    try { return decodeURIComponent(v).trim(); } catch (e) { /* 退回原文 */ }
+  }
+  return v;
+}
+function currentMember(req, urlObj) {
+  const header = decodeMember(req.headers["x-member"]);
+  if (header) return header;
+  const q = urlObj && urlObj.searchParams && urlObj.searchParams.get("as");
+  if (typeof q === "string" && q.trim()) return q.trim();
+  return SUPER_OWNER;
+}
+
+/* ---------- 授权守卫 ----------
+ *
+ * requirePermission：在业务处理器前统一做角色校验。
+ *   - 资源不存在 -> 404；
+ *   - 未配置权限的资源直接放行（向后兼容）；
+ *   - 负责人放行（负责人自审在审批接口单独拦截）；
+ *   - 其余按 permissionCore.authorize 实时判定，拒绝时留痕并响应
+ *     403（缺成员身份也 403 missing_member）。
+ * extraDelegations 用于会话继承空间角色（见 effectiveSessionDelegations）。
+ */
+function effectiveSessionDelegations(sp, sessionId) {
+  // 会话的有效角色集合 = 会话自身委派 + 所属空间委派（空间角色向下继承）
+  return delegationsOf("session", sessionId)
+    .concat(delegationsOf("space", sp.id));
+}
+
+function guardPermission(req, res, urlObj, opts) {
+  const now = new Date().toISOString();
+  const member = currentMember(req, urlObj);
+  const scope = opts.scope, resourceId = opts.resourceId;
+  if (!resourceExists(scope, resourceId)) {
+    apiError(res, 404,
+      scope === "space" ? "replay_space_not_found"
+      : scope === "session" ? "session_not_found"
+      : "batch_not_found",
+      scope === "space" ? "回放空间不存在或已删除"
+      : scope === "session" ? "复核会话不存在或已随空间删除"
+      : "纠错批次不存在");
+    return null;
+  }
+  const owner = opts.owner != null ? opts.owner : resourceOwner(scope, resourceId);
+  const delegations = opts.delegations || delegationsOf(scope, resourceId);
+  // 系统级负责人主体：无成员头的既有流程与显式 X-Member: 负责人 都按负责人放行
+  // （负责人自审在审批接口单独拦截）。
+  if (member === SUPER_OWNER) {
+    return { allowed: true, member: member,
+      decision: { allowed: true, owner: true, roles: permissionCore.ROLES.slice() } };
+  }
+  const decision = permissionCore.authorize({
+    delegations: delegations,
+    member: member,
+    required: opts.required,
+    owner: owner,
+    now: now
+  });
+  if (decision.allowed) return { allowed: true, member: member, decision: decision };
+  const code = decision.reason.code;
+  recordPermissionDenial({
+    scope: scope, resourceId: resourceId, required: opts.required,
+    member: member, action: opts.action || "", code: code,
+    message: decision.reason.message, path: (urlObj && urlObj.pathname) || "",
+    method: req.method
+  });
+  apiError(res, 403, code, decision.reason.message, {
+    scope: scope, resourceId: resourceId, required: opts.required,
+    configured: true, roles: decision.roles
+  });
+  return null;
+}
+
+// 负责人自审守卫：审批接口专用——负责人本人永远不能审批自己负责的批次，
+// 即使负责人身份隐含全部角色也明确拒绝并留痕。
+function guardOwnerSelfApproval(req, res, urlObj, batch, actor) {
+  if (actor && batch.owner && actor === batch.owner) {
+    const member = currentMember(req, urlObj);
+    recordPermissionDenial({
+      scope: "batch", resourceId: batch.id, required: "approve",
+      member: member || actor, action: "batch_approval",
+      code: "owner_self_approval",
+      message: "负责人不能审批自己负责的纠错批次（负责人自审明确禁止）",
+      path: (urlObj && urlObj.pathname) || "", method: req.method
+    });
+    apiError(res, 403, "owner_self_approval",
+      "负责人不能审批自己负责的纠错批次（负责人自审明确禁止），" +
+      "请由批次指定的审批人审批");
+    return true;
+  }
+  return false;
+}
 
 function findReconcileDiff(id) {
   return reconcileStore.diffs.find(function (d) { return d.id === id; }) || null;
@@ -2141,11 +2414,22 @@ function handleReplaySpaces(req, res, seg, urlObj) {
   // seg: [] | [":id"] | [":id", "view"] | [":id", "timeline"] |
   //      [":id", "snapshots", ":sid"] | [":id", "conflicts"] | [":id", "tasks"]
   if (!seg.length) {
-    /* GET 列表（只含摘要，不含锁定全文，便于首屏） */
+    /* GET 列表（只含摘要，不含锁定全文，便于首屏）。
+       已启用权限管控的空间只向负责人或持有效角色的成员可见；
+       未配置委派的空间保持全员可见（向后兼容）。 */
     if (req.method === "GET") {
+      const member = currentMember(req, urlObj);
+      const nowIso = new Date().toISOString();
       const list = replayStore.spaces
         .slice()
         .sort(function (a, b) { return b.importedAt.localeCompare(a.importedAt); })
+        .filter(function (sp) {
+          const dels = delegationsOf("space", sp.id);
+          if (!permissionCore.isConfigured(dels)) return true;
+          const owner = resourceOwner("space", sp.id);
+          if (member && owner && member === owner) return true;
+          return permissionCore.activeRoles(dels, member, nowIso).length > 0;
+        })
         .map(publicReplaySummary);
       sendJSON(res, 200, { rev: replayStore.rev, spaces: list });
       return;
@@ -2161,11 +2445,28 @@ function handleReplaySpaces(req, res, seg, urlObj) {
   }
 
   if (seg.length === 1 && req.method === "GET") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "view",
+      action: "space_view" })) return;
     sendJSON(res, 200, { rev: replayStore.rev, space: publicReplaySpace(sp) });
     return;
   }
 
   if (seg.length === 1 && req.method === "DELETE") {
+    // 删除空间是负责人管理动作：系统负责人主体或空间导入负责人均可
+    const member = currentMember(req, urlObj);
+    const owner = sp.importedBy || SUPER_OWNER;
+    if (member !== owner && member !== SUPER_OWNER) {
+      recordPermissionDenial({
+        scope: "space", resourceId: sp.id, required: "owner",
+        member: member, action: "space_delete", code: "not_resource_owner",
+        message: "只有回放空间负责人（" + owner + "）才能删除空间",
+        path: urlObj.pathname, method: req.method
+      });
+      apiError(res, 403, "not_resource_owner",
+        "只有回放空间负责人（" + owner + "）才能删除该空间");
+      return;
+    }
     deleteReplaySpace(sp, function (err) {
       if (err) { apiError(res, 500, "persist_failed", "删除失败，回放空间未被改动"); return; }
       sendJSON(res, 200, { ok: true, id: sp.id });
@@ -2173,8 +2474,11 @@ function handleReplaySpaces(req, res, seg, urlObj) {
     return;
   }
 
-  /* PUT /spaces/:id/view：保存筛选条件（If-Match: 空间 rev） */
+  /* PUT /spaces/:id/view：保存筛选条件（If-Match: 空间 rev；需要查看角色） */
   if (seg.length === 2 && seg[1] === "view" && req.method === "PUT") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "view",
+      action: "space_view_save" })) return;
     if (checkLock(res, req.headers["if-match"], sp.rev, "回放空间视图")) return;
     readBody(req, function (err, raw) {
       if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
@@ -2200,6 +2504,9 @@ function handleReplaySpaces(req, res, seg, urlObj) {
   /* GET /spaces/:id/timeline：按时间线返回（可 ?taskId=&category= 实时筛选，
      不带参数时回退到空间已保存的筛选条件）；复核意见按复核筛选挂标记 */
   if (seg.length === 2 && seg[1] === "timeline" && req.method === "GET") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "view",
+      action: "space_timeline" })) return;
     const params = urlObj.searchParams;
     const saved = sp.view || {};
     const opts = {
@@ -2248,6 +2555,9 @@ function handleReplaySpaces(req, res, seg, urlObj) {
 
   /* GET /spaces/:id/conflicts：冲突原因汇总（逐条结果，挂复核标记） */
   if (seg.length === 2 && seg[1] === "conflicts" && req.method === "GET") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "view",
+      action: "space_conflicts" })) return;
     const params = urlObj.searchParams;
     const saved = sp.view || {};
     const rfInput = {
@@ -2285,6 +2595,9 @@ function handleReplaySpaces(req, res, seg, urlObj) {
 
   /* GET /spaces/:id/tasks/:taskId：包内锁定的单个任务（只读） */
   if (seg.length === 3 && seg[1] === "tasks" && req.method === "GET") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "view",
+      action: "space_task_view" })) return;
     const t = sp.content.tasks.find(function (x) { return x.id === seg[2]; });
     if (!t) { apiError(res, 404, "task_not_in_package", "该任务不在审计包内"); return; }
     sendJSON(res, 200, { rev: sp.rev, task: t });
@@ -2293,6 +2606,9 @@ function handleReplaySpaces(req, res, seg, urlObj) {
 
   /* GET /spaces/:id/snapshots/:sid：包内锁定的单个快照（只读） */
   if (seg.length === 3 && seg[1] === "snapshots" && req.method === "GET") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "view",
+      action: "space_snapshot_view" })) return;
     const snap = sp.content.snapshots.find(function (x) { return x.id === seg[2]; });
     if (!snap) { apiError(res, 404, "snapshot_not_in_package", "该快照不在审计包内"); return; }
     sendJSON(res, 200, { rev: sp.rev, snapshot: snap });
@@ -2358,6 +2674,9 @@ function handleReplayReviews(req, res, sp, seg, urlObj) {
 
   /* GET /spaces/:id/reviews/reviewers：复核人名单（供筛选下拉，只读） */
   if (seg.length === 1 && seg[0] === "reviewers" && req.method === "GET") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "view",
+      action: "review_reviewers" })) return;
     const set = Object.create(null);
     (sp.reviews || []).forEach(function (r) { set[r.reviewer] = true; });
     sendJSON(res, 200, { rev: sp.rev, reviewers: Object.keys(set).sort() });
@@ -2367,6 +2686,9 @@ function handleReplayReviews(req, res, sp, seg, urlObj) {
   /* POST /spaces/:id/reviews/export：构建独立复核清单（纯只读，不写盘、不推 rev；
      ?download=1 给附件下载头；导出失败不触碰任何意见或空间） */
   if (seg.length === 1 && seg[0] === "export" && req.method === "POST") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "view",
+      action: "review_export" })) return;
     readBody(req, function (err, raw) {
       if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
       let body = {};
@@ -2412,6 +2734,9 @@ function handleReplayReviews(req, res, sp, seg, urlObj) {
 
   /* GET /spaces/:id/reviews：复核清单列表（按状态/复核人/截止时间/引用类型筛选） */
   if (seg.length === 0 && req.method === "GET") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "view",
+      action: "review_list" })) return;
     const filters = reviewQueryFilters(sp, params);
     const norm = replayReview.normalizeFilters(filters);
     if (!norm.ok) { apiError(res, 400, norm.code, norm.message); return; }
@@ -2441,8 +2766,11 @@ function handleReplayReviews(req, res, sp, seg, urlObj) {
     return;
   }
 
-  /* POST /spaces/:id/reviews：新增复核意见（If-Match: 空间 rev） */
+  /* POST /spaces/:id/reviews：新增复核意见（If-Match: 空间 rev；需要复核角色） */
   if (seg.length === 0 && req.method === "POST") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "review",
+      action: "review_create" })) return;
     if (checkLock(res, req.headers["if-match"], sp.rev, "回放空间")) return;
     readBody(req, function (err, raw) {
       if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
@@ -2478,6 +2806,9 @@ function handleReplayReviews(req, res, sp, seg, urlObj) {
 
   /* GET /spaces/:id/reviews/:rid：意见详情（含引用目标快照） */
   if (seg.length === 1 && req.method === "GET") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "view",
+      action: "review_view" })) return;
     const pub = publicReview(rv);
     pub.target = replayReview.describeTarget(sp.content, rv.target) ||
       { kind: rv.target.kind, missing: true };
@@ -2486,8 +2817,11 @@ function handleReplayReviews(req, res, sp, seg, urlObj) {
   }
 
   /* PUT /spaces/:id/reviews/:rid：修改内容/状态/截止时间
-     （If-Match: 空间 rev + X-Review-Version: 意见版本） */
+     （If-Match: 空间 rev + X-Review-Version: 意见版本；需要复核角色） */
   if (seg.length === 1 && req.method === "PUT") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "review",
+      action: "review_update" })) return;
     if (checkReviewVersions(res, req, sp, rv)) return;
     readBody(req, function (err, raw) {
       if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
@@ -2509,8 +2843,11 @@ function handleReplayReviews(req, res, sp, seg, urlObj) {
     return;
   }
 
-  /* POST /spaces/:id/reviews/:rid/close：关闭（终态，双重版本检查） */
+  /* POST /spaces/:id/reviews/:rid/close：关闭（终态，双重版本检查；需要复核角色） */
   if (seg.length === 2 && seg[1] === "close" && req.method === "POST") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "review",
+      action: "review_close" })) return;
     if (checkReviewVersions(res, req, sp, rv)) return;
     readBody(req, function (err, raw) {
       if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
@@ -2533,8 +2870,11 @@ function handleReplayReviews(req, res, sp, seg, urlObj) {
     return;
   }
 
-  /* POST /spaces/:id/reviews/:rid/reassign：转派给新复核人（终态意见拒绝） */
+  /* POST /spaces/:id/reviews/:rid/reassign：转派给新复核人（终态意见拒绝；需要复核角色） */
   if (seg.length === 2 && seg[1] === "reassign" && req.method === "POST") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "review",
+      action: "review_reassign" })) return;
     if (checkReviewVersions(res, req, sp, rv)) return;
     readBody(req, function (err, raw) {
       if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
@@ -2557,6 +2897,9 @@ function handleReplayReviews(req, res, sp, seg, urlObj) {
 
   /* GET /spaces/:id/reviews/:rid/logs：该意见的状态变化记录，支持 ?from=&to= */
   if (seg.length === 2 && seg[1] === "logs" && req.method === "GET") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "view",
+      action: "review_logs" })) return;
     const from = params.get("from");
     const to = params.get("to");
     if (from && !replay.isISODateString(from)) {
@@ -2613,8 +2956,11 @@ function handleReplaySessions(req, res, sp, seg, urlObj) {
   // seg: [] | [":sid"] | [":sid", "conclusions"] | [":sid", "logs"] | [":sid", "report"]
   const params = urlObj.searchParams;
 
-  /* GET /spaces/:id/sessions：会话列表（实时进度与冲突数量，不缓存） */
+  /* GET /spaces/:id/sessions：会话列表（实时进度与冲突数量，不缓存；需要空间查看角色） */
   if (seg.length === 0 && req.method === "GET") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "view",
+      action: "session_list" })) return;
     const now = new Date().toISOString();
     const list = (sp.sessions || []).slice()
       .sort(function (a, b) {
@@ -2634,8 +2980,11 @@ function handleReplaySessions(req, res, sp, seg, urlObj) {
     return;
   }
 
-  /* POST /spaces/:id/sessions：按当前筛选选集创建会话（If-Match: 空间 rev） */
+  /* POST /spaces/:id/sessions：按当前筛选选集创建会话（If-Match: 空间 rev；需要空间复核角色） */
   if (seg.length === 0 && req.method === "POST") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "space", resourceId: sp.id, required: "review",
+      action: "session_create" })) return;
     if (checkLock(res, req.headers["if-match"], sp.rev, "回放空间")) return;
     readBody(req, function (err, raw) {
       if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
@@ -2672,8 +3021,13 @@ function handleReplaySessions(req, res, sp, seg, urlObj) {
     return;
   }
 
-  /* GET /spaces/:id/sessions/:sid：会话详情（条目/锁定摘要/结论/冲突/实时进度） */
+  /* GET /spaces/:id/sessions/:sid：会话详情（条目/锁定摘要/结论/冲突/实时进度；
+     会话角色继承空间角色） */
   if (seg.length === 1 && req.method === "GET") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "session", resourceId: s.id, required: "view",
+      delegations: effectiveSessionDelegations(sp, s.id),
+      owner: sp.importedBy || "负责人", action: "session_view" })) return;
     sendJSON(res, 200, {
       rev: replayStore.rev, spaceRev: sp.rev,
       session: publicSessionDetail(sp, s)
@@ -2682,9 +3036,10 @@ function handleReplaySessions(req, res, sp, seg, urlObj) {
   }
 
   /* POST /spaces/:id/sessions/:sid/conclusions：参与人逐条提交结论
-     （If-Match: 空间 rev + X-Session-Version: 会话版本） */
+     （If-Match: 空间 rev + X-Session-Version: 会话版本；需要会话复核角色，
+       会话复核角色继承空间复核角色） */
   if (seg.length === 2 && seg[1] === "conclusions" && req.method === "POST") {
-    // 归档恢复带入的历史会话永久只读：优先于版本检查直接拒绝
+    // 归档恢复带入的历史会话永久只读：优先于版本/权限检查直接拒绝
     if (s.archived) {
       readBody(req, function () {
         apiError(res, 409, "session_archived_readonly",
@@ -2693,6 +3048,10 @@ function handleReplaySessions(req, res, sp, seg, urlObj) {
       });
       return;
     }
+    if (!guardPermission(req, res, urlObj, {
+      scope: "session", resourceId: s.id, required: "review",
+      delegations: effectiveSessionDelegations(sp, s.id),
+      owner: sp.importedBy || "负责人", action: "session_conclusion" })) return;
     if (checkSessionVersions(res, req, sp, s)) return;
     readBody(req, function (err, raw) {
       if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
@@ -2717,8 +3076,12 @@ function handleReplaySessions(req, res, sp, seg, urlObj) {
     return;
   }
 
-  /* GET /spaces/:id/sessions/:sid/logs：会话操作记录（?from=&to=，时间倒序） */
+  /* GET /spaces/:id/sessions/:sid/logs：会话操作记录（?from=&to=，时间倒序；需要会话查看角色） */
   if (seg.length === 2 && seg[1] === "logs" && req.method === "GET") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "session", resourceId: s.id, required: "view",
+      delegations: effectiveSessionDelegations(sp, s.id),
+      owner: sp.importedBy || "负责人", action: "session_logs" })) return;
     const from = params.get("from");
     const to = params.get("to");
     if (from && !replay.isISODateString(from)) {
@@ -2744,8 +3107,14 @@ function handleReplaySessions(req, res, sp, seg, urlObj) {
   }
 
   /* POST /spaces/:id/sessions/:sid/report：导出独立会话报告
-     （纯只读，不写盘、不推任何 rev；导出失败不改变意见、会话进度或回放空间） */
-  if (seg.length === 2 && seg[1] === "report" && req.method === "POST") {    readBody(req, function (err, raw) {
+     （纯只读，不写盘、不推任何 rev；导出失败不改变意见、会话进度或回放空间；
+       需要会话查看角色） */
+  if (seg.length === 2 && seg[1] === "report" && req.method === "POST") {
+    if (!guardPermission(req, res, urlObj, {
+      scope: "session", resourceId: s.id, required: "view",
+      delegations: effectiveSessionDelegations(sp, s.id),
+      owner: sp.importedBy || "负责人", action: "session_report" })) return;
+    readBody(req, function (err, raw) {
       if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
       let body = {};
       if (raw) {
@@ -3240,8 +3609,12 @@ function handleReplayArchives(req, res, seg, urlObj) {
   apiError(res, 404, "not_found", "归档接口不存在");
 }
 
-// 在回放空间内生成会话归档（先空间版本校验，再走归档中心）
+// 在回放空间内生成会话归档（先空间版本校验，再走归档中心；需要会话复核角色）
 function handleSpaceSessionArchive(req, res, sp, s, urlObj) {
+  if (!guardPermission(req, res, urlObj, {
+    scope: "session", resourceId: s.id, required: "review",
+    delegations: effectiveSessionDelegations(sp, s.id),
+    owner: sp.importedBy || "负责人", action: "session_archive" })) return;
   if (checkLock(res, req.headers["if-match"], sp.rev, "回放空间")) return;
   readBody(req, function (err, raw) {
     if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
@@ -3865,6 +4238,28 @@ function undoNewSpace(newSp, replayBackup) {
 
 /* ---------- 路由 ---------- */
 
+// 成员能否在对账中心列表中看到某批次：未配置管控可见；否则负责人/
+// 审批人名单/持有效角色成员可见（审批人名单是批次业务字段，同样授予查看权）。
+function batchVisibleTo(batch, member, nowIso) {
+  const dels = delegationsOf("batch", batch.id);
+  if (!permissionCore.isConfigured(dels)) return true;
+  if (member && batch.owner && member === batch.owner) return true;
+  if (member && (batch.approvers || []).indexOf(member) !== -1) return true;
+  return permissionCore.activeRoles(dels, member, nowIso).length > 0;
+}
+
+// 纠错归档的查看权跟随其来源批次（correction.batchId）
+function correctionVisibleTo(corr, member, nowIso) {
+  const batch = findReconcileBatch(corr.batchId);
+  if (!batch) {
+    // 批次记录缺失时退回权限存储判定
+    const dels = delegationsOf("batch", corr.batchId);
+    if (!permissionCore.isConfigured(dels)) return true;
+    return permissionCore.activeRoles(dels, member, nowIso).length > 0;
+  }
+  return batchVisibleTo(batch, member, nowIso);
+}
+
 function handleReconcile(req, res, tail, urlObj) {
   const params = urlObj.searchParams;
 
@@ -3923,7 +4318,7 @@ function handleReconcile(req, res, tail, urlObj) {
     return;
   }
 
-  /* GET /diffs */
+  /* GET /diffs（列表按可见批次过滤；未配置权限的资源全员可见） */
   if (tail.length === 1 && tail[0] === "diffs" && req.method === "GET") {
     let list = reconcileStore.diffs.slice().sort(function (a, b) {
       const d = Date.parse(b.createdAt) - Date.parse(a.createdAt);
@@ -3936,6 +4331,17 @@ function handleReconcile(req, res, tail, urlObj) {
       return;
     }
     if (status) list = list.filter(function (d) { return d.status === status; });
+    const member = currentMember(req, urlObj);
+    const nowIso = new Date().toISOString();
+    list = list.filter(function (d) {
+      // 差异结果可能来自任意批次创建；差异本身不单独配权限，
+      // 只要成员能看到任一派生批次或尚未派生批次（全员可见）即可见
+      const derived = reconcileStore.batches.filter(function (b) {
+        return b.diffId === d.id;
+      });
+      if (!derived.length) return true;
+      return derived.some(function (b) { return batchVisibleTo(b, member, nowIso); });
+    });
     sendJSON(res, 200, {
       rev: reconcileStore.rev, count: list.length,
       diffs: list.map(replayReconcile.publicDiff)
@@ -3969,25 +4375,33 @@ function handleReconcile(req, res, tail, urlObj) {
     return;
   }
 
-  /* GET /batches */
+  /* GET /batches（按当前成员可见性过滤） */
   if (tail.length === 1 && tail[0] === "batches" && req.method === "GET") {
-    const list = reconcileStore.batches.slice().sort(function (a, b) {
-      const d = Date.parse(b.createdAt) - Date.parse(a.createdAt);
-      if (d) return d;
-      return a.id < b.id ? 1 : -1;
-    });
+    const member = currentMember(req, urlObj);
+    const nowIso = new Date().toISOString();
+    const list = reconcileStore.batches.slice()
+      .filter(function (b) { return batchVisibleTo(b, member, nowIso); })
+      .sort(function (a, b) {
+        const d = Date.parse(b.createdAt) - Date.parse(a.createdAt);
+        if (d) return d;
+        return a.id < b.id ? 1 : -1;
+      });
     sendJSON(res, 200, { rev: reconcileStore.rev, count: list.length,
       batches: list.map(replayReconcile.publicBatch) });
     return;
   }
 
-  /* GET /corrections */
+  /* GET /corrections（查看权跟随来源批次） */
   if (tail.length === 1 && tail[0] === "corrections" && req.method === "GET") {
-    const list = reconcileStore.corrections.slice().sort(function (a, b) {
-      const d = Date.parse(b.createdAt) - Date.parse(a.createdAt);
-      if (d) return d;
-      return a.id < b.id ? 1 : -1;
-    });
+    const member = currentMember(req, urlObj);
+    const nowIso = new Date().toISOString();
+    const list = reconcileStore.corrections.slice()
+      .filter(function (c) { return correctionVisibleTo(c, member, nowIso); })
+      .sort(function (a, b) {
+        const d = Date.parse(b.createdAt) - Date.parse(a.createdAt);
+        if (d) return d;
+        return a.id < b.id ? 1 : -1;
+      });
     sendJSON(res, 200, { rev: reconcileStore.rev, count: list.length,
       corrections: list.map(replayReconcile.publicCorrection) });
     return;
@@ -3998,16 +4412,49 @@ function handleReconcile(req, res, tail, urlObj) {
     const diff = findReconcileDiff(tail[1]);
     if (!diff) { apiError(res, 404, "diff_not_found", "差异结果不存在"); return; }
     if (req.method === "GET") {
+      const member = currentMember(req, urlObj);
+      const nowIso = new Date().toISOString();
+      const derived = reconcileStore.batches.filter(function (b) {
+        return b.diffId === diff.id;
+      });
+      const visible = !derived.length || derived.some(function (b) {
+        return batchVisibleTo(b, member, nowIso);
+      });
+      if (!visible) {
+        recordPermissionDenial({
+          scope: "batch", resourceId: derived[0].id, required: "view",
+          member: member, action: "diff_view", code: "unauthorized",
+          message: "成员无权查看该差异结果派生的纠错批次",
+          path: urlObj.pathname, method: req.method, diffId: diff.id
+        });
+        apiError(res, 403, "unauthorized",
+          "你没有查看该差异结果的权限（派生批次未授权）");
+        return;
+      }
       sendJSON(res, 200, { rev: reconcileStore.rev,
         diff: replayReconcile.publicDiff(diff) });
       return;
     }
   }
 
-  /* ---- /corrections/:id（含 download） ---- */
+  /* ---- /corrections/:id（含 download；查看权跟随来源批次） ---- */
   if (tail.length >= 2 && tail[0] === "corrections") {
     const corr = findCorrection(tail[1]);
     if (!corr) { apiError(res, 404, "correction_not_found", "纠错归档不存在"); return; }
+    const member = currentMember(req, urlObj);
+    if (!correctionVisibleTo(corr, member, new Date().toISOString())) {
+      recordPermissionDenial({
+        scope: "batch", resourceId: corr.batchId, required: "view",
+        member: member, action: tail[2] === "download"
+          ? "correction_download" : "correction_view",
+        code: "unauthorized",
+        message: "成员无权查看该纠错归档（来源批次未授权）",
+        path: urlObj.pathname, method: req.method, correctionId: corr.id
+      });
+      apiError(res, 403, "unauthorized",
+        "你没有查看该纠错归档的权限（来源批次未授权）");
+      return;
+    }
     if (tail.length === 2 && req.method === "GET") {
       sendJSON(res, 200, { rev: reconcileStore.rev,
         correction: replayReconcile.publicCorrectionDetail(corr) });
@@ -4036,12 +4483,33 @@ function handleReconcile(req, res, tail, urlObj) {
     if (!batch) { apiError(res, 404, "batch_not_found", "纠错批次不存在"); return; }
 
     if (tail.length === 2 && req.method === "GET") {
+      if (!guardPermission(req, res, urlObj, {
+        scope: "batch", resourceId: batch.id, required: "view",
+        action: "batch_view" })) return;
       sendJSON(res, 200, { rev: reconcileStore.rev,
         batch: replayReconcile.publicBatch(batch) });
       return;
     }
 
     if (tail.length === 2 && req.method === "PUT") {
+      // 修改批次：只有负责人本人（业务所有权），且需要 execute 级配置权——
+      // owner 隐含全部角色，guard 通过后再核对负责人身份
+      if (!guardPermission(req, res, urlObj, {
+        scope: "batch", resourceId: batch.id, required: "execute",
+        action: "batch_update" })) return;
+      const member = currentMember(req, urlObj);
+      if (member !== batch.owner) {
+        recordPermissionDenial({
+          scope: "batch", resourceId: batch.id, required: "owner",
+          member: member, action: "batch_update",
+          code: "not_resource_owner",
+          message: "只有批次负责人可以修改批次（负责人：" + batch.owner + "）",
+          path: urlObj.pathname, method: req.method
+        });
+        apiError(res, 403, "not_resource_owner",
+          "只有批次负责人（" + batch.owner + "）可以修改该批次");
+        return;
+      }
       if (checkLock(res, req.headers["if-match"], reconcileStore.rev, "对账中心")) return;
       const their = parseInt(req.headers["x-batch-version"], 10);
       if (!Number.isInteger(their)) {
@@ -4072,6 +4540,23 @@ function handleReconcile(req, res, tail, urlObj) {
     }
 
     if (tail.length === 3 && tail[2] === "submit" && req.method === "POST") {
+      // 提交审批：负责人动作（execute 角色 + 必须是负责人本人）
+      if (!guardPermission(req, res, urlObj, {
+        scope: "batch", resourceId: batch.id, required: "execute",
+        action: "batch_submit" })) return;
+      const member = currentMember(req, urlObj);
+      if (member !== batch.owner) {
+        recordPermissionDenial({
+          scope: "batch", resourceId: batch.id, required: "owner",
+          member: member, action: "batch_submit",
+          code: "not_resource_owner",
+          message: "只有批次负责人可以提交批次审批",
+          path: urlObj.pathname, method: req.method
+        });
+        apiError(res, 403, "not_resource_owner",
+          "只有批次负责人（" + batch.owner + "）可以提交该批次审批");
+        return;
+      }
       if (checkLock(res, req.headers["if-match"], reconcileStore.rev, "对账中心")) return;
       const their = parseInt(req.headers["x-batch-version"], 10);
       if (!Number.isInteger(their)) {
@@ -4107,6 +4592,8 @@ function handleReconcile(req, res, tail, urlObj) {
     }
 
     if (tail.length === 3 && tail[2] === "approvals" && req.method === "POST") {
+      // 审批：先版本锁，再读 body 判定负责人自审，最后由 approveBatch
+      // 复核审批人名单与 approve 角色（403 not_approver / unauthorized）
       if (checkLock(res, req.headers["if-match"], reconcileStore.rev, "对账中心")) return;
       const their = parseInt(req.headers["x-batch-version"], 10);
       if (!Number.isInteger(their)) {
@@ -4128,6 +4615,14 @@ function handleReconcile(req, res, tail, urlObj) {
           catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
         }
         const actor = review.validateAuthor(body.actor).value;
+        // 负责人自审：即使负责人身份隐含全部角色也明确拒绝
+        if (guardOwnerSelfApproval(req, res, urlObj, batch, actor)) return;
+        // 审批角色：必须持有生效中的 approve 角色（审批人名单是业务前置，
+        // 角色委派是权限前置；未配置过权限时不强制，保持向后兼容）
+        const g = guardPermission(req, res, urlObj, {
+          scope: "batch", resourceId: batch.id, required: "approve",
+          action: "batch_approval" });
+        if (!g) return;
         approveBatch(batch, body, actor, function (failure, out) {
           if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
           sendJSON(res, 200, { rev: reconcileStore.rev,
@@ -4159,6 +4654,10 @@ function handleReconcile(req, res, tail, urlObj) {
           catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
         }
         const actor = review.validateAuthor(body.actor).value;
+        // 执行纠错：execute 角色（负责人隐含；审批人不因此自动获得执行权）
+        if (!guardPermission(req, res, urlObj, {
+          scope: "batch", resourceId: batch.id, required: "execute",
+          action: "batch_execute" })) return;
         executeBatch(batch, actor, function (failure, out) {
           if (failure) {
             const extra = {};
@@ -4194,6 +4693,7 @@ function sendJSON(res, status, body, headers) {
     "X-Replay-Rev": String(replayStore.rev),
     "X-Archive-Rev": String(archiveStore.rev),
     "X-Reconcile-Rev": String(reconcileStore.rev),
+    "X-Permission-Rev": String(permissionStore.rev),
     "Cache-Control": "no-store"
   }, headers || {});
   res.writeHead(status, h);
@@ -7638,6 +8138,378 @@ function startScheduler() {
   if (schedulerTimer.unref) schedulerTimer.unref();
 }
 
+/* ================= 角色委派与操作权限 API ================= */
+
+function publicDelegationNow(d) {
+  return permissionCore.publicDelegation(d, new Date().toISOString());
+}
+
+// 委派管理操作只允许资源负责人本人（无 X-Member 的既有流程按系统负责人主体放行）
+function guardOwnerManagement(req, res, urlObj, scope, resourceId) {
+  if (!resourceExists(scope, resourceId)) {
+    apiError(res, 404,
+      scope === "space" ? "replay_space_not_found"
+      : scope === "session" ? "session_not_found"
+      : "batch_not_found",
+      scope === "space" ? "回放空间不存在或已删除"
+      : scope === "session" ? "复核会话不存在或已随空间删除"
+      : "纠错批次不存在");
+    return null;
+  }
+  const member = currentMember(req, urlObj);
+  const owner = resourceOwner(scope, resourceId);
+  if (!owner || member !== owner) {
+    recordPermissionDenial({
+      scope: scope, resourceId: resourceId, required: "owner",
+      member: member, action: "permission_manage",
+      code: "not_resource_owner",
+      message: "只有资源负责人（" + (owner || "—") +
+        "）才能配置角色委派，当前成员：" + member,
+      path: urlObj.pathname, method: req.method
+    });
+    apiError(res, 403, "not_resource_owner",
+      "只有资源负责人才能配置角色委派（负责人：" + (owner || "—") +
+      "，当前成员：" + member + "）");
+    return null;
+  }
+  return { member: member, owner: owner };
+}
+
+// GET /api/permissions/delegations?scope=&resourceId=&member=&role=
+function handlePermissionList(req, res, urlObj) {
+  const params = urlObj.searchParams;
+  const scope = params.get("scope");
+  const resourceId = params.get("resourceId");
+  const memberFilter = params.get("member");
+  const roleFilter = params.get("role");
+  if (scope && permissionCore.SCOPES.indexOf(scope) === -1) {
+    apiError(res, 400, "invalid_scope", "资源类型必须是 space / session / batch");
+    return;
+  }
+  if (roleFilter && permissionCore.ROLES.indexOf(roleFilter) === -1) {
+    apiError(res, 400, "invalid_role",
+      "角色必须是 view / review / approve / execute");
+    return;
+  }
+  // 全量/跨资源委派清单只对系统负责人开放；当查询定位到具体资源时，
+  // 该资源负责人也可查看自己资源上的委派；普通成员用 /effective 查自己的角色。
+  const member = currentMember(req, urlObj);
+  if (member !== SUPER_OWNER) {
+    let allowed = false;
+    if (scope && resourceId && resourceExists(scope, resourceId)) {
+      allowed = member === resourceOwner(scope, resourceId);
+    }
+    if (!allowed) {
+      recordPermissionDenial({
+        scope: scope || "", resourceId: resourceId || "",
+        required: "owner", member: member,
+        action: "permission_list_view", code: "not_resource_owner",
+        message: "只有系统负责人或资源负责人可以查看委派清单",
+        path: urlObj.pathname, method: req.method
+      });
+      apiError(res, 403, "not_resource_owner",
+        "只有系统负责人或资源负责人可以查看委派清单" +
+        "（普通成员可用 /effective 查自己的角色）");
+      return;
+    }
+  }
+  let list = permissionStore.delegations.slice();
+  if (scope) {
+    list = list.filter(function (d) { return d.scope === scope; });
+  }
+  if (resourceId) {
+    list = list.filter(function (d) { return d.resourceId === resourceId; });
+  }
+  if (memberFilter) {
+    list = list.filter(function (d) { return d.member === memberFilter; });
+  }
+  if (roleFilter) {
+    list = list.filter(function (d) { return d.role === roleFilter; });
+  }
+  list.sort(function (a, b) {
+    if (a.scope !== b.scope) return a.scope < b.scope ? -1 : 1;
+    if (a.resourceId !== b.resourceId) return a.resourceId < b.resourceId ? -1 : 1;
+    return b.grantedAt.localeCompare(a.grantedAt);
+  });
+  sendJSON(res, 200, {
+    rev: permissionStore.rev,
+    count: list.length,
+    delegations: list.map(publicDelegationNow)
+  });
+}
+
+// 授予/撤销的记录查询（操作记录 + 拒绝原因），支持 ?from=&to=&scope=&resourceId=
+function filterPermissionLogs(entries, params) {
+  const from = params.get("from"), to = params.get("to");
+  if (from && !permissionCore.isISODateString(from)) {
+    return { error: { status: 400, code: "invalid_from",
+      message: "起始时间不是合法 ISO 时间" } };
+  }
+  if (to && !permissionCore.isISODateString(to)) {
+    return { error: { status: 400, code: "invalid_to",
+      message: "结束时间不是合法 ISO 时间" } };
+  }
+  if (from && to && Date.parse(from) > Date.parse(to)) {
+    return { error: { status: 400, code: "invalid_range",
+      message: "起始时间晚于结束时间" } };
+  }
+  const scope = params.get("scope"), resourceId = params.get("resourceId");
+  const list = entries.filter(function (l) {
+    if (from && Date.parse(l.at) < Date.parse(from)) return false;
+    if (to && Date.parse(l.at) > Date.parse(to)) return false;
+    if (scope && l.scope !== scope) return false;
+    if (resourceId && l.resourceId !== resourceId) return false;
+    return true;
+  }).slice().sort(function (a, b) {
+    const d = Date.parse(b.at) - Date.parse(a.at);
+    if (d) return d;
+    return a.id < b.id ? 1 : -1;
+  });
+  return { value: list };
+}
+
+// POST /api/permissions/delegations：授予角色（负责人；If-Match: 权限集合 rev）
+function handlePermissionGrant(req, res, urlObj) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.rev, "权限集合")) return;
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body;
+    try { body = JSON.parse(raw) || {}; }
+    catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    const scope = typeof body.scope === "string" ? body.scope : "";
+    const resourceId = typeof body.resourceId === "string" ? body.resourceId : "";
+    if (permissionCore.SCOPES.indexOf(scope) === -1) {
+      apiError(res, 400, "invalid_scope",
+        "资源类型必须是 space / session / batch 之一");
+      return;
+    }
+    const guard = guardOwnerManagement(req, res, urlObj, scope, resourceId);
+    if (!guard) return;
+    const checked = permissionCore.validateGrant(body, {
+      owner: guard.owner,
+      existing: delegationsOf(scope, resourceId),
+      now: new Date().toISOString()
+    });
+    if (!checked.ok) {
+      const status = ["missing_member", "member_too_long", "invalid_member",
+        "missing_resource", "invalid_role", "role_not_allowed_for_scope",
+        "invalid_scope", "missing_expire", "invalid_expire",
+        "expire_in_past", "invalid_effective", "effective_after_expire",
+        "invalid_reason", "reason_too_long"].indexOf(checked.code) !== -1 ? 400
+        : 409;
+      // 授予被拒（重复委派/冲突/自审）同样留痕，拒绝原因重启后可查
+      if (status === 409) {
+        recordPermissionDenial({
+          scope: scope, resourceId: resourceId,
+          required: body.role || "", member: guard.member,
+          action: "permission_grant", code: checked.code,
+          message: checked.message, targetMember:
+            permissionCore.cleanMember(body.member),
+          path: urlObj.pathname, method: req.method
+        });
+      }
+      apiError(res, status, checked.code, checked.message,
+        checked.existingDelegationId
+          ? { existingDelegationId: checked.existingDelegationId,
+              conflictingRole: checked.conflictingRole } : undefined);
+      return;
+    }
+    const v = checked.value;
+    const nowIso = new Date().toISOString();
+    mutatePermissions(function () {
+      const d = {
+        id: "del_" + crypto.randomUUID().replace(/-/g, ""),
+        scope: v.scope,
+        resourceId: v.resourceId,
+        role: v.role,
+        member: v.member,
+        effectiveAt: v.effectiveAt,
+        expireAt: v.expireAt,
+        reason: v.reason || "",
+        status: "active",
+        grantedBy: guard.member,
+        grantedAt: nowIso,
+        revokedAt: null,
+        revokedBy: null,
+        revokeReason: null
+      };
+      permissionStore.delegations.push(d);
+      addPermissionLog({
+        action: "grant", scope: d.scope, resourceId: d.resourceId,
+        role: d.role, member: d.member, actor: guard.member,
+        delegationId: d.id,
+        detail: { effectiveAt: d.effectiveAt, expireAt: d.expireAt,
+          reason: d.reason }
+      });
+      permissionStore.rev++;
+      return d;
+    }, function (failure, d) {
+      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      sendJSON(res, 201, { rev: permissionStore.rev,
+        delegation: publicDelegationNow(d) });
+    });
+  });
+}
+
+// POST /api/permissions/delegations/:id/revoke：撤销（负责人；If-Match）
+function handlePermissionRevoke(req, res, urlObj, delegationId) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.rev, "权限集合")) return;
+  const d = findDelegation(delegationId);
+  if (!d) {
+    apiError(res, 404, "delegation_not_found", "角色委派不存在");
+    return;
+  }
+  const guard = guardOwnerManagement(req, res, urlObj, d.scope, d.resourceId);
+  if (!guard) return;
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body = {};
+    if (raw) {
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    }
+    const nowIso = new Date().toISOString();
+    const checked = permissionCore.validateRevoke(d, body, nowIso);
+    if (!checked.ok) {
+      const status = checked.code === "delegation_not_found" ? 404 : 409;
+      recordPermissionDenial({
+        scope: d.scope, resourceId: d.resourceId, required: d.role,
+        member: guard.member, action: "permission_revoke",
+        code: checked.code, message: checked.message,
+        targetMember: d.member, delegationId: d.id,
+        path: urlObj.pathname, method: req.method
+      });
+      apiError(res, status, checked.code, checked.message);
+      return;
+    }
+    mutatePermissions(function () {
+      d.status = "revoked";
+      d.revokedAt = nowIso;
+      d.revokedBy = guard.member;
+      d.revokeReason = checked.value.reason || null;
+      addPermissionLog({
+        action: "revoke", scope: d.scope, resourceId: d.resourceId,
+        role: d.role, member: d.member, actor: guard.member,
+        delegationId: d.id,
+        detail: { reason: d.revokeReason }
+      });
+      permissionStore.rev++;
+      return d;
+    }, function (failure, out) {
+      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      sendJSON(res, 200, { rev: permissionStore.rev,
+        delegation: publicDelegationNow(out) });
+    });
+  });
+}
+
+// GET /api/permissions/effective?scope=&resourceId=：当前请求成员（X-Member）
+// 在该资源上此刻持有的有效角色（角色变更后新请求立即反映最新权限）
+function handlePermissionEffective(req, res, urlObj) {
+  const params = urlObj.searchParams;
+  const scope = params.get("scope") || "";
+  const resourceId = params.get("resourceId") || "";
+  if (permissionCore.SCOPES.indexOf(scope) === -1 || !resourceId) {
+    apiError(res, 400, "invalid_target",
+      "必须指定 scope（space/session/batch）与 resourceId");
+    return;
+  }
+  if (!resourceExists(scope, resourceId)) {
+    apiError(res, 404,
+      scope === "space" ? "replay_space_not_found"
+      : scope === "session" ? "session_not_found" : "batch_not_found",
+      "资源不存在");
+    return;
+  }
+  const member = currentMember(req, urlObj);
+  const owner = resourceOwner(scope, resourceId);
+  const delegations = scope === "session"
+    ? (function () {
+        const found = findSessionAnySpace(resourceId);
+        return found ? effectiveSessionDelegations(found.space, resourceId)
+                     : delegationsOf(scope, resourceId);
+      })()
+    : delegationsOf(scope, resourceId);
+  const nowIso = new Date().toISOString();
+  const roles = permissionCore.activeRoles(delegations, member, nowIso);
+  const isOwner = !!(owner && member && member === owner);
+  sendJSON(res, 200, {
+    rev: permissionStore.rev,
+    scope: scope, resourceId: resourceId, member: member,
+    owner: owner, isOwner: isOwner,
+    // 会话的 configured 综合会话自身与所属空间委派（空间角色向下继承）
+    configured: permissionCore.isConfigured(delegations),
+    roles: isOwner ? permissionCore.ROLES.slice() : roles,
+    inheritedFromSpace: scope === "session"
+      ? delegations.filter(function (d) { return d.scope === "space"; }).length > 0
+      : false,
+    delegations: delegations
+      .filter(function (d) { return !member || d.member === member; })
+      .map(publicDelegationNow)
+  });
+}
+
+function handlePermissions(req, res, tail, urlObj) {
+  // tail: ["delegations"] | ["delegations", ":id", "revoke"] |
+  //       ["logs"] | ["denials"] | ["effective"]
+  if (tail.length === 1 && tail[0] === "delegations" && req.method === "GET") {
+    handlePermissionList(req, res, urlObj);
+    return;
+  }
+  if (tail.length === 1 && tail[0] === "delegations" && req.method === "POST") {
+    handlePermissionGrant(req, res, urlObj);
+    return;
+  }
+  if (tail.length === 3 && tail[0] === "delegations" &&
+      tail[2] === "revoke" && req.method === "POST") {
+    handlePermissionRevoke(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 1 && tail[0] === "effective" && req.method === "GET") {
+    handlePermissionEffective(req, res, urlObj);
+    return;
+  }
+  if (tail.length === 1 && tail[0] === "logs" && req.method === "GET") {
+    // 审计操作记录只对系统负责人开放
+    if (currentMember(req, urlObj) !== SUPER_OWNER) {
+      recordPermissionDenial({
+        scope: "", resourceId: "", required: "owner",
+        member: currentMember(req, urlObj), action: "permission_logs_view",
+        code: "not_resource_owner",
+        message: "只有系统负责人可以查看权限操作记录",
+        path: urlObj.pathname, method: req.method
+      });
+      apiError(res, 403, "not_resource_owner",
+        "只有系统负责人可以查看权限操作记录");
+      return;
+    }
+    const r = filterPermissionLogs(permissionStore.logs, urlObj.searchParams);
+    if (r.error) { apiError(res, r.error.status, r.error.code, r.error.message); return; }
+    sendJSON(res, 200, { rev: permissionStore.rev, count: r.value.length, logs: r.value });
+    return;
+  }
+  if (tail.length === 1 && tail[0] === "denials" && req.method === "GET") {
+    // 拒绝原因记录只对系统负责人开放
+    if (currentMember(req, urlObj) !== SUPER_OWNER) {
+      recordPermissionDenial({
+        scope: "", resourceId: "", required: "owner",
+        member: currentMember(req, urlObj), action: "permission_denials_view",
+        code: "not_resource_owner",
+        message: "只有系统负责人可以查看拒绝原因记录",
+        path: urlObj.pathname, method: req.method
+      });
+      apiError(res, 403, "not_resource_owner",
+        "只有系统负责人可以查看拒绝原因记录");
+      return;
+    }
+    const r = filterPermissionLogs(permissionStore.denials, urlObj.searchParams);
+    if (r.error) { apiError(res, r.error.status, r.error.code, r.error.message); return; }
+    sendJSON(res, 200, { rev: permissionStore.rev, count: r.value.length, denials: r.value });
+    return;
+  }
+  apiError(res, 404, "not_found", "权限接口不存在");
+}
+
 /* ================= 路由 ================= */
 
 function handleAPI(req, res, pathname, urlObj) {
@@ -7664,6 +8536,10 @@ function handleAPI(req, res, pathname, urlObj) {
   }
   if (parts[1] === "replay" && parts.length <= 7) {
     handleReplay(req, res, parts, urlObj);
+    return;
+  }
+  if (parts[1] === "permissions" && parts.length <= 5) {
+    handlePermissions(req, res, parts.slice(2), urlObj);
     return;
   }
   apiError(res, 404, "not_found", "接口不存在");
@@ -7717,7 +8593,8 @@ syncAnnotationBatchFields();
 startScheduler();
 
 module.exports = {
-  core, review, decision, replay,
+  core, review, decision, replay, permissionCore,
   store: store, annStore: annStore, batchStore: batchStore,
-  decisionStore: decisionStore, replayStore: replayStore
+  decisionStore: decisionStore, replayStore: replayStore,
+  permissionStore: permissionStore
 };

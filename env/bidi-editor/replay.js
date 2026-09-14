@@ -107,6 +107,10 @@
   function api(method, url, options) {
     options = options || {};
     var headers = { "Accept": "application/json" };
+    // 当前成员身份（角色委派与操作权限）；缺省“负责人”
+    if (window.PermissionIdentity) {
+      headers["X-Member"] = window.PermissionIdentity.header();
+    }
     if (options.ifMatch != null) headers["If-Match"] = String(options.ifMatch);
     if (options.rvVersion != null) headers["X-Review-Version"] = String(options.rvVersion);
     if (options.ssVersion != null) headers["X-Session-Version"] = String(options.ssVersion);
@@ -306,7 +310,9 @@
         }
         fetch("/api/replay/import", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: Object.assign({ "Content-Type": "application/json" },
+            window.PermissionIdentity
+              ? { "X-Member": window.PermissionIdentity.header() } : {}),
           body: JSON.stringify(Object.assign({ importedBy: "负责人" }, parsed))
         }).then(function (res) {
           return res.json().then(function (d) { return { ok: res.ok, status: res.status, d: d }; });
@@ -1167,7 +1173,9 @@
   function exportChecklist(spaceId, filters) {
     fetch("/api/replay/spaces/" + spaceId + "/reviews/export?download=1", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: Object.assign({ "Content-Type": "application/json" },
+        window.PermissionIdentity
+          ? { "X-Member": window.PermissionIdentity.header() } : {}),
       body: JSON.stringify(Object.assign({ actor: "负责人" }, filters))
     }).then(function (res) {
       if (!res.ok) return res.json().then(function (j) { throw new Error(j.message); });
@@ -1643,7 +1651,9 @@
     fetch("/api/replay/spaces/" + spaceId + "/sessions/" + sessionId +
       "/report?download=1", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: Object.assign({ "Content-Type": "application/json" },
+        window.PermissionIdentity
+          ? { "X-Member": window.PermissionIdentity.header() } : {}),
       body: JSON.stringify({ actor: "负责人" })
     }).then(function (res) {
       if (!res.ok) return res.json().then(function (j) { throw new Error(j.message); });

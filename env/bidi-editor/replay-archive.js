@@ -86,6 +86,9 @@
   function api(method, url, options) {
     options = options || {};
     var headers = { Accept: "application/json" };
+    if (window.PermissionIdentity) {
+      headers["X-Member"] = window.PermissionIdentity.header();
+    }
     if (options.ifMatch != null) headers["If-Match"] = String(options.ifMatch);
     var init = { method: method, headers: headers };
     if (options.body !== undefined) {

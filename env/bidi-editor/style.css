@@ -1677,3 +1677,52 @@ tr.rp-added { background: #f0fdf4; }
 .reconcile-decide-line select { flex-shrink: 0; }
 .archive-log-ok { color: #166534; }
 .archive-log-bad { color: #991b1b; }
+
+/* ================= 角色委派与操作权限 ================= */
+.perm-identity-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 10px; margin-bottom: 12px;
+  background: rgba(25, 118, 210, 0.08); border: 1px solid rgba(25,118,210,0.25);
+  border-radius: 8px; font-size: 13px;
+}
+.perm-identity-bar input { min-width: 160px; }
+.perm-who { color: var(--muted); margin-left: auto; }
+.perm-form {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px 12px; align-items: end;
+}
+.perm-field { display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; }
+.perm-field > span { color: var(--muted); }
+.perm-field input, .perm-field select { width: 100%; box-sizing: border-box; }
+.perm-form > button { grid-column: 1 / -1; justify-self: start; }
+.perm-filter-bar {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  margin: 8px 0; font-size: 13px;
+}
+.perm-filter-bar input { min-width: 140px; }
+.perm-list {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px; max-height: 380px; overflow: auto; padding: 2px;
+}
+.perm-card {
+  border: 1px solid rgba(0,0,0,0.12); border-radius: 8px;
+  padding: 8px 10px; font-size: 12.5px; line-height: 1.7;
+  background: #fff;
+}
+.perm-card-head { display: flex; align-items: center; justify-content: space-between; }
+.perm-role { font-weight: 600; }
+.perm-badge {
+  font-size: 11px; padding: 1px 8px; border-radius: 10px; white-space: nowrap;
+}
+.perm-badge-active { background: #dcfce7; color: #166534; }
+.perm-badge-pending { background: #fef9c3; color: #854d0e; }
+.perm-badge-expired { background: #f1f5f9; color: #64748b; }
+.perm-badge-revoked { background: #fee2e2; color: #991b1b; }
+.perm-card button { margin-top: 6px; }
+.perm-logs { max-height: 60vh; overflow: auto; }
+.perm-logline {
+  padding: 6px 8px; border-bottom: 1px dashed rgba(0,0,0,0.08);
+  font-size: 12.5px; line-height: 1.6;
+}
+.perm-log-deny { background: rgba(220,38,38,0.05); }
+.perm-log-msg { color: var(--muted); }
