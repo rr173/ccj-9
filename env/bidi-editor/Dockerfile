@@ -1,8 +1,8 @@
-# Node 零依赖服务：静态文件 + 快照/批注/审阅批次/决策执行队列/执行回放/角色委派 JSON API
+# Node 零依赖服务：静态文件 + 快照/批注/审阅批次/决策执行队列/执行回放/角色委派/申请分组 JSON API
 FROM node:20-alpine
 
 WORKDIR /app
-COPY server.js snapshot-core.js review-core.js decision-core.js replay-core.js replay-review-core.js replay-session-core.js replay-archive-core.js replay-reconcile-core.js permission-core.js permission-request-core.js app.js snapshots.js annotations.js batches.js decisions.js replay.js replay-archive.js replay-reconcile.js permissions.js index.html style.css ./
+COPY server.js snapshot-core.js review-core.js decision-core.js replay-core.js replay-review-core.js replay-session-core.js replay-archive-core.js replay-reconcile-core.js permission-core.js permission-request-core.js permission-request-group-core.js app.js snapshots.js annotations.js batches.js decisions.js replay.js replay-archive.js replay-reconcile.js permissions.js index.html style.css ./
 
 # 快照、批注、审阅批次、审阅决策、执行回放/归档/对账与角色委派数据持久化目录（可挂卷覆盖：-v bidi-editor-data:/app/data）
 RUN mkdir -p /app/data
