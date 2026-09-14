@@ -125,6 +125,7 @@
       var permRev = res.headers.get("X-Permission-Rev");
       var reqRev = res.headers.get("X-Permission-Request-Rev");
       var grpRev = res.headers.get("X-Permission-Group-Rev");
+      var tplRev = res.headers.get("X-Permission-Template-Rev");
       return res.text().then(function (text) {
         var data = null;
         try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
@@ -135,7 +136,8 @@
           err.data = data;
           throw err;
         }
-        return { data: data, permRev: permRev, reqRev: reqRev, grpRev: grpRev };
+        return { data: data, permRev: permRev, reqRev: reqRev,
+          grpRev: grpRev, tplRev: tplRev };
       });
     });
   }
@@ -150,10 +152,12 @@
     rev: "0",
     requestRev: "0",
     groupRev: "0",
+    templateRev: "0",
     filter: { scope: "", resourceId: "", member: "" },
     delegations: [],
     requests: [],
-    groups: []
+    groups: [],
+    templates: []
   };
 
   /* ================= 主面板 ================= */
@@ -504,6 +508,96 @@
     groupSection.appendChild(groupLogsBtn);
     box.appendChild(groupSection);
 
+    /* ---- ⑤c 申请模板与条件校验（负责人保存可复用模板；成员按模板发起） ---- */
+    var tplSection = el("div", "replay-section");
+    var tplHead = el("div", "replay-section-head");
+    tplHead.appendChild(el("h4", null,
+      "⑤c 申请模板（角色 / 申请类型 / 默认有效期 / 说明 / 适用成员范围；停用与旧版本不能再发起）"));
+    tplHead.appendChild(button("刷新模板"));
+    tplHead.lastChild.addEventListener("click", loadTemplates);
+    tplSection.appendChild(tplHead);
+
+    // 负责人新建模板表单
+    var tCreateBar = el("div", "perm-form");
+    var tcScope = el("select");
+    [["space", "回放空间"], ["session", "复核会话"], ["batch", "纠错批次"]]
+      .forEach(function (p) { tcScope.appendChild(new Option(p[1], p[0])); });
+    var tcResource = el("input");
+    tcResource.placeholder = "资源 id（模板锁定单一资源）";
+    var tcName = el("input");
+    tcName.placeholder = "模板名称（必填，≤100 字）";
+    var tcKind = el("select");
+    [["grant", "授予申请"], ["revoke", "撤销申请"]]
+      .forEach(function (p) { tcKind.appendChild(new Option(p[1], p[0])); });
+    var tcRole = el("select");
+    [["view", "查看"], ["review", "复核"], ["approve", "审批"],
+     ["execute", "执行"]].forEach(function (p) {
+      tcRole.appendChild(new Option(p[1] + "（" + p[0] + "）", p[0]));
+    });
+    var tcDuration = el("input");
+    tcDuration.type = "number";
+    tcDuration.min = "60000";
+    tcDuration.value = String(24 * 3600 * 1000);
+    tcDuration.title = "默认有效期（毫秒）；授予模板必填，1 分钟 ~ 366 天";
+    var tcDesc = el("input");
+    tcDesc.placeholder = "模板说明（可选，≤500 字，对成员可见）";
+    var tcScopeMode = el("select");
+    [["all", "全体成员"], ["members", "指定成员"]]
+      .forEach(function (p) { tcScopeMode.appendChild(new Option(p[1], p[0])); });
+    var tcMembers = el("input");
+    tcMembers.placeholder = "适用成员（逗号分隔；仅“指定成员”时生效）";
+    function tcField(label, node) {
+      var wrap = el("label", "perm-field");
+      wrap.appendChild(el("span", null, label));
+      wrap.appendChild(node);
+      return wrap;
+    }
+    tCreateBar.appendChild(tcField("资源", tcScope));
+    tCreateBar.appendChild(tcField("资源 id", tcResource));
+    tCreateBar.appendChild(tcField("名称", tcName));
+    tCreateBar.appendChild(tcField("类型", tcKind));
+    tCreateBar.appendChild(tcField("角色", tcRole));
+    tCreateBar.appendChild(tcField("默认有效期ms", tcDuration));
+    tCreateBar.appendChild(tcField("说明", tcDesc));
+    tCreateBar.appendChild(tcField("适用范围", tcScopeMode));
+    tCreateBar.appendChild(tcField("成员名单", tcMembers));
+    tCreateBar.appendChild(button("新建模板", "primary", function () {
+      var body = {
+        name: tcName.value.trim(),
+        scope: tcScope.value,
+        resourceId: tcResource.value.trim(),
+        kind: tcKind.value,
+        role: tcRole.value,
+        description: tcDesc.value.trim(),
+        memberScope: tcScopeMode.value === "all"
+          ? { mode: "all" }
+          : { mode: "members",
+              members: tcMembers.value.split(/[,，]/).map(function (s) {
+                return s.trim();
+              }).filter(Boolean) }
+      };
+      if (tcKind.value === "grant") {
+        body.defaultDurationMs = Number(tcDuration.value);
+      }
+      api("POST", "/api/permissions/request-templates",
+        { body: body, ifMatch: state.templateRev }).then(function (r) {
+          state.templateRev = r.tplRev;
+          toast("已创建模板：" + body.name);
+          tcName.value = ""; tcDesc.value = ""; tcMembers.value = "";
+          loadTemplates();
+        }).catch(handleTemplateError);
+    }));
+    tplSection.appendChild(tCreateBar);
+
+    var tplList = el("div", "perm-list");
+    tplSection.appendChild(tplList);
+    var tplLogsBtn = button("模板审计记录（变更 / 使用 / 拒绝原因）");
+    tplLogsBtn.addEventListener("click", function () {
+      openTemplateLogs();
+    });
+    tplSection.appendChild(tplLogsBtn);
+    box.appendChild(tplSection);
+
     /* ---- ⑥ 未来时刻生效预览（纯只读，不修改正式权限） ---- */
     var previewSection = el("div", "replay-section");
     previewSection.appendChild(el("h4", null,
@@ -573,6 +667,7 @@
       loadList();
       loadRequests();
       loadGroups();
+      loadTemplates();
     }
 
     function loadList() {
@@ -681,6 +776,11 @@
           "（v" + q.version + "）"));
         card.appendChild(el("div", null, "申请人：" + q.member));
         card.appendChild(el("div", null, "资源：" + q.resourceId));
+        if (q.templateId) {
+          card.appendChild(el("div", null,
+            "来源模板：" + q.templateName + "（v" + q.templateVersion +
+            " · " + q.templateId + "，模板日后修改不影响本申请）"));
+        }
         card.appendChild(el("div", null,
           "所属分组：" + (q.groupName
             ? q.groupName + "（" + groupDeadlineLabel(q.groupDeadlineState) +
@@ -861,6 +961,335 @@
           toast("分组已删除，解除归属 " + r.data.detachedRequests + " 条申请");
           loadGroups(); loadRequests();
         }).catch(handleGroupError);
+    }
+
+    /* ---------------- 申请模板 ---------------- */
+
+    function loadTemplates() {
+      api("GET", "/api/permissions/request-templates").then(function (r) {
+        state.templateRev = r.tplRev;
+        state.templates = r.data.templates || [];
+        renderTemplates(tplList, state.templates);
+      }).catch(function (e) {
+        tplList.innerHTML = "";
+        tplList.appendChild(el("div", "snap-empty",
+          "模板加载失败：" + e.message));
+      });
+    }
+
+    function isTemplateOwnerView(t) {
+      // 负责人视图含 history；普通成员视图是裁剪版
+      return Array.isArray(t.history);
+    }
+
+    function scopeText(t) {
+      var ms = t.memberScope || { mode: "all" };
+      return ms.mode === "all"
+        ? "全体成员"
+        : ("指定成员 " + (ms.memberCount == null ? ms.members.length : ms.memberCount) +
+           " 名");
+    }
+
+    function renderTemplates(container, templates) {
+      container.innerHTML = "";
+      if (!templates.length) {
+        container.appendChild(el("div", "snap-empty",
+          "暂无模板。负责人可在上方为某个资源保存可复用的申请模板。"));
+        return;
+      }
+      templates.forEach(function (t) {
+        var card = el("div", "perm-card perm-tpl-card perm-tpl-" +
+          (t.status || "active"));
+        var head = el("div", "perm-card-head");
+        head.appendChild(el("span", "perm-role",
+          "模板 · " + t.name + " · " +
+          (t.kind === "grant" ? "授予申请" : "撤销申请") + " · " +
+          (ROLE_LABELS[t.role] || t.role) + " · " +
+          (SCOPE_LABELS[t.scope] || t.scope)));
+        head.appendChild(el("span",
+          "perm-badge perm-badge-" + (t.status === "disabled" ? "expired" : "approved"),
+          t.status === "disabled" ? "已停用" : "启用中 v" + t.currentVersion));
+        card.appendChild(head);
+        card.appendChild(el("div", null, "资源：" + t.resourceId));
+        card.appendChild(el("div", null,
+          "适用范围：" + scopeText(t)));
+        if (t.kind === "grant") {
+          card.appendChild(el("div", null,
+            "默认有效期：" + (t.defaultDurationMs != null
+              ? Math.round(t.defaultDurationMs / 3600000) + " 小时" : "—")));
+        }
+        if (t.description) {
+          card.appendChild(el("div", "snap-note", "说明：" + t.description));
+        }
+        var acts = el("div", "perm-rq-actions");
+        acts.appendChild(button("用此模板发起申请", "primary", function () {
+          submitFromTemplate(t);
+        }));
+        if (isTemplateOwnerView(t)) {
+          acts.appendChild(button("修改", null, function () { editTemplate(t.id); }));
+          acts.appendChild(button("版本历史", null, function () {
+            openTemplateVersions(t.id);
+          }));
+          if (t.status !== "disabled") {
+            acts.appendChild(button("停用", "danger", function () {
+              disableTemplate(t.id);
+            }));
+          }
+        }
+        card.appendChild(acts);
+        container.appendChild(card);
+      });
+    }
+
+    function editTemplate(id) {
+      var t = state.templates.find(function (x) { return x.id === id; });
+      if (!t) return;
+      var box = el("div", "perm-form");
+      var n = el("input"); n.value = t.name;
+      var dur = el("input"); dur.type = "number"; dur.min = "60000";
+      dur.value = t.defaultDurationMs != null ? String(t.defaultDurationMs) : "";
+      var desc = el("input"); desc.value = t.description || "";
+      var mode = el("select");
+      [["all", "全体成员"], ["members", "指定成员"]].forEach(function (p) {
+        mode.appendChild(new Option(p[1], p[0]));
+      });
+      mode.value = (t.memberScope && t.memberScope.mode) || "all";
+      var members = el("input");
+      members.value = (t.memberScope && t.memberScope.members || []).join("，");
+      function f(label, node) {
+        var wrap = el("label", "perm-field");
+        wrap.appendChild(el("span", null, label));
+        wrap.appendChild(node);
+        return wrap;
+      }
+      box.appendChild(f("名称", n));
+      if (t.kind === "grant") box.appendChild(f("默认有效期（毫秒）", dur));
+      box.appendChild(f("说明", desc));
+      box.appendChild(f("适用范围", mode));
+      box.appendChild(f("成员名单（逗号分隔）", members));
+      var m = openModal("修改模板：" + t.name + "（当前 v" +
+        t.currentVersion + "；保存后生成新版本，旧版本不能再发起）", box,
+        { buttons: [] });
+      var save = button("保存为新版本", "primary", function () {
+        var body = {
+          name: n.value.trim(),
+          description: desc.value.trim(),
+          memberScope: mode.value === "all"
+            ? { mode: "all" }
+            : { mode: "members",
+                members: members.value.split(/[,，]/).map(function (s) {
+                  return s.trim();
+                }).filter(Boolean) }
+        };
+        if (t.kind === "grant" && dur.value) {
+          body.defaultDurationMs = Number(dur.value);
+        }
+        api("PATCH", "/api/permissions/request-templates/" + id,
+          { body: body, ifMatch: state.templateRev }).then(function (r) {
+            state.templateRev = r.tplRev;
+            toast(r.data.unchanged
+              ? "模板内容无变化"
+              : "模板已更新到 v" + r.data.template.currentVersion);
+            m.close(); loadTemplates(); loadRequests();
+          }).catch(function (e) { handleTemplateError(e); });
+      });
+      var cancel = button("取消", null, function () { m.close(); });
+      m.foot.appendChild(save); m.foot.appendChild(cancel);
+    }
+
+    function disableTemplate(id) {
+      var t = state.templates.find(function (x) { return x.id === id; });
+      if (!t) return;
+      var reason = window.prompt(
+        "停用原因（可留空）。停用是终态：停用后不能再用该模板发起新申请，" +
+        "已提交申请与版本历史保留。", "");
+      if (reason === null) return;
+      api("POST", "/api/permissions/request-templates/" + id + "/disable",
+        { body: { reason: reason }, ifMatch: state.templateRev })
+        .then(function (r) {
+          state.templateRev = r.tplRev;
+          toast("模板 “" + t.name + "” 已停用");
+          loadTemplates();
+        }).catch(handleTemplateError);
+    }
+
+    // 成员用模板发起申请；提交瞬间服务端按当前角色配置/委派/待处理申请重新校验
+    function submitFromTemplate(t) {
+      var box = el("div", "perm-form");
+      box.appendChild(el("div", "snap-note",
+        (SCOPE_LABELS[t.scope] || t.scope) + " " + t.resourceId + " · " +
+        (t.kind === "grant" ? "授予" : "撤销") + " · " +
+        (ROLE_LABELS[t.role] || t.role) + " · 依据版本 v" + t.currentVersion));
+      var delegationId = el("input");
+      delegationId.placeholder = "撤销申请：本人正式委派 id（del_…）";
+      var effective = el("input");
+      effective.type = "datetime-local"; effective.step = "1";
+      effective.title = "生效时间（留空=立即生效）";
+      var expire = el("input");
+      expire.type = "datetime-local"; expire.step = "1";
+      if (t.kind === "grant" && t.defaultDurationMs) {
+        expire.value = dtLocal(new Date(Date.now() + t.defaultDurationMs));
+      }
+      expire.title = "失效时间（留空=使用模板默认有效期）";
+      var note = el("input");
+      note.placeholder = "申请说明（可选，≤500 字）";
+      function f(label, node) {
+        var wrap = el("label", "perm-field");
+        wrap.appendChild(el("span", null, label));
+        wrap.appendChild(node);
+        return wrap;
+      }
+      if (t.kind === "revoke") box.appendChild(f("目标委派 id", delegationId));
+      if (t.kind === "grant") {
+        box.appendChild(f("生效（留空=立即）", effective));
+        box.appendChild(f("失效（留空=模板默认）", expire));
+      }
+      box.appendChild(f("说明", note));
+      var m = openModal("用模板发起申请：" + t.name, box, { buttons: [] });
+      var submit = button("提交申请", "primary", function () {
+        var body = { templateVersion: t.currentVersion,
+          note: note.value.trim() };
+        if (t.kind === "revoke") {
+          body.delegationId = delegationId.value.trim();
+        } else {
+          if (expire.value) body.expireAt = new Date(expire.value).toISOString();
+          if (effective.value) {
+            body.effectiveAt = new Date(effective.value).toISOString();
+          }
+        }
+        api("POST", "/api/permissions/request-templates/" + t.id + "/submit",
+          { body: body, ifMatch: state.requestRev }).then(function (r) {
+            state.requestRev = r.reqRev;
+            toast("申请已提交：" + r.data.request.id +
+              "（模板 " + t.name + " v" + t.currentVersion + "）");
+            m.close(); loadRequests();
+          }).catch(function (e) { handleTemplateSubmitError(e); });
+      });
+      m.foot.appendChild(submit);
+      m.foot.appendChild(button("取消", null, function () { m.close(); }));
+    }
+
+    function openTemplateVersions(id) {
+      api("GET", "/api/permissions/request-templates/" + id + "/versions")
+        .then(function (r) {
+          var box = el("div", "perm-logs");
+          box.appendChild(el("div", "snap-note",
+            "当前版本 v" + r.data.currentVersion +
+            "（新版本倒序；停用不产生内容版本）"));
+          r.data.versions.forEach(function (v) {
+            var line = el("div", "perm-logline");
+            line.appendChild(el("span", null,
+              formatTime(v.at) + " · " +
+              ({ create: "创建", update: "修改", disable: "停用" }[v.action] ||
+                v.action) + " · v" + v.version + " · " + (v.by || "—")));
+            line.appendChild(el("div", "perm-log-msg",
+              v.name + " · " + (ROLE_LABELS[v.role] || v.role) + " · " +
+              (v.kind === "grant" ? "授予" : "撤销") +
+              (v.defaultDurationMs != null
+                ? " · 默认有效期 " + Math.round(v.defaultDurationMs / 3600000) + " 小时"
+                : "") + " · " +
+              (v.memberScope && v.memberScope.mode === "all"
+                ? "全体成员"
+                : "指定成员 " + ((v.memberScope && v.memberScope.members) || [])
+                    .join("、"))));
+            if (v.description) {
+              line.appendChild(el("div", "perm-log-msg", "说明：" + v.description));
+            }
+            if (v.action === "update" && v.changes) {
+              line.appendChild(el("div", "perm-log-msg",
+                "变更字段：" + Object.keys(v.changes).join("、")));
+            }
+            box.appendChild(line);
+          });
+          openModal("模板版本历史", box,
+            { buttons: [button("关闭", null, function () {})] });
+        }).catch(handleTemplateError);
+    }
+
+    function openTemplateLogs() {
+      var box = el("div", "perm-logs");
+      box.appendChild(el("div", "snap-note", "加载中…"));
+      var m = openModal("模板审计（变更 / 使用 / 拒绝原因）", box,
+        { buttons: [button("关闭", null, function () {})] });
+      api("GET", "/api/permissions/request-templates/logs").then(function (r) {
+        state.templateRev = r.tplRev || state.templateRev;
+        box.innerHTML = "";
+        var entries = r.data.logs || [];
+        box.appendChild(el("div", "snap-note", "共 " + entries.length +
+          " 条（时间倒序；只增不改，重启可查）"));
+        if (!entries.length) {
+          box.appendChild(el("div", "snap-empty", "暂无记录。"));
+          return;
+        }
+        var ACTIONS = {
+          template_create: "创建模板", template_update: "修改模板",
+          template_disable: "停用模板", template_submit: "用模板发起申请",
+          template_submit_rejected: "模板发起被拒绝"
+        };
+        entries.slice(0, 500).forEach(function (x) {
+          var deny = x.action === "template_submit_rejected";
+          var line = el("div", "perm-logline perm-log-" + (deny ? "deny" : "ok"));
+          line.appendChild(el("span", null,
+            formatTime(x.at) + " · " + (ACTIONS[x.action] || x.action) +
+            " · " + (SCOPE_LABELS[x.scope] || x.scope) + " " +
+            (x.resourceId || "") + " · 操作人 " + (x.actor || "—") +
+            " · " + x.templateId +
+            (x.requestId ? " · 申请 " + x.requestId : "")));
+          var d = x.detail || {};
+          if (deny) {
+            line.appendChild(el("div", "perm-log-msg",
+              "拒绝原因：" + d.code + " — " + d.message));
+          }
+          if (x.action === "template_create" || x.action === "template_update") {
+            if (d.name) line.appendChild(el("div", "perm-log-msg", "名称：" + d.name));
+          }
+          box.appendChild(line);
+        });
+      }).catch(function (e) {
+        box.innerHTML = "";
+        box.appendChild(el("div", "snap-empty", "加载失败：" + e.message));
+      });
+      return m;
+    }
+
+    function handleTemplateError(e) {
+      if (e.code === "version_conflict") {
+        toast("模板集合已被其他页面更新（旧 templateRev 冲突），本次未写入，请刷新",
+          "error");
+        loadTemplates();
+      } else if (e.code === "template_disabled") {
+        toast("模板已停用，不能再修改或发起新申请", "error");
+        loadTemplates();
+      } else {
+        toast(e.message, "error");
+      }
+    }
+
+    function handleTemplateSubmitError(e) {
+      if (e.code === "version_conflict") {
+        toast("申请集合已被其他页面更新，本次未提交，请刷新后重试", "error");
+        loadRequests();
+      } else if (e.code === "template_version_changed") {
+        toast("模板已被负责人修改到 v" +
+          (e.data && e.data.currentVersion) +
+          "，旧版本不能创建申请，请关闭窗口后用新版本发起", "error");
+        loadTemplates();
+      } else if (e.code === "template_disabled") {
+        toast("模板已停用，不能继续创建申请", "error");
+        loadTemplates();
+      } else if (e.code === "member_not_in_template_scope") {
+        toast("你不在该模板的适用成员范围内，不能使用此模板", "error");
+      } else if (e.code === "duplicate_request") {
+        toast("你已有一条待处理的同角色申请（" +
+          (e.data && e.data.existingRequestId) + "），不能重复提交", "error");
+      } else if (e.code === "duplicate_delegation") {
+        toast("你已持有时间窗重叠的正式委派，无需重复申请", "error");
+      } else if (e.code === "conflicting_roles" ||
+                 e.code === "conflicting_request_roles") {
+        toast("时间窗内存在 approve/execute 职责冲突，已拒绝创建", "error");
+      } else {
+        handleRequestError(e);
+      }
     }
 
     // 组详情：列出组内申请，支持勾选加入/移除与整批批量决定

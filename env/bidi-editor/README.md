@@ -57,6 +57,17 @@ A/B）；归档被篡改、缺失引用或校验摘要不一致时明确标出�
 批量审批与截止提醒写入独立审计，分组、处理结果、失败原因与历史只读状态随权限文件
 持久化，重启后仍可查询。
 
+在申请流之上再提供**申请模板与条件校验**：资源负责人可为某个资源保存可复用的
+申请模板，模板包含**角色、申请类型（授予/撤销）、默认有效期、说明与适用成员范围
+（全体或白名单）**，支持新建、修改（每次保存生成新版本，旧版本完整留存在版本历史）、
+停用与查看版本历史；**停用模板与旧版本都不能继续创建新申请**。普通成员只能看到和
+使用“启用且适用范围含自己”的模板。用模板发起申请时，系统按提交瞬间的角色配置、
+已有正式委派与待处理申请重新校验——角色已存在、时间窗冲突、职责冲突、重复申请、
+成员不在适用范围或模板版本已变化都**明确拒绝并返回原因**。成功创建的申请记录模板
+id、版本与该版本完整快照（溯源），**后续模板修改/停用不改变任何已提交申请**。
+模板集合有第四套独立版本号 `X-Permission-Template-Rev`；模板变更、使用记录与
+拒绝原因写入独立审计（拒绝同时进入统一 denials），随权限文件持久化，重启后一致。
+
 ## 双向编辑的需求与实现对照
 
 | 需求 | 实现方式 |
@@ -1006,6 +1017,58 @@ revoked。落盘失败整体回滚（申请终态与正式委派要么同时生�
   与本人无关的分组 403；分组的管理、批量审批、成员加移、删除与截止提醒审计仅资源
   负责人/系统负责人可见。删除分组只解除申请归属，申请本身与正式权限均不变。
 
+### 申请模板与条件校验
+
+资源负责人可为某个资源保存**可复用的申请模板**，让普通成员按统一口径快速发起申请：
+
+- **模板内容**：`name`、资源（scope+resourceId，锁定单一资源）、角色 `role`、
+  申请类型 `kind`（grant 授予 / revoke 撤销）、**默认有效期** `defaultDurationMs`
+  （授予模板必填，整数毫秒，1 分钟 ~ 366 天；撤销模板不适用）、**说明**
+  `description`（≤500 字，对成员可见）、**适用成员范围** `memberScope`
+  （`{mode:"all"}` 全体，或 `{mode:"members",members:[...]}` 白名单，
+  ≤200 人、自动去重）。角色仍受资源矩阵约束（space/session 仅 view/review）。
+- **生命周期**：新建（内容版本 v1）→ 修改（每次实际变更生成新版本，无变化不推进
+  版本）→ 停用（终态；停用后不能再发起、不能再修改，需要时由负责人新建）。
+  全部 create/update/disable 事件进入只增不改的**版本历史**（内容事件带该版本完整
+  快照），可 `GET …/request-templates/:id/versions` 查询。
+- **第四套独立版本**：模板集合有单调版本号 `templateRev`（响应头
+  `X-Permission-Template-Rev`），与申请集合 `requestRev`、分组集合 `groupRev`、
+  正式委派集合 `rev` 四者独立；建/改/停用必须 `If-Match` 等于 templateRev
+  （缺省 428、旧页面 409 `version_conflict`）。模板自身的内容版本 `currentVersion`
+  与集合版本互不影响。
+- **普通成员可见性**：成员只能看到“**启用中且适用范围包含自己**”的模板；成员视图
+  裁剪掉版本历史与完整白名单（只给 `memberCount`，不泄露他人名单）；停用模板、
+  范围外模板对成员不可见，直接取详情 403；版本历史仅负责人/系统负责人可查。
+- **用模板发起申请**：`POST …/request-templates/:id/submit`，必须携带
+  `If-Match=requestRev`（与直接申请同一集合版本）与 **`templateVersion`（发起所
+  依据的模板内容版本，严格相等）**。授予模板默认窗口为提交瞬间
+  `now ~ now+defaultDurationMs`，可显式给 `effectiveAt/expireAt` 覆盖；撤销模板
+  需带本人正式委派 `delegationId`；`note` 可选。
+- **提交时重新校验（模板只提供默认值，不豁免任何硬规则）**：
+
+  | 场景 | 结果 |
+  |---|---|
+  | 模板不存在 / 已停用 | 404 `template_not_found` / 409 `template_disabled` |
+  | 不带 templateVersion | 428 `precondition_required` |
+  | 模板在此期间被修改（版本不符） | 409 `template_version_changed`（带 currentVersion/submittedVersion），旧版本不能创建 |
+  | 成员不在适用范围 | 403 `member_not_in_template_scope` |
+  | 角色已存在 / 重复申请 / 时间窗冲突 / 职责冲突 / 负责人自审 | 复用申请流同一组错误：409 `duplicate_delegation`/`duplicate_request`/`conflicting_roles`/`conflicting_request_roles`/`approver_is_owner` |
+  | 撤销非本人/已撤销/已过期委派、重复撤销申请 | 404 `delegation_not_found`、409 `not_delegation_member`/`duplicate_revoke`/`delegation_expired`/`duplicate_revoke_request` |
+
+  被拒申请**不写任何业务数据**；拒绝原因逐条返回并同时写入独立模板审计
+  （`template_submit_rejected`）与统一 `denials`（`action=permission_template_submit`），
+  重启后仍可查询。
+- **溯源与历史只读**：成功创建的申请记录 `templateId/templateVersion/templateName/
+  templateSnapshot`（该版本完整内容快照）；后续模板修改、停用**不回溯改变任何已
+  提交申请**——既有申请仍按原窗口/原说明正常审批（模板停用不影响在途申请）。申请
+  列表与详情对外返回模板来源字段。
+- **独立审计**：`template_create/template_update/template_disable/template_submit/
+  template_submit_rejected` 写入只增不改的 `templateLogs`，可
+  `GET /api/permissions/request-templates/logs` 按时间/资源查询；普通成员只看到
+  自己发起或自己被拒的记录，管理事件仅负责人可见。模板、版本历史、申请溯源、审计
+  与四套版本号全部随 `./data/permissions.json` 原子落盘，旧文件缺字段启动自动补齐，
+  重启后状态一致。
+
 ### 权限变更 HTTP API 摘要
 
 ```
@@ -1033,6 +1096,20 @@ POST   /api/permissions/request-groups/:id/batch-decide
                                                 批量决定 {items:[{id,version,decision,reason?}]}（If-Match: requestRev；整批原子）
 GET    /api/permissions/request-groups/logs[?from=&to=&scope=&resourceId=]
                                                 分组独立审计（变更/批量/截止提醒；普通成员只见本人相关，提醒仅负责人）
+
+GET    /api/permissions/request-templates[?scope=&resourceId=]
+                                                模板列表（负责人含历史；成员只见启用且适用范围含自己的模板）
+POST   /api/permissions/request-templates       创建 {name,scope,resourceId,role,kind,defaultDurationMs?,description?,memberScope?}（If-Match: templateRev）
+GET    /api/permissions/request-templates/:id   模板详情（负责人含版本历史/白名单；成员为裁剪视图）
+PATCH  /api/permissions/request-templates/:id   修改生成新版本 {name?,role?,kind?,defaultDurationMs?,description?,memberScope?}（If-Match: templateRev）
+POST   /api/permissions/request-templates/:id/disable
+                                                停用（终态；{reason?}，If-Match: templateRev）
+GET    /api/permissions/request-templates/:id/versions
+                                                版本历史（仅资源/系统负责人）
+POST   /api/permissions/request-templates/:id/submit
+                                                用模板发起申请 {templateVersion（必填）,effectiveAt?,expireAt?,note?,delegationId?(revoke)}（If-Match: requestRev）
+GET    /api/permissions/request-templates/logs[?from=&to=&scope=&resourceId=]
+                                                模板独立审计（变更/使用/拒绝原因；普通成员只见自己相关）
 ```
 
 分组集合版本号为响应头 `X-Permission-Group-Rev`；错误码补充：400
@@ -1051,6 +1128,16 @@ GET    /api/permissions/request-groups/logs[?from=&to=&scope=&resourceId=]
 `reject_reason_required`/`request_expired`/`request_not_pending`/
 `request_version_conflict`；428 缺 `If-Match` 或 `X-Request-Version`。
 审批截止可用 `PERMISSION_REQUEST_TTL_MS` 调整（默认 72 小时）。
+
+模板集合版本号为响应头 `X-Permission-Template-Rev`（建/改/停用携带
+`If-Match: templateRev`；发起申请携带 `If-Match: requestRev` 与请求体
+`templateVersion`）。模板错误码：400 `missing_template_name`/`name_too_long`/
+`invalid_default_duration`/`missing_default_duration`/`invalid_member_scope`/
+`missing_scope_members`/`invalid_scope_member`/`too_many_scope_members`/
+`description_too_long`/`template_too_large`；403
+`member_not_in_template_scope`；404 `template_not_found`；409
+`template_disabled`/`template_version_changed`（带 `currentVersion`/
+`submittedVersion`）；428 缺 `If-Match` 或 `templateVersion`。
 
 ## 其他编辑器功能
 
@@ -1078,15 +1165,20 @@ node server.js          # http://localhost:8080
 `./data/replay-reconcile.json`（`REPLAY_RECONCILE_FILE` 覆盖，集合版本号为
 响应头 `X-Reconcile-Rev`，两阶段写盘失败重启自动对账清理孤儿纠错空间），
 **角色委派与操作权限**（委派/有效期/撤销/拒绝原因/操作记录，权限变更申请的
-申请记录、独立 requestRev、逐条 version、审批处理记录与申请流审计，以及申请分组的
+申请记录、独立 requestRev、逐条 version、审批处理记录与申请流审计，申请分组的
 分组记录、独立 groupRev、成员归属、批量决定逐条结果/失败原因、分组变更/批量/截止
-提醒独立审计）独立写到 `./data/permissions.json`（`PERMISSIONS_FILE` 覆盖，
+提醒独立审计，以及申请模板的模板记录、独立 templateRev、内容版本历史、停用状态、
+申请模板溯源、模板变更/使用/拒绝独立审计）独立写到 `./data/permissions.json`
+（`PERMISSIONS_FILE` 覆盖，
 正式委派集合版本号为响应头 `X-Permission-Rev`，申请集合独立版本号为
 `X-Permission-Request-Rev`，申请分组集合独立版本号为 `X-Permission-Group-Rev`，
+申请模板集合独立版本号为 `X-Permission-Template-Rev`，
 授予/撤销/申请/审批必须 If-Match 严格相等、审批还须 X-Request-Version 等于
 申请 version，分组管理须 If-Match 等于 groupRev、批量审批须 If-Match 等于
-requestRev 且每条携带申请 version，重启后有效期、申请状态与截止、分组归属、
-批量处理结果与失败原因、操作记录全部恢复；申请审批截止时长用
+requestRev 且每条携带申请 version，模板管理须 If-Match 等于 templateRev、
+用模板发起申请须 If-Match 等于 requestRev 且携带 templateVersion，重启后有效期、
+申请状态与截止、分组归属、批量处理结果与失败原因、模板与版本历史、申请模板溯源、
+操作记录全部恢复；申请审批截止时长用
 `PERMISSION_REQUEST_TTL_MS` 调整（默认 72 小时），分组截止提醒扫描间隔用
 `PERMISSION_GROUP_REMINDER_INTERVAL_MS`（默认 60 秒）、提醒提前量用
 `PERMISSION_GROUP_REMINDER_APPROACHING_MS`（默认 24 小时）），
@@ -1129,6 +1221,8 @@ node --test test/
 - `test/permission-requests-api.test.js`：真实起服务走完空间→会话→两个归档→差异→纠错批次的准备链路后，覆盖跨资源申请（space/session/batch）、待处理申请不改变授权、重复申请/替人申请/越权查看明细拒绝、拒绝必填原因且拒绝不改变权限（正式委派 rev 不推进）、批准后下一个请求即时生效、非负责人审批 403、负责人审批自己的申请 403 self_approval、并发审批同一申请只成功一次（败者 version_conflict/request_version_conflict，串行旧 X-Request-Version 单独 409）、过期边界（截止后审批落 expired 终态且权限不变/终态只读）、过期后重新申请并批准、撤销申请批准即时失权/重复撤销申请拒绝、撤销后重新申请、未来生效委派 activating 预览、待处理申请只在 pending 组、即将失效与已批准撤销分组、预览不推 rev、普通成员不能预览他人/非法 at 400、申请审计链动作齐全且普通成员只见自己相关记录、旧 requestRev 提交 409、重启后申请状态/版本/拒绝原因/正式委派 rev/预览依据全部恢复、终态申请只读
 - `test/permission-request-group-core.test.js`：分组创建/更新校验（名称/截止未来/备注/数量上限/更新允许改过去标记逾期）、截止状态 none/pending/overdue、分组摘要按类型/状态/成员计数与待处理数量、截止提醒确定性与幂等（approaching/overdue、无 pending 不提醒、已提醒不重复、过截止补发 overdue）、批量决定原子前置校验（集合版本/批内重复/缺 id/不属于本组/每条版本/已处理/过期/自审/非负责人/拒绝缺原因、批准瞬间与正式委派重复、批内同角色重复与 approve-execute 窗口冲突整批拒绝、窗口错开或全部合法整批通过）
 - `test/permission-request-groups-api.test.js`：真实起服务覆盖仅资源负责人可建/改/删组与加移成员、独立 groupRev 旧版本 409、普通成员只见本人所在分组摘要且组详情只见本人申请、申请列表携带分组/截止状态/待处理数量、加入成员原子（跨资源/已在别组整批拒绝、reassign 移动）、批量决定双重版本校验（requestRev+每条 version）、自审/拒绝缺原因/非本组条目整批拒绝逐条返回、整批一次事务只推一次 requestRev、批准即时生效下一个请求放行、历史终态只读、批内批准瞬间冲突整批不改权限与版本、分组变更与批量成功/失败写独立 groupLogs、截止提醒经重启扫描产生 overdue 且重复扫描幂等、重启后分组/归属/批量结果/失败审计/待处理数量恢复、删除分组解除归属但申请与权限不变
+- `test/permission-template-core.test.js`：模板创建/更新校验（名称/角色矩阵/默认有效期上下限/撤销模板不需要有效期/说明长度/数量上限）、适用成员范围（全体/白名单去重/非法成员/超限）、停用模板与旧版本拒绝（template_disabled/template_version_changed/precondition_required）、成员不在适用范围、发起授予申请时默认窗口=now+默认有效期与显式覆盖、提交时按当前正式委派/待处理申请复核（角色已存在/重复申请/approve-execute 职责冲突/负责人自审）、撤销模板必须指定本人有效委派、内容快照不可变与溯源固化、负责人/成员视图裁剪
+- `test/permission-templates-api.test.js`：真实起服务覆盖仅资源负责人可建/改/停用模板、独立 templateRev 旧版本 409 与缺 If-Match 428、角色矩阵与默认有效期校验、普通成员只见启用且范围含自己的模板（裁剪白名单/历史、范围外详情 403、历史 403）、用模板发起申请（默认窗口/显式覆盖/记录 templateId+version+快照）、提交时条件复核拒绝（duplicate_request/duplicate_delegation/member_not_in_template_scope）、模板修改后旧版本 template_version_changed、停用后不能发起/修改/重复停用且不推内容版本、已提交申请保留 v1 快照且可正常审批（模板修改不回溯）、撤销模板对本人委派发起/非本人拒绝、templateLogs 含创建/修改/停用/发起/拒绝且成员只见自己相关、拒绝进入统一 denials、重启后模板/历史/申请溯源/日志/四套版本号恢复
 
 
 ## Docker 部署

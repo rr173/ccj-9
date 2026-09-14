@@ -654,7 +654,13 @@
       groupDeadlineState: groupInfo ? groupInfo.deadlineState : null,
       groupPendingCount: groupInfo ? groupInfo.pendingCount : null,
       // 正式委派关联：批准授予时生成的委派 id
-      generatedDelegationId: r.generatedDelegationId || null
+      generatedDelegationId: r.generatedDelegationId || null,
+      // 申请模板溯源：经模板发起时记录模板 id/版本与该版本快照；
+      // 模板日后的修改/停用不改变这些字段（申请与模板版本永久绑定）
+      templateId: r.templateId || null,
+      templateVersion: r.templateVersion || null,
+      templateName: r.templateName || null,
+      templateSnapshot: r.templateSnapshot || null
     };
     return out;
   }

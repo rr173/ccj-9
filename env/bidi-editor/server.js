@@ -47,6 +47,7 @@ const replayReconcile = require("./replay-reconcile-core");
 const permissionCore = require("./permission-core");
 const permissionRequestCore = require("./permission-request-core");
 const permissionRequestGroupCore = require("./permission-request-group-core");
+const permissionTemplateCore = require("./permission-template-core");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
@@ -1075,12 +1076,15 @@ const permissionStore = {
   rev: 0,
   requestRev: 0, // 申请集合独立版本号（X-Permission-Request-Rev），与委派集合 rev 独立
   groupRev: 0,   // 申请分组集合独立版本号（X-Permission-Group-Rev）
+  templateRev: 0, // 申请模板集合独立版本号（X-Permission-Template-Rev）
   delegations: [], // 全部资源的委派记录（active/revoked；过期由时间实时判定）
   requests: [],    // 权限变更申请（grant 授予 / revoke 撤销；含终态与版本）
   requestGroups: [], // 申请分组（名称/处理截止/备注；groupId 冗余在申请上）
+  requestTemplates: [], // 申请模板（角色/申请类型/默认有效期/说明/适用成员范围）
   logs: [],        // 授予/撤销操作记录
   requestLogs: [], // 申请流审计记录（提交/批准/拒绝/过期/批准时冲突），只增不改
   groupLogs: [],   // 分组独立审计（分组变更/批量审批/截止提醒），只增不改
+  templateLogs: [], // 模板独立审计（创建/修改/停用/发起/拒绝/使用统计），只增不改
   groupReminders: {}, // 截止提醒幂等标记 {groupId: {approaching:iso, overdue:iso}}
   denials: []      // 被权限校验拒绝的请求记录（含原因，只增不改）
 };
@@ -1127,6 +1131,13 @@ try {
     permissionStore.groupReminders = dataPerm.groupReminders &&
       typeof dataPerm.groupReminders === "object"
       ? dataPerm.groupReminders : {};
+    // 申请模板与条件校验（旧文件缺字段自动补齐为空集合，不影响既有数据）
+    permissionStore.templateRev =
+      Number.isInteger(dataPerm.templateRev) ? dataPerm.templateRev : 0;
+    permissionStore.requestTemplates = Array.isArray(dataPerm.requestTemplates)
+      ? dataPerm.requestTemplates : [];
+    permissionStore.templateLogs = Array.isArray(dataPerm.templateLogs)
+      ? dataPerm.templateLogs : [];
   }
 } catch (e) {
   // 文件不存在/损坏：以空存储启动，损坏文件不覆盖
@@ -1179,12 +1190,15 @@ function mutatePermissions(mutator, cb) {
     rev: permissionStore.rev,
     requestRev: permissionStore.requestRev,
     groupRev: permissionStore.groupRev,
+    templateRev: permissionStore.templateRev,
     delegations: permissionStore.delegations,
     requests: permissionStore.requests,
     requestGroups: permissionStore.requestGroups,
+    requestTemplates: permissionStore.requestTemplates,
     logs: permissionStore.logs,
     requestLogs: permissionStore.requestLogs,
     groupLogs: permissionStore.groupLogs,
+    templateLogs: permissionStore.templateLogs,
     groupReminders: permissionStore.groupReminders,
     denials: permissionStore.denials
   }));
@@ -1210,12 +1224,15 @@ function restorePermissions(backup) {
   permissionStore.rev = backup.rev;
   permissionStore.requestRev = backup.requestRev;
   permissionStore.groupRev = backup.groupRev;
+  permissionStore.templateRev = backup.templateRev;
   permissionStore.delegations = backup.delegations;
   permissionStore.requests = backup.requests;
   permissionStore.requestGroups = backup.requestGroups;
+  permissionStore.requestTemplates = backup.requestTemplates;
   permissionStore.logs = backup.logs;
   permissionStore.requestLogs = backup.requestLogs;
   permissionStore.groupLogs = backup.groupLogs;
+  permissionStore.templateLogs = backup.templateLogs;
   permissionStore.groupReminders = backup.groupReminders;
   permissionStore.denials = backup.denials;
 }
@@ -4738,6 +4755,7 @@ function sendJSON(res, status, body, headers) {
     "X-Permission-Rev": String(permissionStore.rev),
     "X-Permission-Request-Rev": String(permissionStore.requestRev),
     "X-Permission-Group-Rev": String(permissionStore.groupRev),
+    "X-Permission-Template-Rev": String(permissionStore.templateRev),
     "Cache-Control": "no-store"
   }, headers || {});
   res.writeHead(status, h);
@@ -9755,6 +9773,594 @@ function sweepGroupReminders() {
   });
 }
 
+/* ================= 申请模板与条件校验 ================= */
+
+function findRequestTemplate(id) {
+  return permissionStore.requestTemplates.find(function (t) {
+    return t.id === id;
+  }) || null;
+}
+function templatesOf(scope, resourceId) {
+  return permissionStore.requestTemplates.filter(function (t) {
+    return t.scope === scope && t.resourceId === resourceId;
+  });
+}
+
+// 模板独立审计日志（只增不改；随权限文件持久化，重启可查）
+function addTemplateLog(entry) {
+  const e = Object.assign({
+    id: crypto.randomUUID(),
+    at: new Date().toISOString()
+  }, entry);
+  permissionStore.templateLogs.push(e);
+  if (permissionStore.templateLogs.length >
+      permissionTemplateCore.LIMITS.TEMPLATE_LOGS_MAX) {
+    permissionStore.templateLogs.splice(0,
+      permissionStore.templateLogs.length -
+      permissionTemplateCore.LIMITS.TEMPLATE_LOGS_MAX);
+  }
+  return e;
+}
+
+// 模板发起被拒的留痕（停用/旧版本/不在适用范围/提交时复核失败），重启可查
+function recordTemplateDenial(rec, defer) {
+  recordPermissionDenial(Object.assign({
+    action: "permission_template_submit"
+  }, rec), defer);
+}
+
+function publicTemplateNow(t) {
+  return permissionTemplateCore.publicTemplate(t,
+    { includeHistory: true, includeMembers: true });
+}
+function publicTemplateMemberView(t, member) {
+  return permissionTemplateCore.publicTemplateForMember(t, member);
+}
+
+// 模板写操作（建/改/停用）统一的负责人守卫
+function guardTemplateOwner(req, res, urlObj, t) {
+  const member = currentMember(req, urlObj);
+  const owner = resourceOwner(t.scope, t.resourceId) || SUPER_OWNER;
+  if (member !== owner && member !== SUPER_OWNER) {
+    recordPermissionDenial({
+      scope: t.scope, resourceId: t.resourceId, required: "owner",
+      member: member, action: "permission_template_manage",
+      code: "not_resource_owner",
+      message: "只有资源负责人（" + owner + "）才能管理申请模板 " + t.id,
+      path: urlObj.pathname, method: req.method
+    });
+    apiError(res, 403, "not_resource_owner",
+      "只有资源负责人（" + owner + "）才能管理该申请模板");
+    return null;
+  }
+  return { member: member, owner: owner };
+}
+
+// 由已通过校验的申请目标构造申请记录（直接申请与模板发起共用同一条建单链）
+function buildRequestFromTarget(kind, v, actor, nowIso) {
+  const r = {
+    id: "preq_" + crypto.randomUUID().replace(/-/g, ""),
+    kind: kind,
+    scope: v.scope,
+    resourceId: v.resourceId,
+    role: v.role,
+    member: v.member,
+    version: 1,
+    status: "pending",
+    note: v.note || "",
+    createdAt: nowIso,
+    createdBy: actor,
+    expiresAt: new Date(Date.parse(nowIso) + requestTtlMs()).toISOString(),
+    decidedAt: null, decidedBy: null, decision: null,
+    decisionReason: null,
+    delegationId: null,
+    effectiveAt: null, expireAt: null,
+    generatedDelegationId: null,
+    groupId: null,
+    templateId: null,
+    templateVersion: null,
+    templateName: null,
+    templateSnapshot: null
+  };
+  if (kind === "grant") {
+    r.effectiveAt = v.effectiveAt;
+    r.expireAt = v.expireAt;
+  } else {
+    r.delegationId = v.delegationId;
+    const target = permissionStore.delegations.find(function (d) {
+      return d.id === v.delegationId;
+    });
+    if (target) {
+      r.effectiveAt = target.effectiveAt;
+      r.expireAt = target.expireAt;
+    }
+  }
+  return r;
+}
+
+// 把模板溯源写入新建申请（快照独立留存，模板日后修改不影响已提交申请）
+function stampTemplateProvenance(r, prov) {
+  r.templateId = prov.templateId;
+  r.templateVersion = prov.templateVersion;
+  r.templateName = prov.templateName;
+  r.templateSnapshot = JSON.parse(JSON.stringify(prov));
+}
+
+// GET /api/permissions/request-templates[?scope=&resourceId=]
+// 负责人看自己资源的模板（含历史）；普通成员只见“启用且适用范围含自己”的模板。
+function handleRequestTemplateList(req, res, urlObj) {
+  const params = urlObj.searchParams;
+  const scope = params.get("scope");
+  const resourceId = params.get("resourceId");
+  if (scope && permissionTemplateCore.SCOPES.indexOf(scope) === -1) {
+    apiError(res, 400, "invalid_scope", "资源类型必须是 space / session / batch");
+    return;
+  }
+  const member = currentMember(req, urlObj);
+  let list = permissionStore.requestTemplates.slice();
+  if (scope) list = list.filter(function (t) { return t.scope === scope; });
+  if (resourceId) {
+    list = list.filter(function (t) { return t.resourceId === resourceId; });
+  }
+  const ordered = list.slice().sort(function (a, b) {
+    const d = Date.parse(b.createdAt) - Date.parse(a.createdAt);
+    if (d) return d;
+    return a.id < b.id ? 1 : -1;
+  });
+  let templates;
+  if (member === SUPER_OWNER) {
+    templates = ordered.map(publicTemplateNow);
+  } else {
+    templates = [];
+    ordered.forEach(function (t) {
+      const owner = resourceOwner(t.scope, t.resourceId);
+      if (owner === member) {
+        templates.push(publicTemplateNow(t));
+      } else {
+        const view = publicTemplateMemberView(t, member);
+        if (view) templates.push(view);
+      }
+    });
+  }
+  sendJSON(res, 200, {
+    templateRev: permissionStore.templateRev,
+    rev: permissionStore.templateRev,
+    count: templates.length,
+    templates: templates
+  });
+}
+
+// GET /api/permissions/request-templates/:id
+// 负责人/系统负责人看详情（含版本历史与完整白名单）；普通成员仅看启用且含自己的版本。
+function handleRequestTemplateGet(req, res, urlObj, id) {
+  const t = findRequestTemplate(id);
+  if (!t) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
+  const member = currentMember(req, urlObj);
+  const owner = resourceOwner(t.scope, t.resourceId);
+  const isOwner = member === SUPER_OWNER || member === owner;
+  if (!isOwner) {
+    const view = publicTemplateMemberView(t, member);
+    if (!view) {
+      recordPermissionDenial({
+        scope: t.scope, resourceId: t.resourceId, required: "owner",
+        member: member, action: "permission_template_view",
+        code: "not_resource_owner",
+        message: "只能查看启用且适用范围包含自己的申请模板",
+        path: urlObj.pathname, method: req.method
+      });
+      apiError(res, 403, "not_resource_owner",
+        "只能查看启用且适用范围包含自己的申请模板");
+      return;
+    }
+    sendJSON(res, 200, {
+      templateRev: permissionStore.templateRev,
+      template: view
+    });
+    return;
+  }
+  sendJSON(res, 200, {
+    templateRev: permissionStore.templateRev,
+    template: publicTemplateNow(t)
+  });
+}
+
+// GET /api/permissions/request-templates/:id/versions：版本历史（仅负责人）
+function handleRequestTemplateVersions(req, res, urlObj, id) {
+  const t = findRequestTemplate(id);
+  if (!t) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
+  const member = currentMember(req, urlObj);
+  const owner = resourceOwner(t.scope, t.resourceId);
+  if (member !== SUPER_OWNER && member !== owner) {
+    recordPermissionDenial({
+      scope: t.scope, resourceId: t.resourceId, required: "owner",
+      member: member, action: "permission_template_versions_view",
+      code: "not_resource_owner",
+      message: "只有资源负责人或系统负责人可以查看模板版本历史",
+      path: urlObj.pathname, method: req.method
+    });
+    apiError(res, 403, "not_resource_owner",
+      "只有资源负责人或系统负责人可以查看模板版本历史");
+    return;
+  }
+  sendJSON(res, 200, {
+    templateRev: permissionStore.templateRev,
+    currentVersion: t.currentVersion,
+    versions: (t.history || []).slice().sort(function (a, b) {
+      return b.version - a.version || Date.parse(b.at) - Date.parse(a.at);
+    })
+  });
+}
+
+// POST /api/permissions/request-templates（If-Match: templateRev）
+// body: {name, scope, resourceId, role, kind:"grant"|"revoke",
+//        defaultDurationMs?(grant 必填), description?, memberScope?}
+function handleRequestTemplateCreate(req, res, urlObj) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.templateRev,
+                "模板集合")) return;
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body;
+    try { body = JSON.parse(raw) || {}; }
+    catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    const scope = typeof body.scope === "string" ? body.scope : "";
+    const resourceId = typeof body.resourceId === "string" ? body.resourceId.trim() : "";
+    if (permissionTemplateCore.SCOPES.indexOf(scope) === -1) {
+      apiError(res, 400, "invalid_scope",
+        "资源类型必须是 space / session / batch 之一");
+      return;
+    }
+    if (!resourceExists(scope, resourceId)) {
+      apiError(res, 404,
+        scope === "space" ? "replay_space_not_found"
+        : scope === "session" ? "session_not_found" : "batch_not_found",
+        "资源不存在，无法对其创建申请模板");
+      return;
+    }
+    const guard = guardOwnerManagement(req, res, urlObj, scope, resourceId);
+    if (!guard) return;
+    const nowIso = new Date().toISOString();
+    const checked = permissionTemplateCore.validateTemplateBody(body, {
+      now: nowIso, isCreate: true,
+      templateCount: templatesOf(scope, resourceId).length
+    });
+    if (!checked.ok) {
+      const badRequest = ["invalid_scope", "missing_resource", "missing_template_name",
+        "name_too_long", "invalid_name", "invalid_kind", "invalid_role",
+        "role_not_allowed_for_scope", "missing_default_duration",
+        "invalid_default_duration", "invalid_description",
+        "description_too_long", "invalid_member_scope",
+        "missing_scope_members", "invalid_scope_member",
+        "too_many_scope_members"].indexOf(checked.code) !== -1;
+      apiError(res, badRequest ? 400 : 409, checked.code, checked.message);
+      return;
+    }
+    const v = checked.value;
+    mutatePermissions(function () {
+      const t = {
+        id: "ptpl_" + crypto.randomUUID().replace(/-/g, ""),
+        scope: v.scope, resourceId: v.resourceId,
+        name: v.name, role: v.role, kind: v.kind,
+        defaultDurationMs: v.defaultDurationMs != null ? v.defaultDurationMs : null,
+        description: v.description || "",
+        memberScope: v.memberScope || { mode: "all", members: [] },
+        status: "active",
+        currentVersion: 1,
+        createdAt: nowIso, createdBy: guard.member,
+        updatedAt: null, updatedBy: null,
+        disabledAt: null, disabledBy: null,
+        history: []
+      };
+      const snap = Object.assign(
+        permissionTemplateCore.contentSnapshot(t, 1),
+        { action: "create", at: nowIso, by: guard.member });
+      t.history.push(snap);
+      permissionStore.requestTemplates.push(t);
+      addTemplateLog({
+        action: "template_create", templateId: t.id,
+        scope: t.scope, resourceId: t.resourceId,
+        actor: guard.member, version: 1,
+        detail: { name: t.name, role: t.role, kind: t.kind,
+          defaultDurationMs: t.defaultDurationMs,
+          memberScope: t.memberScope, description: t.description }
+      });
+      permissionStore.templateRev++;
+      return t;
+    }, function (failure, t) {
+      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      sendJSON(res, 201, {
+        templateRev: permissionStore.templateRev,
+        template: publicTemplateNow(t)
+      });
+    });
+  });
+}
+
+// PATCH /api/permissions/request-templates/:id（If-Match: templateRev）
+// body: {name?, role?, kind?, defaultDurationMs?, description?, memberScope?}
+// 停用模板不能再修改（只能由负责人重新建一个）；无实际变化不推进版本。
+function handleRequestTemplateUpdate(req, res, urlObj, id) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.templateRev,
+                "模板集合")) return;
+  const t = findRequestTemplate(id);
+  if (!t) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body;
+    try { body = JSON.parse(raw) || {}; }
+    catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    const guard = guardTemplateOwner(req, res, urlObj, t);
+    if (!guard) return;
+    if (t.status === "disabled") {
+      apiError(res, 409, "template_disabled",
+        "模板已停用，停用模板不能再修改（旧版本永久只读；如需变更请新建模板）",
+        { templateId: t.id, currentVersion: t.currentVersion });
+      return;
+    }
+    const nowIso = new Date().toISOString();
+    const checked = permissionTemplateCore.validateTemplateBody(body, {
+      now: nowIso, isCreate: false,
+      currentScope: t.scope, currentKind: t.kind
+    });
+    if (!checked.ok) {
+      const badRequest = ["missing_template_name", "name_too_long", "invalid_name",
+        "invalid_kind", "invalid_role", "role_not_allowed_for_scope",
+        "invalid_default_duration", "invalid_description",
+        "description_too_long", "invalid_member_scope",
+        "missing_scope_members", "invalid_scope_member",
+        "too_many_scope_members"].indexOf(checked.code) !== -1;
+      apiError(res, badRequest ? 400 : 409, checked.code, checked.message);
+      return;
+    }
+    const v = checked.value;
+    mutatePermissions(function () {
+      const changes = {};
+      if (v.name !== undefined && v.name !== t.name) {
+        changes.name = { from: t.name, to: v.name }; t.name = v.name;
+      }
+      if (v.role !== undefined && v.role !== t.role) {
+        changes.role = { from: t.role, to: v.role }; t.role = v.role;
+      }
+      if (v.kind !== undefined && v.kind !== t.kind) {
+        changes.kind = { from: t.kind, to: v.kind }; t.kind = v.kind;
+      }
+      // 切到撤销类型时清空默认有效期
+      let newDuration = t.defaultDurationMs;
+      if (v.defaultDurationMs !== undefined) {
+        const nd = v.defaultDurationMs == null ? null : v.defaultDurationMs;
+        if (nd !== t.defaultDurationMs) {
+          changes.defaultDurationMs = { from: t.defaultDurationMs, to: nd };
+          newDuration = nd;
+        }
+      }
+      if (t.kind === "revoke") newDuration = null;
+      t.defaultDurationMs = newDuration;
+      if (v.description !== undefined && v.description !== t.description) {
+        changes.description = { from: t.description, to: v.description };
+        t.description = v.description;
+      }
+      if (v.memberScope !== undefined) {
+        const before = JSON.stringify(t.memberScope);
+        const afterMs = v.memberScope;
+        if (JSON.stringify(afterMs) !== before) {
+          changes.memberScope = {
+            from: JSON.parse(before), to: JSON.parse(JSON.stringify(afterMs))
+          };
+          t.memberScope = afterMs;
+        }
+      }
+      const changed = Object.keys(changes).length > 0;
+      if (!changed) return { unchanged: true, template: t };
+      t.currentVersion++;
+      t.updatedAt = nowIso;
+      t.updatedBy = guard.member;
+      const snap = Object.assign(
+        permissionTemplateCore.contentSnapshot(t, t.currentVersion),
+        { action: "update", at: nowIso, by: guard.member,
+          changes: changes });
+      t.history.push(snap);
+      addTemplateLog({
+        action: "template_update", templateId: t.id,
+        scope: t.scope, resourceId: t.resourceId,
+        actor: guard.member, version: t.currentVersion,
+        detail: changes
+      });
+      permissionStore.templateRev++;
+      return { unchanged: false, template: t };
+    }, function (failure, out) {
+      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      sendJSON(res, 200, {
+        templateRev: permissionStore.templateRev,
+        unchanged: !!out.unchanged,
+        template: publicTemplateNow(out.template)
+      });
+    });
+  });
+}
+
+// POST /api/permissions/request-templates/:id/disable（If-Match: templateRev）
+// 停用是终态：停用后不能再发起新申请，也不能再修改；历史与已提交申请不受影响。
+function handleRequestTemplateDisable(req, res, urlObj, id) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.templateRev,
+                "模板集合")) return;
+  const t = findRequestTemplate(id);
+  if (!t) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body = {};
+    if (raw) {
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    }
+    const guard = guardTemplateOwner(req, res, urlObj, t);
+    if (!guard) return;
+    if (t.status === "disabled") {
+      apiError(res, 409, "template_disabled",
+        "模板已停用（" + (t.disabledAt || "") +
+        "），停用是终态，不能重复停用",
+        { templateId: t.id, disabledAt: t.disabledAt });
+      return;
+    }
+    const nowIso = new Date().toISOString();
+    mutatePermissions(function () {
+      t.status = "disabled";
+      t.disabledAt = nowIso;
+      t.disabledBy = guard.member;
+      // 停用事件进版本历史（停用不产生新内容版本，snapshot 仍指向当前版本）
+      t.history.push(Object.assign(
+        permissionTemplateCore.contentSnapshot(t, t.currentVersion),
+        { action: "disable", at: nowIso, by: guard.member,
+          reason: typeof body.reason === "string" ? body.reason.trim() : "" }));
+      addTemplateLog({
+        action: "template_disable", templateId: t.id,
+        scope: t.scope, resourceId: t.resourceId,
+        actor: guard.member, version: t.currentVersion,
+        detail: { reason: typeof body.reason === "string" ? body.reason.trim() : "" }
+      });
+      permissionStore.templateRev++;
+      return t;
+    }, function (failure, out) {
+      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      sendJSON(res, 200, {
+        templateRev: permissionStore.templateRev,
+        template: publicTemplateNow(out)
+      });
+    });
+  });
+}
+
+// POST /api/permissions/request-templates/:id/submit：用模板发起申请
+// body: {templateVersion(必填), effectiveAt?, expireAt?, note?, delegationId?(revoke)}
+// If-Match: requestRev（与直接申请同一申请集合版本；模板版本用 body.templateVersion）
+function handleRequestTemplateSubmit(req, res, urlObj, id) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.requestRev,
+                "申请集合")) return;
+  const t = findRequestTemplate(id);
+  if (!t) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body;
+    try { body = JSON.parse(raw) || {}; }
+    catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    const actor = currentMember(req, urlObj);
+    const owner = resourceOwner(t.scope, t.resourceId) || SUPER_OWNER;
+    const nowIso = new Date().toISOString();
+    const checked = permissionTemplateCore.validateTemplateSubmit(t, body, {
+      now: nowIso, member: actor,
+      templateVersion: body.templateVersion, owner: owner,
+      delegations: delegationsOf(t.scope, t.resourceId),
+      requests: requestsOf(t.scope, t.resourceId)
+    });
+    if (!checked.ok) {
+      const badRequest = ["invalid_note", "note_too_long",
+        "invalid_effective", "invalid_expire", "missing_expire",
+        "expire_in_past", "effective_after_expire",
+        "missing_member", "member_too_long", "invalid_member",
+        "missing_delegation"].indexOf(checked.code) !== -1;
+      const status = checked.code === "precondition_required" ? 428
+        : checked.code === "delegation_not_found" ? 404
+        : (checked.code === "template_version_changed" ||
+           checked.code === "template_disabled") ? 409
+        : (checked.code === "member_not_in_template_scope" ||
+           checked.code === "request_for_other_member") ? 403
+        : badRequest ? 400 : 409;
+      // 拒绝原因与模板/版本上下文一起留痕（重启可查）
+      mutatePermissions(function () {
+        recordTemplateDenial({
+          scope: t.scope, resourceId: t.resourceId, required: t.role,
+          member: actor, templateId: t.id,
+          templateVersion: body.templateVersion != null
+            ? Number(body.templateVersion) : null,
+          code: checked.code, message: checked.message,
+          delegationId: body.delegationId || null,
+          path: urlObj.pathname, method: req.method
+        }, true);
+        addTemplateLog({
+          action: "template_submit_rejected", templateId: t.id,
+          scope: t.scope, resourceId: t.resourceId,
+          actor: actor, version: t.currentVersion,
+          detail: { code: checked.code, message: checked.message,
+            submittedVersion: body.templateVersion != null
+              ? Number(body.templateVersion) : null }
+        });
+        return null;
+      }, function (failure) {
+        if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+        const extra = { templateId: t.id,
+          currentVersion: checked.currentVersion,
+          submittedVersion: checked.submittedVersion,
+          existingRequestId: checked.existingRequestId,
+          existingDelegationId: checked.existingDelegationId,
+          conflictingRole: checked.conflictingRole };
+        apiError(res, status, checked.code, checked.message, extra);
+      });
+      return;
+    }
+
+    const target = checked.value.target;
+    const prov = checked.value.provenance;
+    const kind = checked.value.kind;
+    mutatePermissions(function () {
+      const r = buildRequestFromTarget(kind, target, actor, nowIso);
+      stampTemplateProvenance(r, prov);
+      permissionStore.requests.push(r);
+      addPermissionRequestLog({
+        action: "submit", requestId: r.id, kind: kind,
+        scope: r.scope, resourceId: r.resourceId, role: r.role,
+        member: r.member, actor: actor, version: 1,
+        detail: { effectiveAt: r.effectiveAt, expireAt: r.expireAt,
+          delegationId: r.delegationId, note: r.note,
+          expiresAt: r.expiresAt,
+          viaTemplate: { templateId: r.templateId,
+            templateVersion: r.templateVersion,
+            templateName: r.templateName } }
+      });
+      addTemplateLog({
+        action: "template_submit", templateId: t.id,
+        scope: t.scope, resourceId: t.resourceId,
+        actor: actor, version: t.currentVersion,
+        requestId: r.id, member: actor, role: r.role, kind: kind,
+        detail: { requestId: r.id, effectiveAt: r.effectiveAt,
+          expireAt: r.expireAt, delegationId: r.delegationId }
+      });
+      permissionStore.requestRev++;
+      return r;
+    }, function (failure, r) {
+      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      sendJSON(res, 201, {
+        requestRev: permissionStore.requestRev,
+        templateRev: permissionStore.templateRev,
+        request: publicRequestNow(r)
+      });
+    });
+  });
+}
+
+// GET /api/permissions/request-templates/logs[?from=&to=&scope=&resourceId=]
+// 模板独立审计：系统负责人全量；资源负责人看本资源；
+// 普通成员只能看到自己发起（template_submit）或自己被拒（submit_rejected）的记录。
+function handleRequestTemplateLogs(req, res, urlObj) {
+  const r = filterPermissionLogs(permissionStore.templateLogs, urlObj.searchParams);
+  if (r.error) { apiError(res, r.error.status, r.error.code, r.error.message); return; }
+  const member = currentMember(req, urlObj);
+  const scope = urlObj.searchParams.get("scope");
+  const resourceId = urlObj.searchParams.get("resourceId");
+  let entries = r.value;
+  if (member !== SUPER_OWNER) {
+    const owner = scope && resourceId && resourceExists(scope, resourceId)
+      ? resourceOwner(scope, resourceId) : null;
+    if (!(owner && member === owner)) {
+      entries = entries.filter(function (e) {
+        return e.actor === member || e.member === member;
+      });
+    }
+  }
+  sendJSON(res, 200, {
+    templateRev: permissionStore.templateRev,
+    count: entries.length,
+    logs: entries
+  });
+}
+
 function handlePermissions(req, res, tail, urlObj) {
   // tail: ["delegations"] | ["delegations", ":id", "revoke"] |
   //       ["requests"] | ["requests", ":id"] | ["requests", ":id", "decision"] |
@@ -9798,6 +10404,46 @@ function handlePermissions(req, res, tail, urlObj) {
   if (tail.length === 3 && tail[0] === "request-groups" &&
       tail[2] === "batch-decide" && req.method === "POST") {
     handleRequestGroupBatchDecide(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 1 && tail[0] === "request-templates" &&
+      req.method === "GET") {
+    handleRequestTemplateList(req, res, urlObj);
+    return;
+  }
+  if (tail.length === 1 && tail[0] === "request-templates" &&
+      req.method === "POST") {
+    handleRequestTemplateCreate(req, res, urlObj);
+    return;
+  }
+  if (tail.length === 2 && tail[0] === "request-templates" &&
+      tail[1] === "logs" && req.method === "GET") {
+    handleRequestTemplateLogs(req, res, urlObj);
+    return;
+  }
+  if (tail.length === 2 && tail[0] === "request-templates" &&
+      req.method === "GET") {
+    handleRequestTemplateGet(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 2 && tail[0] === "request-templates" &&
+      req.method === "PATCH") {
+    handleRequestTemplateUpdate(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 3 && tail[0] === "request-templates" &&
+      tail[2] === "disable" && req.method === "POST") {
+    handleRequestTemplateDisable(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 3 && tail[0] === "request-templates" &&
+      tail[2] === "versions" && req.method === "GET") {
+    handleRequestTemplateVersions(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 3 && tail[0] === "request-templates" &&
+      tail[2] === "submit" && req.method === "POST") {
+    handleRequestTemplateSubmit(req, res, urlObj, tail[1]);
     return;
   }
   if (tail.length === 1 && tail[0] === "delegations" && req.method === "GET") {
