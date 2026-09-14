@@ -236,7 +236,7 @@ describe("申请模板与条件校验 API（顺序用例）", function () {
     ctx.tplView = r.data.template.id;
     ctx.templateRev = r.tplRev;
     assert.equal(r.data.template.currentVersion, 1);
-    assert.equal(r.data.template.history.length, 1);
+    assert.equal(r.data.template.history.length, 2);
     assert.equal(r.data.template.history[0].action, "create");
 
     // 合法：白名单（张三、李四）的复核授予模板
@@ -357,9 +357,18 @@ describe("申请模板与条件校验 API（顺序用例）", function () {
       { defaultDurationMs: 3 * DAY }, { "If-Match": ctx.templateRev });
     assert.equal(r.status, 200, JSON.stringify(r.data));
     ctx.templateRev = r.tplRev;
-    assert.equal(r.data.template.currentVersion, 2);
-    assert.equal(r.data.template.history.length, 2);
-    assert.equal(r.data.template.history[1].action, "update");
+    assert.equal(r.data.template.currentVersion, 1);
+    assert.equal(r.data.template.draftStatus, "unpublished");
+    assert.equal(r.data.template.draft.draftVersion, 1);
+    assert.equal(r.data.template.history[r.data.template.history.length - 1].action,
+      "update");
+    assert.equal(r.data.template.defaultDurationMs, DAY); // 成员发布面仍是 v1
+    const pub = await request("POST",
+      "/api/permissions/request-templates/" + ctx.tplReview + "/publish",
+      { draftVersion: 1 }, { "If-Match": ctx.templateRev });
+    assert.equal(pub.status, 200, JSON.stringify(pub.data));
+    ctx.templateRev = pub.tplRev;
+    assert.equal(pub.data.template.currentVersion, 2);
 
     // 张三拿旧版本号发起 -> 409
     r = await as("张三")("POST",
@@ -438,7 +447,7 @@ describe("申请模板与条件校验 API（顺序用例）", function () {
     assert.equal(unchanged.data.template.currentVersion, 1);
     assert.equal(unchanged.data.template.defaultDurationMs, null);
     assert.equal(unchanged.tplRev, ctx.templateRev);
-    assert.equal(unchanged.data.template.history.length, 1); // 无 update 事件
+    assert.equal(unchanged.data.template.history.length, 2); // 创建+发布，无草稿 update 事件
 
     // 同时给出合法有效期 -> 切换成功，新模板可按默认窗口提交
     r = await request("PATCH",
@@ -446,10 +455,16 @@ describe("申请模板与条件校验 API（顺序用例）", function () {
       { kind: "grant", defaultDurationMs: DAY },
       { "If-Match": ctx.templateRev });
     assert.equal(r.status, 200, JSON.stringify(r.data));
-    assert.equal(r.data.template.kind, "grant");
-    assert.equal(r.data.template.defaultDurationMs, DAY);
-    assert.equal(r.data.template.currentVersion, 2);
     ctx.templateRev = r.tplRev;
+    assert.equal(r.data.template.kind, "revoke"); // 已发布面仍为 revoke
+    assert.equal(r.data.template.draft.kind, "grant");
+    assert.equal(r.data.template.draft.defaultDurationMs, DAY);
+    assert.equal(r.data.template.currentVersion, 1);
+    const switchPub = await request("POST",
+      "/api/permissions/request-templates/" + revId + "/publish",
+      { draftVersion: 1 }, { "If-Match": ctx.templateRev });
+    assert.equal(switchPub.status, 200, JSON.stringify(switchPub.data));
+    ctx.templateRev = switchPub.tplRev;
 
     r = await as("张三")("POST",
       "/api/permissions/request-templates/" + revId + "/submit",

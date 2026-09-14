@@ -51,6 +51,8 @@
   // 模板状态：active 启用（可发起新申请）/ disabled 停用（只读，不能再发起）
   var STATUSES = ["active", "disabled"];
   var SCOPE_MODES = ["all", "members"];
+  var PLAN_STATUSES = ["pending", "cancelled", "succeeded", "failed"];
+  var RELEASE_SOURCES = ["publish", "rollback"];
 
   var LIMITS = {
     NAME_MAX_CHARS: 100,
@@ -268,31 +270,238 @@
     return ok(n);
   }
 
-  /* ================= 组装某内容版本的不可变快照 ================= */
-  function contentSnapshot(t, version) {
+  /* ================= 发布版本与草稿 ================= */
+
+  // 当前对外可见内容：普通成员和申请分组只能读取最近一次已发布版本。
+  function publishedContent(t) {
+    var releases = Array.isArray(t && t.releases) ? t.releases : [];
+    if (releases.length) {
+      var current = null;
+      for (var i = releases.length - 1; i >= 0; i--) {
+        if (releases[i].status !== "cancelled") { current = releases[i]; break; }
+      }
+      return current && current.snapshot ? current.snapshot : null;
+    }
+    // 兼容发布能力上线前的旧模板记录：顶层内容即已发布内容。
+    if (t && Number.isInteger(t.currentVersion)) {
+      return {
+        releaseId: t.releaseId || null,
+        version: t.currentVersion,
+        name: t.name,
+        role: t.role,
+        kind: t.kind,
+        defaultDurationMs: t.defaultDurationMs,
+        description: t.description || "",
+        memberScope: JSON.parse(JSON.stringify(
+          t.memberScope || { mode: "all", members: [] })),
+        scope: t.scope,
+        resourceId: t.resourceId
+      };
+    }
+    return null;
+  }
+
+  function currentPublishedVersion(t) {
+    var p = publishedContent(t);
+    return p ? p.version : null;
+  }
+
+  // 发布/回滚前完整性检查：目标版本必须存在，且适用范围、角色、有效期规则完整。
+  function validateReleaseSnapshot(snapshot, ctx) {
+    ctx = ctx || {};
+    if (!snapshot || typeof snapshot !== "object") {
+      return fail("release_version_not_found", "目标发布版本不存在或快照已损坏");
+    }
+    var scope = ctx.scope || snapshot.scope;
+    var resourceId = ctx.resourceId || snapshot.resourceId;
+    if (SCOPES.indexOf(scope) === -1 || !resourceId) {
+      return fail("invalid_published_template",
+        "目标发布版本缺少完整适用资源范围");
+    }
+    if (typeof snapshot.name !== "string" || !snapshot.name.trim()) {
+      return fail("invalid_published_template", "目标发布版本缺少模板名称");
+    }
+    if (ROLES.indexOf(snapshot.role) === -1) {
+      return fail("invalid_published_template", "目标发布版本缺少合法角色");
+    }
+    if ((scope === "space" || scope === "session") &&
+        (snapshot.role === "approve" || snapshot.role === "execute")) {
+      return fail("invalid_published_template",
+        "目标发布版本的角色不适用于当前资源范围");
+    }
+    if (KINDS.indexOf(snapshot.kind) === -1) {
+      return fail("invalid_published_template", "目标发布版本缺少合法申请类型");
+    }
+    if (snapshot.kind === "grant") {
+      if (!Number.isInteger(snapshot.defaultDurationMs) ||
+          snapshot.defaultDurationMs < LIMITS.MIN_DURATION_MS ||
+          snapshot.defaultDurationMs > LIMITS.MAX_DURATION_MS) {
+        return fail("invalid_published_template",
+          "目标发布版本缺少完整合法的默认有效期");
+      }
+    }
+    var ms = snapshot.memberScope;
+    if (!ms || SCOPE_MODES.indexOf(ms.mode) === -1) {
+      return fail("invalid_published_template", "目标发布版本缺少适用范围");
+    }
+    if (ms.mode === "members" &&
+        (!Array.isArray(ms.members) || !ms.members.length)) {
+      return fail("invalid_published_template",
+        "目标发布版本的指定成员适用范围不完整");
+    }
+    return ok(snapshot);
+  }
+
+  function findRelease(t, version) {
+    if (!t || !Array.isArray(t.releases)) return null;
+    for (var i = 0; i < t.releases.length; i++) {
+      if (t.releases[i].version === version) return t.releases[i];
+    }
+    return null;
+  }
+
+  function validateScheduleTime(raw, ctx) {
+    ctx = ctx || {};
+    var nowMs = Date.parse(ctx.now || new Date().toISOString());
+    if (raw === undefined || raw === null || raw === "") return ok(null);
+    if (typeof raw !== "string" || Number.isNaN(Date.parse(raw))) {
+      return fail("invalid_scheduled_at", "计划发布时间必须是合法 ISO 时间");
+    }
+    var atMs = Date.parse(raw);
+    if (atMs <= nowMs) {
+      return fail("scheduled_time_in_past", "计划发布时间必须晚于当前时间");
+    }
+    return ok(new Date(atMs).toISOString());
+  }
+
+  // 同一模板不允许同一时刻存在两个待执行计划；同一资源同一时刻也不允许两个模板同时生效。
+  function validatePlanConflict(templates, current, ctx) {
+    ctx = ctx || {};
+    if (!ctx.scheduledAt) return ok(null);
+    var at = ctx.scheduledAt;
+    for (var i = 0; i < templates.length; i++) {
+      var t = templates[i];
+      if (!t || t.status === "disabled" || current && t.id === current.id) continue;
+      var plans = Array.isArray(t.publishPlans) ? t.publishPlans : [];
+      for (var j = 0; j < plans.length; j++) {
+        var p = plans[j];
+        if (p.status === "pending" &&
+            Date.parse(p.scheduledAt) === Date.parse(at) &&
+            (!ctx.scope || t.scope === ctx.scope) &&
+            (!ctx.resourceId || t.resourceId === ctx.resourceId)) {
+          return fail("scheduled_publish_conflict",
+            "同一资源在该时间已有待执行的模板发布计划，不能同时生效",
+            { conflictPlanId: p.id, conflictTemplateId: t.id });
+        }
+      }
+    }
+    return ok(null);
+  }
+
+  function pendingPlan(t) {
+    var plans = Array.isArray(t && t.publishPlans) ? t.publishPlans : [];
+    for (var i = plans.length - 1; i >= 0; i--) {
+      if (plans[i].status === "pending") return plans[i];
+    }
+    return null;
+  }
+
+  function draftStatus(t) {
+    if (!t) return "none";
+    var p = pendingPlan(t);
+    if (p) return "scheduled";
+    return t.draft ? "unpublished" : "none";
+  }
+
+  function draftView(t) {
+    if (!t || !t.draft) return null;
+    var d = t.draft;
+    var out = {
+      draftVersion: t.draftVersion || d.version || 1,
+      version: t.draftVersion || d.version || 1,
+      name: d.name,
+      role: d.role,
+      kind: d.kind,
+      defaultDurationMs: d.defaultDurationMs,
+      description: d.description || "",
+      memberScope: JSON.parse(JSON.stringify(
+        d.memberScope || { mode: "all", members: [] })),
+      createdAt: d.createdAt || t.updatedAt || null,
+      createdBy: d.createdBy || t.updatedBy || null,
+      updatedAt: d.updatedAt || d.createdAt || t.updatedAt || null,
+      updatedBy: d.updatedBy || d.createdBy || t.updatedBy || null,
+      status: draftStatus(t)
+    };
+    var p = pendingPlan(t);
+    out.scheduledAt = p ? p.scheduledAt : null;
+    out.planId = p ? p.id : null;
+    return out;
+  }
+
+  function releaseView(r) {
+    if (!r) return null;
     return {
-      version: version,
-      name: t.name,
-      role: t.role,
-      kind: t.kind,
-      defaultDurationMs: t.defaultDurationMs,
-      description: t.description || "",
-      memberScope: JSON.parse(JSON.stringify(t.memberScope || { mode: "all", members: [] }))
+      releaseId: r.id,
+      version: r.version,
+      source: r.source,
+      sourceDraftVersion: r.sourceDraftVersion || null,
+      sourceReleaseVersion: r.sourceReleaseVersion || null,
+      status: r.status || "succeeded",
+      publishedAt: r.publishedAt || null,
+      publishedBy: r.publishedBy || null,
+      reason: r.reason || "",
+      snapshot: JSON.parse(JSON.stringify(r.snapshot))
     };
   }
 
-  // 申请记录上留存的模板来源（完整快照；模板日后修改不影响已提交申请）
+  function planView(p) {
+    if (!p) return null;
+    return {
+      planId: p.id,
+      templateVersion: p.templateVersion,
+      draftVersion: p.draftVersion,
+      scheduledAt: p.scheduledAt,
+      status: p.status,
+      createdAt: p.createdAt,
+      createdBy: p.createdBy,
+      cancelledAt: p.cancelledAt || null,
+      cancelledBy: p.cancelledBy || null,
+      executedAt: p.executedAt || null,
+      releaseVersion: p.releaseVersion || null,
+      errorCode: p.errorCode || null,
+      errorMessage: p.errorMessage || null
+    };
+  }
+
+  /* ================= 组装某内容版本的不可变快照 ================= */
+  function contentSnapshot(t, version) {
+    var source = publishedContent(t) || t;
+    return {
+      version: version,
+      name: source.name,
+      role: source.role,
+      kind: source.kind,
+      defaultDurationMs: source.defaultDurationMs,
+      description: source.description || "",
+      memberScope: JSON.parse(JSON.stringify(
+        source.memberScope || { mode: "all", members: [] }))
+    };
+  }
+
+  // 申请记录上留存的模板来源（完整已发布快照；发布/回滚不影响已提交申请）
   function provenance(t) {
+    var p = publishedContent(t) || {};
     return {
       templateId: t.id,
-      templateVersion: t.currentVersion,
-      templateName: t.name,
-      role: t.role,
-      kind: t.kind,
-      defaultDurationMs: t.defaultDurationMs,
-      description: t.description || "",
+      templateVersion: p.version,
+      templateReleaseId: p.releaseId || p.id || null,
+      templateName: p.name,
+      role: p.role,
+      kind: p.kind,
+      defaultDurationMs: p.defaultDurationMs,
+      description: p.description || "",
       memberScope: JSON.parse(JSON.stringify(
-        t.memberScope || { mode: "all", members: [] })),
+        p.memberScope || { mode: "all", members: [] })),
       scope: t.scope,
       resourceId: t.resourceId
     };
@@ -318,14 +527,36 @@
     body = body || {};
     ctx = ctx || {};
     var nowIso = ctx.now || new Date().toISOString();
+    var published = publishedContent(template);
 
     if (!template) return fail("template_not_found", "申请模板不存在");
     if (template.status === "disabled") {
       return fail("template_disabled",
         "模板 “" + template.name + "” 已停用，停用模板不能继续创建新申请；" +
         "请联系资源负责人启用或新建模板",
-        { templateId: template.id, currentVersion: template.currentVersion });
+        { templateId: template.id,
+          currentVersion: currentPublishedVersion(template) });
     }
+    if (!published) {
+      return fail("template_not_published",
+        "模板尚未发布，只有负责人草稿；普通成员不能使用未发布模板",
+        { templateId: template.id });
+    }
+
+    // 后续校验全部使用最近一次已发布版本，草稿或计划发布对成员不可见。
+    var effective = {
+      id: template.id,
+      scope: template.scope,
+      resourceId: template.resourceId,
+      status: template.status,
+      name: published.name,
+      role: published.role,
+      kind: published.kind,
+      defaultDurationMs: published.defaultDurationMs,
+      description: published.description,
+      memberScope: published.memberScope,
+      currentVersion: published.version
+    };
 
     if (ctx.templateVersion === undefined || ctx.templateVersion === null ||
         ctx.templateVersion === "") {
@@ -340,15 +571,15 @@
       return fail("invalid_template_version",
         "templateVersion 必须是正整数（所依据的模板内容版本号），" +
         "收到：" + JSON.stringify(ctx.templateVersion),
-        { templateId: template.id, currentVersion: template.currentVersion });
+        { templateId: template.id, currentVersion: effective.currentVersion });
     }
-    if (their !== template.currentVersion) {
+    if (their !== effective.currentVersion) {
       return fail("template_version_changed",
-        "模板 “" + template.name + "” 已被负责人修改到版本 " +
-        template.currentVersion + "（提交依据版本 " + their +
+        "模板 “" + effective.name + "” 已发布到版本 " +
+        effective.currentVersion + "（提交依据版本 " + their +
         "），旧版本不能继续创建新申请，请刷新模板后重新发起",
         { templateId: template.id,
-          currentVersion: template.currentVersion,
+          currentVersion: effective.currentVersion,
           submittedVersion: their });
     }
 
@@ -356,25 +587,25 @@
     var mc = prc.validateMember(member);
     if (!mc.ok) return mc;
     member = mc.value;
-    if (!memberInScope(template, member)) {
-      var ms = template.memberScope || { mode: "all" };
+    if (!memberInScope(effective, member)) {
+      var ms = effective.memberScope || { mode: "all" };
       return fail("member_not_in_template_scope",
         ms.mode === "members"
-          ? "成员 “" + member + "” 不在模板 “" + template.name +
+          ? "成员 “" + member + "” 不在模板 “" + effective.name +
             "” 的适用成员范围内，不能使用该模板发起申请"
           : "成员 “" + member + "” 不能使用该模板",
         { templateId: template.id });
     }
 
     var reqBody = {
-      scope: template.scope,
-      resourceId: template.resourceId,
-      role: template.role,
+      scope: effective.scope,
+      resourceId: effective.resourceId,
+      role: effective.role,
       member: member,
       note: typeof body.note === "string" ? body.note : ""
     };
 
-    if (template.kind === "grant") {
+    if (effective.kind === "grant") {
       var hasExpire = body.expireAt !== undefined && body.expireAt !== null &&
         body.expireAt !== "";
       var hasEffective = body.effectiveAt !== undefined &&
@@ -384,7 +615,7 @@
       if (!hasExpire) {
         // 默认有效期：提交瞬间锁定失效时间（默认值只在提交时取值，
         // 与模板日后修改完全解耦）
-        var dur = template.defaultDurationMs;
+        var dur = effective.defaultDurationMs;
         if (!Number.isInteger(dur) || dur <= 0) {
           return fail("invalid_default_duration",
             "模板缺少可用的默认有效期，无法按默认窗口发起申请");
@@ -417,24 +648,32 @@
 
   function publicTemplate(t, opts) {
     opts = opts || {};
-    var ms = t.memberScope || { mode: "all", members: [] };
+    var p = publishedContent(t);
+    var source = p || {};
+    var ms = source.memberScope || t.memberScope || { mode: "all", members: [] };
     var out = {
       id: t.id,
       scope: t.scope,
       resourceId: t.resourceId,
-      name: t.name,
-      role: t.role,
-      kind: t.kind,
-      defaultDurationMs: t.defaultDurationMs,
-      description: t.description || "",
+      name: source.name != null ? source.name : t.name,
+      role: source.role != null ? source.role : t.role,
+      kind: source.kind != null ? source.kind : t.kind,
+      defaultDurationMs: source.defaultDurationMs != null
+        ? source.defaultDurationMs : t.defaultDurationMs,
+      description: source.description || t.description || "",
       memberScope: {
         mode: ms.mode,
         // 普通成员视图不带完整白名单（避免泄露其他成员名单）
-        members: opts.includeMembers !== false ? ms.members.slice() : [],
+        members: opts.includeMembers !== false ? (ms.members || []).slice() : [],
         memberCount: Array.isArray(ms.members) ? ms.members.length : 0
       },
       status: t.status || "active",
-      currentVersion: t.currentVersion,
+      currentVersion: p ? p.version : null,
+      publishedVersion: p ? p.version : null,
+      publishedAt: p ? (p.publishedAt || null) : null,
+      publishedBy: p ? (p.publishedBy || null) : null,
+      draftStatus: draftStatus(t),
+      scheduledAt: (pendingPlan(t) || {}).scheduledAt || null,
       createdAt: t.createdAt,
       createdBy: t.createdBy,
       updatedAt: t.updatedAt || null,
@@ -442,14 +681,27 @@
       disabledAt: t.disabledAt || null,
       disabledBy: t.disabledBy || null
     };
-    if (opts.includeHistory) out.history = (t.history || []).slice();
+    if (opts.includeHistory) {
+      out.history = (t.history || []).slice();
+      out.releases = (t.releases || []).map(releaseView).reverse();
+      out.publishPlans = (t.publishPlans || []).map(planView).reverse();
+      out.draft = draftView(t);
+      out.draftVersion = t.draftVersion || 0;
+    }
     return out;
   }
 
-  // 普通成员视图：只给当前启用版本的必要信息，不给历史/完整白名单
+  // 普通成员视图：只给最近已发布启用版本的必要信息，不给草稿/历史/发布计划/白名单
   function publicTemplateForMember(t, member) {
-    if (!t || t.status !== "active" || !memberInScope(t, member)) return null;
+    var p = publishedContent(t);
+    if (!t || t.status !== "active" || !p || !memberInScope(p, member)) return null;
     var view = publicTemplate(t, { includeMembers: false, includeHistory: false });
+    delete view.draftStatus;
+    delete view.scheduledAt;
+    delete view.draft;
+    delete view.draftVersion;
+    delete view.releases;
+    delete view.publishPlans;
     view.inScope = true;
     return view;
   }
@@ -460,6 +712,8 @@
     KINDS: KINDS,
     STATUSES: STATUSES,
     SCOPE_MODES: SCOPE_MODES,
+    PLAN_STATUSES: PLAN_STATUSES,
+    RELEASE_SOURCES: RELEASE_SOURCES,
     LIMITS: LIMITS,
     ROLE_LABELS: ROLE_LABELS,
     SCOPE_LABELS: SCOPE_LABELS,
@@ -467,6 +721,17 @@
     memberInScope: memberInScope,
     validateTemplateBody: validateTemplateBody,
     validateTemplateSubmit: validateTemplateSubmit,
+    publishedContent: publishedContent,
+    currentPublishedVersion: currentPublishedVersion,
+    validateReleaseSnapshot: validateReleaseSnapshot,
+    findRelease: findRelease,
+    validateScheduleTime: validateScheduleTime,
+    validatePlanConflict: validatePlanConflict,
+    pendingPlan: pendingPlan,
+    draftStatus: draftStatus,
+    draftView: draftView,
+    releaseView: releaseView,
+    planView: planView,
     contentSnapshot: contentSnapshot,
     provenance: provenance,
     publicTemplate: publicTemplate,

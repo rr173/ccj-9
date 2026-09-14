@@ -352,6 +352,69 @@ describe("用模板发起撤销申请", function () {
   });
 });
 
+function releaseTemplate(over) {
+  const t = tpl(over);
+  const snap = Object.assign({
+    releaseId: "trel_1", version: 1,
+    scope: "space", resourceId: "sp1"
+  }, tc.contentSnapshot(t, 1));
+  t.releases = [{
+    id: "trel_1", version: 1, source: "publish",
+    publishedAt: NOW, publishedBy: "负责人", snapshot: snap
+  }];
+  t.currentVersion = 1;
+  return t;
+}
+
+describe("发布草稿与发布版本", function () {
+  it("成员提交只读取 releases 最新发布版本，不读取顶层草稿字段", function () {
+    const t = releaseTemplate({
+      name: "已发布名称", defaultDurationMs: DAY,
+      memberScope: { mode: "members", members: ["张三"] }
+    });
+    t.name = "草稿名称";
+    t.defaultDurationMs = 3 * DAY;
+    t.currentVersion = 99;
+    const r = tc.validateTemplateSubmit(t, {},
+      ctx({ templateVersion: 1 }));
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.value.provenance.templateVersion, 1);
+    assert.equal(r.value.provenance.templateName, "已发布名称");
+    assert.equal(r.value.provenance.defaultDurationMs, DAY);
+  });
+
+  it("回滚目标必须存在且适用范围、角色、有效期完整", function () {
+    const t = releaseTemplate();
+    let r = tc.validateReleaseSnapshot(null);
+    assert.equal(r.code, "release_version_not_found");
+    const bad = JSON.parse(JSON.stringify(t.releases[0].snapshot));
+    bad.role = "root";
+    r = tc.validateReleaseSnapshot(bad, { scope: "space", resourceId: "sp1" });
+    assert.equal(r.code, "invalid_published_template");
+    bad.role = "view";
+    bad.memberScope = { mode: "members", members: [] };
+    r = tc.validateReleaseSnapshot(bad, { scope: "space", resourceId: "sp1" });
+    assert.equal(r.code, "invalid_published_template");
+    const good = JSON.parse(JSON.stringify(t.releases[0].snapshot));
+    assert.equal(tc.validateReleaseSnapshot(good).ok, true);
+  });
+
+  it("同资源相同时间只能有一个待执行计划", function () {
+    const a = releaseTemplate({ id: "ptpl_a" });
+    const b = releaseTemplate({ id: "ptpl_b" });
+    a.publishPlans = [{
+      id: "tpln_1", status: "pending", scheduledAt: f(24),
+      templateVersion: 1, draftVersion: 1
+    }];
+    const conflict = tc.validatePlanConflict([a, b], b,
+      { scheduledAt: f(24), scope: "space", resourceId: "sp1" });
+    assert.equal(conflict.code, "scheduled_publish_conflict");
+    const otherTime = tc.validatePlanConflict([a, b], b,
+      { scheduledAt: f(25), scope: "space", resourceId: "sp1" });
+    assert.equal(otherTime.ok, true);
+  });
+});
+
 describe("快照、溯源与对外视图", function () {
   it("contentSnapshot 是不可变拷贝（修改模板不影响旧快照）", function () {
     const t = tpl({ memberScope: { mode: "members", members: ["张三"] } });

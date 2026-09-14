@@ -1006,13 +1006,28 @@
           (t.kind === "grant" ? "授予申请" : "撤销申请") + " · " +
           (ROLE_LABELS[t.role] || t.role) + " · " +
           (SCOPE_LABELS[t.scope] || t.scope)));
+        var published = t.currentVersion ? "已发布 v" + t.currentVersion : "未发布";
+        var stateText = t.status === "disabled" ? "已停用" : published;
         head.appendChild(el("span",
           "perm-badge perm-badge-" + (t.status === "disabled" ? "expired" : "approved"),
-          t.status === "disabled" ? "已停用" : "启用中 v" + t.currentVersion));
+          stateText));
         card.appendChild(head);
         card.appendChild(el("div", null, "资源：" + t.resourceId));
         card.appendChild(el("div", null,
           "适用范围：" + scopeText(t)));
+        if (isTemplateOwnerView(t)) {
+          var draftLine = "草稿：无";
+          if (t.draftStatus === "unpublished") {
+            draftLine = "草稿：未发布（草稿 v" + (t.draft && t.draft.draftVersion) + "）";
+          } else if (t.draftStatus === "scheduled") {
+            draftLine = "草稿：计划 " + formatTime(t.scheduledAt) + " 发布";
+          }
+          card.appendChild(el("div", "snap-note", draftLine));
+          card.appendChild(el("div", "snap-note",
+            "当前已发布：" + (t.publishedVersion ? "v" + t.publishedVersion : "无") +
+            (t.publishedAt ? " · " + formatTime(t.publishedAt) : "") +
+            (t.publishedBy ? " · " + t.publishedBy : "")));
+        }
         if (t.kind === "grant") {
           card.appendChild(el("div", null,
             "默认有效期：" + (t.defaultDurationMs != null
@@ -1026,8 +1041,27 @@
           submitFromTemplate(t);
         }));
         if (isTemplateOwnerView(t)) {
-          acts.appendChild(button("修改", null, function () { editTemplate(t.id); }));
-          acts.appendChild(button("版本历史", null, function () {
+          acts.appendChild(button("修改草稿", null, function () { editTemplate(t.id); }));
+          if (t.draftStatus === "unpublished") {
+            acts.appendChild(button("立即发布", "primary", function () {
+              publishTemplate(t.id, null);
+            }));
+            acts.appendChild(button("计划发布", null, function () {
+              scheduleTemplatePublish(t.id);
+            }));
+            acts.appendChild(button("丢弃草稿", "danger", function () {
+              discardTemplateDraft(t.id);
+            }));
+          }
+          if (t.draftStatus === "scheduled" && t.draft) {
+            acts.appendChild(button("取消计划发布", "danger", function () {
+              cancelScheduledTemplate(t.id, t.draft.planId);
+            }));
+          }
+          acts.appendChild(button("回滚", null, function () {
+            rollbackTemplate(t.id);
+          }));
+          acts.appendChild(button("发布记录", null, function () {
             openTemplateVersions(t.id);
           }));
           if (t.status !== "disabled") {
@@ -1067,10 +1101,10 @@
       box.appendChild(f("说明", desc));
       box.appendChild(f("适用范围", mode));
       box.appendChild(f("成员名单（逗号分隔）", members));
-      var m = openModal("修改模板：" + t.name + "（当前 v" +
-        t.currentVersion + "；保存后生成新版本，旧版本不能再发起）", box,
+      var m = openModal("修改模板草稿：" + t.name + "（已发布 v" +
+        (t.publishedVersion || "无") + "；保存后普通成员仍只见已发布版本）", box,
         { buttons: [] });
-      var save = button("保存为新版本", "primary", function () {
+      var save = button("保存未发布草稿", "primary", function () {
         var body = {
           name: n.value.trim(),
           description: desc.value.trim(),
@@ -1088,13 +1122,117 @@
           { body: body, ifMatch: state.templateRev }).then(function (r) {
             state.templateRev = r.tplRev;
             toast(r.data.unchanged
-              ? "模板内容无变化"
-              : "模板已更新到 v" + r.data.template.currentVersion);
+              ? "草稿内容无变化"
+              : "已保存未发布草稿（草稿 v" +
+                (r.data.template.draft && r.data.template.draft.draftVersion) +
+                "），需发布后成员才能看到");
             m.close(); loadTemplates(); loadRequests();
           }).catch(function (e) { handleTemplateError(e); });
       });
       var cancel = button("取消", null, function () { m.close(); });
       m.foot.appendChild(save); m.foot.appendChild(cancel);
+    }
+
+    function publishTemplate(id, scheduledAt, draftVersion) {
+      var t = state.templates.find(function (x) { return x.id === id; });
+      if (!t || !t.draft) { toast("没有未发布草稿", "error"); return; }
+      var body = { draftVersion: draftVersion != null ? draftVersion
+        : t.draft.draftVersion };
+      if (scheduledAt) body.scheduledAt = scheduledAt;
+      api("POST", "/api/permissions/request-templates/" + id + "/publish",
+        { body: body, ifMatch: state.templateRev }).then(function (r) {
+          state.templateRev = r.tplRev;
+          toast(r.data.scheduled
+            ? "已计划于 " + formatTime(r.data.plan.scheduledAt) + " 发布"
+            : "已发布 v" + r.data.release.version);
+          loadTemplates();
+        }).catch(handleTemplateError);
+      }
+
+    function scheduleTemplatePublish(id) {
+      var input = el("input");
+      input.type = "datetime-local";
+      input.step = "1";
+      var box = el("div", "perm-form");
+      var wrap = el("label", "perm-field");
+      wrap.appendChild(el("span", null, "计划发布时间"));
+      wrap.appendChild(input);
+      box.appendChild(wrap);
+      box.appendChild(el("div", "snap-note",
+        "到点后发布当前草稿；在执行前可以取消。"));
+      var m = openModal("计划发布模板", box, { buttons: [] });
+      var save = button("创建发布计划", "primary", function () {
+        if (!input.value) { toast("请选择未来时间", "error"); return; }
+        publishTemplate(id, new Date(input.value).toISOString());
+        m.close();
+      });
+      m.foot.appendChild(save);
+      m.foot.appendChild(button("取消", null, function () { m.close(); }));
+    }
+
+    function cancelScheduledTemplate(id, planId) {
+      if (!window.confirm("确认取消该计划发布？草稿会保留为未发布状态。")) return;
+      api("POST", "/api/permissions/request-templates/" + id +
+          "/publish-plans/" + planId + "/cancel",
+        { body: { templateVersion: t.publishedVersion,
+          draftVersion: t.draft && t.draft.draftVersion },
+          ifMatch: state.templateRev }).then(function (r) {
+          state.templateRev = r.tplRev;
+          toast("计划发布已取消");
+          loadTemplates();
+        }).catch(handleTemplateError);
+    }
+
+    function discardTemplateDraft(id) {
+      var t = state.templates.find(function (x) { return x.id === id; });
+      if (!t) return;
+      if (!window.confirm("确认丢弃未发布草稿？已发布版本不会改变。")) return;
+      api("DELETE", "/api/permissions/request-templates/" + id + "/draft",
+        { ifMatch: state.templateRev }).then(function (r) {
+          state.templateRev = r.tplRev;
+          toast(r.data.unchanged ? "没有未发布草稿" : "草稿已丢弃");
+          loadTemplates();
+        }).catch(handleTemplateError);
+    }
+
+    function rollbackTemplate(id) {
+      api("GET", "/api/permissions/request-templates/" + id + "/versions")
+        .then(function (r) {
+          var releases = r.data.releases || [];
+          var box = el("div", "perm-logs");
+          box.appendChild(el("div", "snap-note",
+            "回滚会复制所选发布内容并生成一个新发布版本，不会覆盖历史。" +
+            "如有未发布草稿，请先发布或丢弃。"));
+          releases.forEach(function (rel) {
+            var line = el("div", "perm-logline");
+            line.appendChild(el("span", null,
+              "v" + rel.version + " · " + formatTime(rel.publishedAt) +
+              " · " + (rel.source === "rollback" ? "回滚产生" : "发布") +
+              " · " + rel.publishedBy));
+            line.appendChild(el("div", "perm-log-msg",
+              rel.snapshot.name + " · " +
+              (ROLE_LABELS[rel.snapshot.role] || rel.snapshot.role)));
+          if (rel.version !== r.data.currentVersion) {
+              line.appendChild(button("回滚到此版本", null, function () {
+                var reason = window.prompt("回滚原因（可留空）", "");
+                if (reason === null) return;
+                api("POST", "/api/permissions/request-templates/" + id +
+                    "/rollback",
+                  { body: { releaseVersion: rel.version, reason: reason },
+                    ifMatch: state.templateRev }).then(function (rr) {
+                    state.templateRev = rr.tplRev;
+                    toast("已回滚并发布为 v" + rr.data.release.version);
+                    m.close(); loadTemplates();
+                  }).catch(handleTemplateError);
+              }));
+            } else {
+              line.appendChild(el("span", "snap-note", "当前版本"));
+            }
+            box.appendChild(line);
+          });
+          var m = openModal("模板发布历史与回滚", box,
+            { buttons: [button("关闭", null, function () {})] });
+        }).catch(handleTemplateError);
     }
 
     function disableTemplate(id) {
@@ -1174,13 +1312,23 @@
         .then(function (r) {
           var box = el("div", "perm-logs");
           box.appendChild(el("div", "snap-note",
-            "当前版本 v" + r.data.currentVersion +
-            "（新版本倒序；停用不产生内容版本）"));
+            "当前已发布 v" + r.data.currentVersion +
+            "；下方是完整版本历史，发布记录可在上方卡片使用“回滚”操作"));
+          (r.data.publishPlans || []).forEach(function (p) {
+            if (p.status !== "pending") return;
+            box.appendChild(el("div", "perm-logline",
+              "计划发布：" + formatTime(p.scheduledAt) +
+              " · 草稿 v" + p.draftVersion + " · " + p.status));
+          });
           r.data.versions.forEach(function (v) {
             var line = el("div", "perm-logline");
             line.appendChild(el("span", null,
               formatTime(v.at) + " · " +
-              ({ create: "创建", update: "修改", disable: "停用" }[v.action] ||
+              ({ create: "创建", update: "保存草稿", disable: "停用",
+                 publish: "发布", schedule_publish: "计划发布",
+                 cancel_publish: "取消计划", rollback: "回滚",
+                 discard_draft: "丢弃草稿",
+                 schedule_publish_failed: "计划发布失败" }[v.action] ||
                 v.action) + " · v" + v.version + " · " + (v.by || "—")));
             line.appendChild(el("div", "perm-log-msg",
               v.name + " · " + (ROLE_LABELS[v.role] || v.role) + " · " +
@@ -1222,7 +1370,13 @@
           return;
         }
         var ACTIONS = {
-          template_create: "创建模板", template_update: "修改模板",
+          template_create: "创建模板", template_update: "保存草稿",
+          template_publish: "发布模板",
+          template_publish_scheduled: "计划模板发布",
+          template_publish_cancelled: "取消模板计划发布",
+          template_scheduled_publish_failed: "计划发布失败",
+          template_rollback: "回滚模板",
+          template_draft_discarded: "丢弃草稿",
           template_disable: "停用模板", template_submit: "用模板发起申请",
           template_submit_rejected: "模板发起被拒绝"
         };

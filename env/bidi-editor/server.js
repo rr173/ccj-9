@@ -1080,7 +1080,8 @@ const permissionStore = {
   delegations: [], // 全部资源的委派记录（active/revoked；过期由时间实时判定）
   requests: [],    // 权限变更申请（grant 授予 / revoke 撤销；含终态与版本）
   requestGroups: [], // 申请分组（名称/处理截止/备注；groupId 冗余在申请上）
-  requestTemplates: [], // 申请模板（角色/申请类型/默认有效期/说明/适用成员范围）
+  requestTemplates: [], // 申请模板（已发布内容、未发布草稿、发布计划与发布历史）
+  templatePublishPlans: [], // 兼容旧结构的待执行发布计划（新记录同时冗余在模板上）
   logs: [],        // 授予/撤销操作记录
   requestLogs: [], // 申请流审计记录（提交/批准/拒绝/过期/批准时冲突），只增不改
   groupLogs: [],   // 分组独立审计（分组变更/批量审批/截止提醒），只增不改
@@ -1136,6 +1137,10 @@ try {
       Number.isInteger(dataPerm.templateRev) ? dataPerm.templateRev : 0;
     permissionStore.requestTemplates = Array.isArray(dataPerm.requestTemplates)
       ? dataPerm.requestTemplates : [];
+    permissionStore.templatePublishPlans = Array.isArray(dataPerm.templatePublishPlans)
+      ? dataPerm.templatePublishPlans : [];
+    migratePermissionTemplates(permissionStore.requestTemplates,
+      permissionStore.templatePublishPlans);
     permissionStore.templateLogs = Array.isArray(dataPerm.templateLogs)
       ? dataPerm.templateLogs : [];
   }
@@ -1184,40 +1189,59 @@ function recordPermissionDenial(rec, defer) {
   return e;
 }
 
-// 权限存储自身的内存修改 + 串行原子落盘（失败回滚）
+// 权限存储自身的内存修改 + 串行原子落盘（失败回滚）。
+// 整条事务（内存修改 + 落盘）串行执行：两个并发写请求不能各自在内存里先
+// 自增 rev 再排队落盘，否则后到的请求会带着过期 rev 通过乐观锁检查。
+let mutatePermissionsChain = Promise.resolve();
 function mutatePermissions(mutator, cb) {
-  const backup = JSON.parse(JSON.stringify({
-    rev: permissionStore.rev,
-    requestRev: permissionStore.requestRev,
-    groupRev: permissionStore.groupRev,
-    templateRev: permissionStore.templateRev,
-    delegations: permissionStore.delegations,
-    requests: permissionStore.requests,
-    requestGroups: permissionStore.requestGroups,
-    requestTemplates: permissionStore.requestTemplates,
-    logs: permissionStore.logs,
-    requestLogs: permissionStore.requestLogs,
-    groupLogs: permissionStore.groupLogs,
-    templateLogs: permissionStore.templateLogs,
-    groupReminders: permissionStore.groupReminders,
-    denials: permissionStore.denials
-  }));
-  let result;
-  try { result = mutator(); }
-  catch (e) {
-    restorePermissions(backup);
-    cb({ status: 500, code: "internal_error", message: e.message });
-    return;
-  }
-  persistPermissions(function (err) {
-    if (err) {
-      restorePermissions(backup);
-      cb({ status: 500, code: "persist_failed",
-        message: "权限配置落盘失败，已回滚，任何委派均未被改动" });
-      return;
-    }
-    cb(null, result);
-  });
+  const run = function () {
+    return new Promise(function (resolve) {
+      const backup = JSON.parse(JSON.stringify({
+        rev: permissionStore.rev,
+        requestRev: permissionStore.requestRev,
+        groupRev: permissionStore.groupRev,
+        templateRev: permissionStore.templateRev,
+        delegations: permissionStore.delegations,
+        requests: permissionStore.requests,
+        requestGroups: permissionStore.requestGroups,
+        requestTemplates: permissionStore.requestTemplates,
+        templatePublishPlans: permissionStore.templatePublishPlans,
+        logs: permissionStore.logs,
+        requestLogs: permissionStore.requestLogs,
+        groupLogs: permissionStore.groupLogs,
+        templateLogs: permissionStore.templateLogs,
+        groupReminders: permissionStore.groupReminders,
+        denials: permissionStore.denials
+      }));
+      let result;
+      try {
+        result = mutator();
+      } catch (e) {
+        // 校验失败只回滚本次事务，不能把此前已成功落盘的写一起回滚。
+        restorePermissions(backup);
+        if (e && e.status && e.code) {
+          resolve([e, null]);
+        } else {
+          resolve([{ status: 500, code: "internal_error", message: e.message }, null]);
+        }
+        return;
+      }
+      persistPermissions(function (err) {
+        if (err) {
+          restorePermissions(backup);
+          resolve([{ status: 500, code: "persist_failed",
+            message: "权限配置落盘失败，已回滚，任何委派均未被改动" }, null]);
+          return;
+        }
+        resolve([null, result]);
+      });
+    });
+  };
+  const current = mutatePermissionsChain.then(run, run);
+  // 事务链不受单个回调异常影响；回调结果单独派发。
+  mutatePermissionsChain = current.then(function () { return null; },
+                                      function () { return null; });
+  current.then(function (pair) { cb(pair[0], pair[1]); });
 }
 
 function restorePermissions(backup) {
@@ -1229,6 +1253,7 @@ function restorePermissions(backup) {
   permissionStore.requests = backup.requests;
   permissionStore.requestGroups = backup.requestGroups;
   permissionStore.requestTemplates = backup.requestTemplates;
+  permissionStore.templatePublishPlans = backup.templatePublishPlans || [];
   permissionStore.logs = backup.logs;
   permissionStore.requestLogs = backup.requestLogs;
   permissionStore.groupLogs = backup.groupLogs;
@@ -8193,6 +8218,115 @@ function recoverInterruptedTasks() {
   }
 }
 
+function templatePublishIntervalMs() {
+  const v = Number(process.env.PERMISSION_TEMPLATE_PUBLISH_INTERVAL_MS);
+  if (Number.isFinite(v) && v > 0) return v;
+  return 1000;
+}
+
+function finishTemplatePlan(t, plan, nowIso, err) {
+  if (err) {
+    plan.status = "failed";
+    plan.executedAt = nowIso;
+    plan.errorCode = err.code || "scheduled_publish_failed";
+    plan.errorMessage = err.message || "计划发布失败";
+    addTemplateHistory(t, "schedule_publish_failed", nowIso, "系统", {
+      planId: plan.id, scheduledAt: plan.scheduledAt,
+      code: plan.errorCode, message: plan.errorMessage
+    });
+    addTemplateLog({
+      action: "template_scheduled_publish_failed", templateId: t.id,
+      scope: t.scope, resourceId: t.resourceId,
+      actor: "系统", version: t.currentVersion,
+      detail: { planId: plan.id, scheduledAt: plan.scheduledAt,
+        code: plan.errorCode, message: plan.errorMessage }
+    });
+  } else {
+    plan.status = "succeeded";
+    plan.executedAt = nowIso;
+    plan.errorCode = null;
+    plan.errorMessage = null;
+  }
+  syncRootTemplatePlans();
+}
+
+function sweepTemplatePublishes() {
+  const nowIso = new Date().toISOString();
+  const due = allPendingTemplatePlans()
+    .filter(function (x) { return Date.parse(x.plan.scheduledAt) <= Date.parse(nowIso); })
+    .sort(function (a, b) {
+      return Date.parse(a.plan.scheduledAt) - Date.parse(b.plan.scheduledAt) ||
+        a.plan.id.localeCompare(b.plan.id);
+    });
+  due.forEach(function (item) {
+    mutatePermissions(function () {
+      const t = findRequestTemplate(item.template.id);
+      const now = new Date().toISOString();
+      const plan = t && (t.publishPlans || []).find(function (p) {
+        return p.id === item.plan.id;
+      });
+      if (!plan || plan.status !== "pending") return null; // 幂等：重复触发不重复执行
+      const execBackup = JSON.parse(JSON.stringify({
+        rev: permissionStore.rev,
+        requestRev: permissionStore.requestRev,
+        groupRev: permissionStore.groupRev,
+        templateRev: permissionStore.templateRev,
+        delegations: permissionStore.delegations,
+        requests: permissionStore.requests,
+        requestGroups: permissionStore.requestGroups,
+        requestTemplates: permissionStore.requestTemplates,
+        templatePublishPlans: permissionStore.templatePublishPlans,
+        logs: permissionStore.logs,
+        requestLogs: permissionStore.requestLogs,
+        groupLogs: permissionStore.groupLogs,
+        templateLogs: permissionStore.templateLogs,
+        groupReminders: permissionStore.groupReminders,
+        denials: permissionStore.denials
+      }));
+      try {
+        if (!t || t.status === "disabled") {
+          throw { code: "template_disabled", message: "模板已停用，计划发布不能执行" };
+        }
+        if (!t.draft) {
+          throw { code: "draft_not_found", message: "草稿不存在，计划发布不能执行" };
+        }
+        if (plan.templateVersion !== permissionTemplateCore
+            .currentPublishedVersion(t) ||
+            plan.draftVersion !== t.draft.version) {
+          throw { code: "template_version_changed",
+            message: "发布计划锁定的模板版本或草稿版本已变化" };
+        }
+        const release = publishDraftNow(t, "系统", now,
+          { scheduled: true, planId: plan.id });
+        plan.releaseVersion = release.version;
+        finishTemplatePlan(t, plan, now, null);
+      } catch (e) {
+        restorePermissions(execBackup);
+        const failedTemplate = findRequestTemplate(t.id);
+        const failedPlan = failedTemplate &&
+          (failedTemplate.publishPlans || []).find(function (p) {
+            return p.id === plan.id;
+          });
+        if (failedTemplate && failedPlan) {
+          finishTemplatePlan(failedTemplate, failedPlan, now, e);
+        }
+      }
+      return true;
+    }, function (failure) {
+      if (failure) console.error("scheduled template publish failed:", failure);
+    });
+  });
+}
+
+let templatePublishTimer = null;
+function startTemplatePublishScheduler() {
+  if (templatePublishTimer) return;
+  sweepTemplatePublishes(); // 重启后立即恢复并执行到点计划
+  templatePublishTimer = setInterval(sweepTemplatePublishes,
+    templatePublishIntervalMs());
+  if (templatePublishTimer.unref) templatePublishTimer.unref();
+}
+
 let groupReminderTimer = null;
 function startGroupReminderScheduler() {
   if (groupReminderTimer) return;
@@ -8206,6 +8340,7 @@ function startScheduler() {
   recoverInterruptedTasks();
   schedulerTimer = setInterval(schedulerTick, SCHEDULER_INTERVAL_MS);
   if (schedulerTimer.unref) schedulerTimer.unref();
+  startTemplatePublishScheduler();
   // 申请分组处理截止提醒（approaching/overdue，幂等，独立审计）
   startGroupReminderScheduler();
 }
@@ -9786,6 +9921,201 @@ function templatesOf(scope, resourceId) {
   });
 }
 
+function cloneTemplateContent(v) {
+  return {
+    name: v.name,
+    role: v.role,
+    kind: v.kind,
+    defaultDurationMs: v.defaultDurationMs != null ? v.defaultDurationMs : null,
+    description: v.description || "",
+    memberScope: JSON.parse(JSON.stringify(
+      v.memberScope || { mode: "all", members: [] }))
+  };
+}
+
+function makeReleaseSnapshot(t, v, version) {
+  const cloned = cloneTemplateContent(v);
+  return Object.assign({
+    releaseId: "trel_" + crypto.randomUUID().replace(/-/g, ""),
+    version: version,
+    scope: t.scope,
+    resourceId: t.resourceId
+  }, cloned);
+}
+
+function addRelease(t, snapshot, actor, nowIso, opts) {
+  opts = opts || {};
+  const version = (t.releases || []).filter(function (r) {
+    return r.status !== "cancelled";
+  }).length + 1;
+  const release = {
+    id: snapshot.releaseId ||
+      ("trel_" + crypto.randomUUID().replace(/-/g, "")),
+    version: version,
+    source: opts.source || "publish",
+    sourceDraftVersion: opts.sourceDraftVersion || null,
+    sourceReleaseVersion: opts.sourceReleaseVersion || null,
+    reason: opts.reason || "",
+    publishedAt: nowIso,
+    publishedBy: actor,
+    snapshot: Object.assign({}, snapshot, { version: version })
+  };
+  delete release.snapshot.releaseId;
+  t.releases.push(release);
+  t.currentVersion = version;
+  const live = cloneTemplateContent(snapshot);
+  Object.assign(t, live);
+  return release;
+}
+
+function contentEqual(a, b) {
+  return JSON.stringify({
+    name: a && a.name, role: a && a.role, kind: a && a.kind,
+    defaultDurationMs: a && a.defaultDurationMs,
+    description: a && a.description || "",
+    memberScope: a && a.memberScope
+  }) === JSON.stringify({
+    name: b && b.name, role: b && b.role, kind: b && b.kind,
+    defaultDurationMs: b && b.defaultDurationMs,
+    description: b && b.description || "",
+    memberScope: b && b.memberScope
+  });
+}
+
+function applyDraftEdits(t, v, actor, nowIso) {
+  if (!t.draft) {
+    t.draftVersion = Number.isInteger(t.draftVersion) ? t.draftVersion + 1 : 1;
+    t.draft = Object.assign({
+      version: t.draftVersion,
+      createdAt: nowIso,
+      createdBy: actor
+    }, cloneTemplateContent(v));
+  } else {
+    t.draftVersion = Number.isInteger(t.draftVersion)
+      ? t.draftVersion + 1 : (t.draft.version + 1);
+    Object.assign(t.draft, cloneTemplateContent(v), {
+      version: t.draftVersion,
+      updatedAt: nowIso,
+      updatedBy: actor
+    });
+  }
+  return t.draft;
+}
+
+function discardDraft(t) {
+  t.draft = null;
+  t.draftVersion = t.draftVersion || 0;
+}
+
+function assertTemplateExpectedRev(expected) {
+  const current = permissionStore.templateRev;
+  if (expected === undefined || expected === null || expected === "") {
+    return { status: 428, code: "precondition_required",
+      message: "模板集合必须携带 If-Match 版本号" };
+  }
+  const n = parseInt(expected, 10);
+  if (!Number.isInteger(n) || n !== current) {
+    return { status: 409, code: "version_conflict",
+      message: "模板集合已被其他操作更新，请刷新发布状态后重试",
+      currentRev: current, expectedRev: n };
+  }
+  return null;
+}
+
+function makePublishPlan(t, draft, actor, nowIso, scheduledAt) {
+  return {
+    id: "tpln_" + crypto.randomUUID().replace(/-/g, ""),
+    templateId: t.id,
+    scope: t.scope,
+    resourceId: t.resourceId,
+    templateVersion: t.currentVersion,
+    draftVersion: draft.version,
+    scheduledAt: scheduledAt,
+    status: "pending",
+    createdAt: nowIso,
+    createdBy: actor,
+    cancelledAt: null,
+    cancelledBy: null,
+    executedAt: null,
+    releaseVersion: null,
+    errorCode: null,
+    errorMessage: null
+  };
+}
+
+function addTemplateHistory(t, action, at, by, extra) {
+  const entry = Object.assign({
+    action: action,
+    at: at,
+    by: by
+  }, extra || {});
+  t.history.push(entry);
+}
+
+function migratePermissionTemplates(templates, rootPlans) {
+  templates.forEach(function (t) {
+    if (!Array.isArray(t.releases)) t.releases = [];
+    if (!Array.isArray(t.publishPlans)) t.publishPlans = [];
+    if (!Number.isInteger(t.draftVersion)) t.draftVersion = 0;
+    if (t.draft === undefined) t.draft = null;
+
+    if (!t.releases.length && Number.isInteger(t.currentVersion)) {
+      const versions = (t.history || []).filter(function (h) {
+        return ["create", "update"].indexOf(h.action) !== -1;
+      });
+      const latest = versions[versions.length - 1];
+      const snapshot = {
+        releaseId: "trel_legacy_" + t.id,
+        version: t.currentVersion,
+        scope: t.scope,
+        resourceId: t.resourceId,
+        name: (latest && latest.name) || t.name,
+        role: (latest && latest.role) || t.role,
+        kind: (latest && latest.kind) || t.kind,
+        defaultDurationMs: latest && latest.defaultDurationMs !== undefined
+          ? latest.defaultDurationMs : t.defaultDurationMs,
+        description: (latest && latest.description) || t.description || "",
+        memberScope: (latest && latest.memberScope) || t.memberScope ||
+          { mode: "all", members: [] }
+      };
+      t.releases.push({
+        id: snapshot.releaseId,
+        version: t.currentVersion,
+        source: "publish",
+        sourceDraftVersion: null,
+        sourceReleaseVersion: null,
+        reason: "迁移发布能力上线前的已发布版本",
+        publishedAt: (latest && latest.at) || t.createdAt,
+        publishedBy: (latest && latest.by) || t.createdBy || SUPER_OWNER,
+        snapshot: snapshot
+      });
+    }
+
+    // 旧文件若有根计划，按 templateId 挂回模板；同 id 只迁移一次。
+    (rootPlans || []).forEach(function (p) {
+      if (p.templateId === t.id &&
+          !t.publishPlans.some(function (x) { return x.id === p.id; })) {
+        t.publishPlans.push(p);
+      }
+    });
+  });
+}
+
+function allPendingTemplatePlans() {
+  const out = [];
+  permissionStore.requestTemplates.forEach(function (t) {
+    (t.publishPlans || []).forEach(function (p) {
+      if (p.status === "pending") out.push({ template: t, plan: p });
+    });
+  });
+  return out;
+}
+
+function syncRootTemplatePlans() {
+  permissionStore.templatePublishPlans = allPendingTemplatePlans()
+    .map(function (x) { return x.plan; });
+}
+
 // 模板独立审计日志（只增不改；随权限文件持久化，重启可查）
 function addTemplateLog(entry) {
   const e = Object.assign({
@@ -9985,8 +10315,14 @@ function handleRequestTemplateVersions(req, res, urlObj, id) {
   sendJSON(res, 200, {
     templateRev: permissionStore.templateRev,
     currentVersion: t.currentVersion,
+    publishedVersion: permissionTemplateCore.currentPublishedVersion(t),
+    draft: permissionTemplateCore.draftView(t),
+    releases: (t.releases || []).map(permissionTemplateCore.releaseView).reverse(),
+    publishPlans: (t.publishPlans || []).map(permissionTemplateCore.planView).reverse(),
     versions: (t.history || []).slice().sort(function (a, b) {
-      return b.version - a.version || Date.parse(b.at) - Date.parse(a.at);
+      const diff = Date.parse(b.at) - Date.parse(a.at);
+      if (diff) return diff;
+      return a.id < b.id ? 1 : -1;
     })
   });
 }
@@ -10044,21 +10380,32 @@ function handleRequestTemplateCreate(req, res, urlObj) {
         description: v.description || "",
         memberScope: v.memberScope || { mode: "all", members: [] },
         status: "active",
-        currentVersion: 1,
+        currentVersion: 0,
+        draft: null,
+        draftVersion: 0,
+        releases: [],
+        publishPlans: [],
         createdAt: nowIso, createdBy: guard.member,
         updatedAt: null, updatedBy: null,
         disabledAt: null, disabledBy: null,
         history: []
       };
-      const snap = Object.assign(
-        permissionTemplateCore.contentSnapshot(t, 1),
-        { action: "create", at: nowIso, by: guard.member });
-      t.history.push(snap);
+      const releaseSnapshot = makeReleaseSnapshot(t, v, 1);
+      const release = addRelease(t, releaseSnapshot, guard.member, nowIso,
+        { source: "publish" });
+      addTemplateHistory(t, "create", nowIso, guard.member,
+        Object.assign(
+          permissionTemplateCore.contentSnapshot(t, release.version),
+          { releaseId: release.id }));
+      addTemplateHistory(t, "publish", nowIso, guard.member, {
+        version: release.version, releaseId: release.id, source: "create",
+        snapshot: JSON.parse(JSON.stringify(release.snapshot))
+      });
       permissionStore.requestTemplates.push(t);
       addTemplateLog({
         action: "template_create", templateId: t.id,
         scope: t.scope, resourceId: t.resourceId,
-        actor: guard.member, version: 1,
+        actor: guard.member, version: release.version,
         detail: { name: t.name, role: t.role, kind: t.kind,
           defaultDurationMs: t.defaultDurationMs,
           memberScope: t.memberScope, description: t.description }
@@ -10077,100 +10424,91 @@ function handleRequestTemplateCreate(req, res, urlObj) {
 
 // PATCH /api/permissions/request-templates/:id（If-Match: templateRev）
 // body: {name?, role?, kind?, defaultDurationMs?, description?, memberScope?}
-// 停用模板不能再修改（只能由负责人重新建一个）；无实际变化不推进版本。
+// 编辑只形成未发布草稿；普通成员仍读取最近一次已发布版本。
 function handleRequestTemplateUpdate(req, res, urlObj, id) {
-  if (checkLock(res, req.headers["if-match"], permissionStore.templateRev,
-                "模板集合")) return;
-  const t = findRequestTemplate(id);
-  if (!t) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
+  const expectedRev = req.headers["if-match"];
+  const t0 = findRequestTemplate(id);
+  if (!t0) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
   readBody(req, function (err, raw) {
     if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
     let body;
     try { body = JSON.parse(raw) || {}; }
     catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
-    const guard = guardTemplateOwner(req, res, urlObj, t);
+    const guard = guardTemplateOwner(req, res, urlObj, t0);
     if (!guard) return;
-    if (t.status === "disabled") {
-      apiError(res, 409, "template_disabled",
-        "模板已停用，停用模板不能再修改（旧版本永久只读；如需变更请新建模板）",
-        { templateId: t.id, currentVersion: t.currentVersion });
-      return;
-    }
     const nowIso = new Date().toISOString();
-    const checked = permissionTemplateCore.validateTemplateBody(body, {
-      now: nowIso, isCreate: false,
-      currentScope: t.scope, currentKind: t.kind,
-      currentDefaultDurationMs: t.defaultDurationMs
-    });
-    if (!checked.ok) {
-      const badRequest = ["missing_template_name", "name_too_long", "invalid_name",
-        "invalid_kind", "invalid_role", "role_not_allowed_for_scope",
-        "missing_default_duration", "invalid_default_duration",
-        "invalid_description",
-        "description_too_long", "invalid_member_scope",
-        "missing_scope_members", "invalid_scope_member",
-        "too_many_scope_members"].indexOf(checked.code) !== -1;
-      apiError(res, badRequest ? 400 : 409, checked.code, checked.message);
-      return;
-    }
-    const v = checked.value;
     mutatePermissions(function () {
+      const conflict = assertTemplateExpectedRev(expectedRev);
+      if (conflict) throw Object.assign(new Error(conflict.message), conflict);
+      const t = findRequestTemplate(id);
+      if (!t) throw { status: 404, code: "template_not_found", message: "申请模板不存在" };
+      if (t.status === "disabled") {
+        throw { status: 409, code: "template_disabled",
+          message: "模板已停用，停用模板不能再修改（旧版本永久只读；如需变更请新建模板）" };
+      }
+      const pending = permissionTemplateCore.pendingPlan(t);
+      if (pending) {
+        throw { status: 409, code: "scheduled_publish_pending",
+          message: "已有待执行的计划发布，请先取消后再修改草稿",
+          planId: pending.id, scheduledAt: pending.scheduledAt };
+      }
+      const published = permissionTemplateCore.publishedContent(t);
+      const base = t.draft
+        ? cloneTemplateContent(t.draft)
+        : cloneTemplateContent(published);
+      const checked = permissionTemplateCore.validateTemplateBody(body, {
+        now: nowIso, isCreate: false,
+        currentScope: t.scope, currentKind: base.kind,
+        currentDefaultDurationMs: base.defaultDurationMs
+      });
+      if (!checked.ok) {
+        const badRequest = ["missing_template_name", "name_too_long", "invalid_name",
+          "invalid_kind", "invalid_role", "role_not_allowed_for_scope",
+          "missing_default_duration", "invalid_default_duration",
+          "invalid_description",
+          "description_too_long", "invalid_member_scope",
+          "missing_scope_members", "invalid_scope_member",
+          "too_many_scope_members"].indexOf(checked.code) !== -1;
+        throw { status: badRequest ? 400 : 409,
+          code: checked.code, message: checked.message };
+      }
+      const candidate = Object.assign({}, base, checked.value);
+      if (candidate.kind === "revoke") candidate.defaultDurationMs = null;
+      if (t.draft && contentEqual(t.draft, candidate)) {
+        return { unchanged: true, template: t };
+      }
+      if (!t.draft && published && contentEqual(published, candidate)) {
+        return { unchanged: true, template: t };
+      }
+      const before = t.draft ? cloneTemplateContent(t.draft)
+        : cloneTemplateContent(published);
+      const draft = applyDraftEdits(t, candidate, guard.member, nowIso);
       const changes = {};
-      if (v.name !== undefined && v.name !== t.name) {
-        changes.name = { from: t.name, to: v.name }; t.name = v.name;
-      }
-      if (v.role !== undefined && v.role !== t.role) {
-        changes.role = { from: t.role, to: v.role }; t.role = v.role;
-      }
-      if (v.kind !== undefined && v.kind !== t.kind) {
-        changes.kind = { from: t.kind, to: v.kind }; t.kind = v.kind;
-      }
-      // 默认有效期以校验层归一化结果为准：
-      // 切到撤销类型 -> null；切到授予类型必须带合法值（校验层已保证）；
-      // 显式 null 不清空既有授予模板的有效期（校验层回填原值）。
-      let newDuration = t.defaultDurationMs;
-      if (v.defaultDurationMs !== undefined) {
-        newDuration = v.defaultDurationMs == null ? null : v.defaultDurationMs;
-      }
-      if (t.kind === "revoke") newDuration = null;
-      if (newDuration !== t.defaultDurationMs) {
-        changes.defaultDurationMs = { from: t.defaultDurationMs, to: newDuration };
-      }
-      t.defaultDurationMs = newDuration;
-      if (v.description !== undefined && v.description !== t.description) {
-        changes.description = { from: t.description, to: v.description };
-        t.description = v.description;
-      }
-      if (v.memberScope !== undefined) {
-        const before = JSON.stringify(t.memberScope);
-        const afterMs = v.memberScope;
-        if (JSON.stringify(afterMs) !== before) {
-          changes.memberScope = {
-            from: JSON.parse(before), to: JSON.parse(JSON.stringify(afterMs))
-          };
-          t.memberScope = afterMs;
-        }
-      }
-      const changed = Object.keys(changes).length > 0;
-      if (!changed) return { unchanged: true, template: t };
-      t.currentVersion++;
+      ["name", "role", "kind", "defaultDurationMs", "description", "memberScope"]
+        .forEach(function (k) {
+          const a = k === "memberScope"
+            ? JSON.stringify(before[k]) : before[k];
+          const b = k === "memberScope"
+            ? JSON.stringify(candidate[k]) : candidate[k];
+          if (a !== b) changes[k] = { from: before[k], to: candidate[k] };
+        });
       t.updatedAt = nowIso;
       t.updatedBy = guard.member;
-      const snap = Object.assign(
-        permissionTemplateCore.contentSnapshot(t, t.currentVersion),
-        { action: "update", at: nowIso, by: guard.member,
-          changes: changes });
-      t.history.push(snap);
+      addTemplateHistory(t, "update", nowIso, guard.member,
+        Object.assign(JSON.parse(JSON.stringify(t.draft)),
+          { version: draft.version, changes: changes, draft: true }));
       addTemplateLog({
         action: "template_update", templateId: t.id,
         scope: t.scope, resourceId: t.resourceId,
         actor: guard.member, version: t.currentVersion,
-        detail: changes
+        detail: { draftVersion: draft.version, changes: changes }
       });
       permissionStore.templateRev++;
       return { unchanged: false, template: t };
     }, function (failure, out) {
-      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      if (failure) { apiError(res, failure.status, failure.code, failure.message,
+        { planId: failure.planId, scheduledAt: failure.scheduledAt,
+          currentRev: failure.currentRev }); return; }
       sendJSON(res, 200, {
         templateRev: permissionStore.templateRev,
         unchanged: !!out.unchanged,
@@ -10180,13 +10518,12 @@ function handleRequestTemplateUpdate(req, res, urlObj, id) {
   });
 }
 
-// POST /api/permissions/request-templates/:id/disable（If-Match: templateRev）
-// 停用是终态：停用后不能再发起新申请，也不能再修改；历史与已提交申请不受影响。
-function handleRequestTemplateDisable(req, res, urlObj, id) {
-  if (checkLock(res, req.headers["if-match"], permissionStore.templateRev,
-                "模板集合")) return;
-  const t = findRequestTemplate(id);
-  if (!t) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
+// POST /api/permissions/request-templates/:id/publish
+// body: {} 立即发布；{scheduledAt} 生成未来计划。均发布当前未发布草稿。
+function handleRequestTemplatePublish(req, res, urlObj, id) {
+  const expectedRev = req.headers["if-match"];
+  const t0 = findRequestTemplate(id);
+  if (!t0) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
   readBody(req, function (err, raw) {
     if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
     let body = {};
@@ -10194,23 +10531,381 @@ function handleRequestTemplateDisable(req, res, urlObj, id) {
       try { body = JSON.parse(raw) || {}; }
       catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
     }
-    const guard = guardTemplateOwner(req, res, urlObj, t);
+    const guard = guardTemplateOwner(req, res, urlObj, t0);
     if (!guard) return;
-    if (t.status === "disabled") {
+    if (!Number.isSafeInteger(body.draftVersion) || body.draftVersion <= 0) {
+      apiError(res, 400, "invalid_draft_version",
+        "发布必须携带要发布的正整数 draftVersion");
+      return;
+    }
+    const nowIso = new Date().toISOString();
+    const scheduledCheck = permissionTemplateCore.validateScheduleTime(
+      body.scheduledAt, { now: nowIso });
+    if (!scheduledCheck.ok) {
+      apiError(res, 400, scheduledCheck.code, scheduledCheck.message);
+      return;
+    }
+    mutatePermissions(function () {
+      const conflict = assertTemplateExpectedRev(expectedRev);
+      if (conflict) throw Object.assign(new Error(conflict.message), conflict);
+      const t = findRequestTemplate(id);
+      if (!t) throw { status: 404, code: "template_not_found", message: "申请模板不存在" };
+      if (t.status === "disabled") {
+        throw { status: 409, code: "template_disabled", message: "模板已停用，不能发布" };
+      }
+      const pending = permissionTemplateCore.pendingPlan(t);
+      if (pending) {
+        throw { status: 409, code: "scheduled_publish_pending",
+          message: "该模板已有待执行计划，不能重复创建发布计划",
+          planId: pending.id, scheduledAt: pending.scheduledAt };
+      }
+      if (!t.draft) {
+        throw { status: 409, code: "draft_not_found",
+          message: "没有未发布草稿；负责人先修改模板后才能发布" };
+      }
+      if (body.draftVersion !== t.draft.version) {
+        throw { status: 409, code: "template_version_changed",
+          message: "草稿已被其他操作更新，请刷新后再发布",
+          currentDraftVersion: t.draft.version,
+          submittedDraftVersion: body.draftVersion };
+      }
+      const integrity = permissionTemplateCore.validateReleaseSnapshot(
+        Object.assign({ scope: t.scope, resourceId: t.resourceId },
+          cloneTemplateContent(t.draft)),
+        { scope: t.scope, resourceId: t.resourceId });
+      if (!integrity.ok) throw { status: 409, code: integrity.code, message: integrity.message };
+      if (scheduledCheck.value) {
+        const conflictPlan = permissionTemplateCore.validatePlanConflict(
+          permissionStore.requestTemplates, t,
+          { scheduledAt: scheduledCheck.value, scope: t.scope, resourceId: t.resourceId });
+        if (!conflictPlan.ok) {
+          throw Object.assign({ status: 409 }, conflictPlan);
+        }
+        const plan = makePublishPlan(t, t.draft, guard.member, nowIso,
+          scheduledCheck.value);
+        t.publishPlans.push(plan);
+        syncRootTemplatePlans();
+        addTemplateHistory(t, "schedule_publish", nowIso, guard.member, {
+          planId: plan.id, scheduledAt: plan.scheduledAt,
+          templateVersion: plan.templateVersion,
+          draftVersion: plan.draftVersion
+        });
+        addTemplateLog({
+          action: "template_publish_scheduled", templateId: t.id,
+          scope: t.scope, resourceId: t.resourceId,
+          actor: guard.member, version: t.currentVersion,
+          detail: { planId: plan.id, scheduledAt: plan.scheduledAt,
+            draftVersion: plan.draftVersion,
+            templateVersion: plan.templateVersion }
+        });
+        permissionStore.templateRev++;
+        return { scheduled: true, plan: plan, template: t };
+      }
+      const release = publishDraftNow(t, guard.member, nowIso, { reason: "" });
+      return { scheduled: false, release: release, template: t };
+    }, function (failure, out) {
+      if (failure) {
+        apiError(res, failure.status || 500, failure.code, failure.message,
+          { planId: failure.planId, scheduledAt: failure.scheduledAt,
+            conflictPlanId: failure.conflictPlanId,
+            conflictTemplateId: failure.conflictTemplateId,
+            currentDraftVersion: failure.currentDraftVersion,
+            submittedDraftVersion: failure.submittedDraftVersion,
+            currentRev: failure.currentRev });
+        return;
+      }
+      sendJSON(res, 200, {
+        templateRev: permissionStore.templateRev,
+        scheduled: !!out.scheduled,
+        plan: out.scheduled ? permissionTemplateCore.planView(out.plan) : null,
+        release: out.release ? permissionTemplateCore.releaseView(out.release) : null,
+        template: publicTemplateNow(out.template)
+      });
+    });
+  });
+}
+
+function publishDraftNow(t, actor, nowIso, opts) {
+  opts = opts || {};
+  if (!t.draft) throw { status: 409, code: "draft_not_found", message: "没有未发布草稿" };
+  const content = cloneTemplateContent(t.draft);
+  const integrity = permissionTemplateCore.validateReleaseSnapshot(
+    Object.assign({ scope: t.scope, resourceId: t.resourceId }, content),
+    { scope: t.scope, resourceId: t.resourceId });
+  if (!integrity.ok) throw { status: 409, code: integrity.code, message: integrity.message };
+  const draftVersion = t.draft.version;
+  const snapshot = makeReleaseSnapshot(t, content, (t.releases || []).length + 1);
+  const release = addRelease(t, snapshot, actor, nowIso,
+    { source: "publish", sourceDraftVersion: draftVersion, reason: opts.reason || "" });
+  discardDraft(t);
+  addTemplateHistory(t, "publish", nowIso, actor, {
+    version: release.version, releaseId: release.id,
+    draftVersion: draftVersion,
+    snapshot: JSON.parse(JSON.stringify(release.snapshot))
+  });
+  addTemplateLog({
+    action: "template_publish", templateId: t.id,
+    scope: t.scope, resourceId: t.resourceId,
+    actor: actor, version: release.version,
+    detail: { releaseId: release.id, draftVersion: draftVersion,
+      scheduled: !!opts.scheduled, planId: opts.planId || null }
+  });
+  permissionStore.templateRev++;
+  return release;
+}
+
+// DELETE /api/permissions/request-templates/:id/draft：负责人丢弃未发布草稿
+function handleRequestTemplateDraftDelete(req, res, urlObj, id) {
+  const expectedRev = req.headers["if-match"];
+  const t0 = findRequestTemplate(id);
+  if (!t0) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
+  readBody(req, function () {
+    const guard = guardTemplateOwner(req, res, urlObj, t0);
+    if (!guard) return;
+    mutatePermissions(function () {
+      const conflict = assertTemplateExpectedRev(expectedRev);
+      if (conflict) throw Object.assign(new Error(conflict.message), conflict);
+      const t = findRequestTemplate(id);
+      if (!t) throw { status: 404, code: "template_not_found", message: "申请模板不存在" };
+      if (permissionTemplateCore.pendingPlan(t)) {
+        throw { status: 409, code: "scheduled_publish_pending",
+          message: "计划发布尚未执行或取消，不能丢弃草稿" };
+      }
+      if (!t.draft) return { unchanged: true, template: t };
+      const draftVersion = t.draft.version;
+      discardDraft(t);
+      addTemplateHistory(t, "discard_draft", new Date().toISOString(),
+        guard.member, { draftVersion: draftVersion });
+      addTemplateLog({
+        action: "template_draft_discarded", templateId: t.id,
+        scope: t.scope, resourceId: t.resourceId,
+        actor: guard.member, version: t.currentVersion,
+        detail: { draftVersion: draftVersion }
+      });
+      permissionStore.templateRev++;
+      return { unchanged: false, template: t };
+    }, function (failure, out) {
+      if (failure) { apiError(res, failure.status || 500, failure.code, failure.message); return; }
+      sendJSON(res, 200, { templateRev: permissionStore.templateRev,
+        unchanged: !!out.unchanged, template: publicTemplateNow(out.template) });
+    });
+  });
+}
+
+// POST /api/permissions/request-templates/:id/publish-plans/:planId/cancel
+function handleRequestTemplatePublishCancel(req, res, urlObj, id, planId) {
+  const expectedRev = req.headers["if-match"];
+  const t0 = findRequestTemplate(id);
+  if (!t0) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body = {};
+    if (raw) {
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    }
+    const guard = guardTemplateOwner(req, res, urlObj, t0);
+    if (!guard) return;
+    if (!Number.isSafeInteger(body.templateVersion) || body.templateVersion <= 0 ||
+        !Number.isSafeInteger(body.draftVersion) || body.draftVersion <= 0) {
+      apiError(res, 400, "invalid_plan_version",
+        "取消计划必须携带 plan 锁定的正整数 templateVersion 和 draftVersion");
+      return;
+    }
+    mutatePermissions(function () {
+      const conflict = assertTemplateExpectedRev(expectedRev);
+      if (conflict) throw Object.assign(new Error(conflict.message), conflict);
+      const t = findRequestTemplate(id);
+      if (!t) throw { status: 404, code: "template_not_found", message: "申请模板不存在" };
+      const plan = (t.publishPlans || []).find(function (p) { return p.id === planId; });
+      if (!plan) {
+        throw { status: 404, code: "publish_plan_not_found",
+          message: "发布计划不存在" };
+      }
+      if (plan.status !== "pending") {
+        throw { status: 409, code: "publish_plan_not_pending",
+          message: "只能取消尚未执行的计划发布",
+          planStatus: plan.status, errorCode: plan.errorCode || null };
+      }
+      if (body.templateVersion !== plan.templateVersion) {
+        throw { status: 409, code: "template_version_changed",
+          message: "发布计划所依据的模板发布版本已变化",
+          currentVersion: plan.templateVersion,
+          submittedVersion: body.templateVersion };
+      }
+      if (body.draftVersion !== plan.draftVersion) {
+        throw { status: 409, code: "template_version_changed",
+          message: "发布计划所依据的草稿版本已变化",
+          currentDraftVersion: plan.draftVersion,
+          submittedDraftVersion: body.draftVersion };
+      }
+      const nowIso = new Date().toISOString();
+      plan.status = "cancelled";
+      plan.cancelledAt = nowIso;
+      plan.cancelledBy = guard.member;
+      plan.errorCode = "cancelled";
+      plan.errorMessage = typeof body.reason === "string" ? body.reason.trim() : "";
+      syncRootTemplatePlans();
+      addTemplateHistory(t, "cancel_publish", nowIso, guard.member, {
+        planId: plan.id, scheduledAt: plan.scheduledAt,
+        templateVersion: plan.templateVersion,
+        draftVersion: plan.draftVersion
+      });
+      addTemplateLog({
+        action: "template_publish_cancelled", templateId: t.id,
+        scope: t.scope, resourceId: t.resourceId,
+        actor: guard.member, version: t.currentVersion,
+        detail: { planId: plan.id, scheduledAt: plan.scheduledAt,
+          templateVersion: plan.templateVersion,
+          draftVersion: plan.draftVersion }
+      });
+      permissionStore.templateRev++;
+      return { plan: plan, template: t };
+    }, function (failure, out) {
+      if (failure) {
+        apiError(res, failure.status || 500, failure.code, failure.message,
+          { planStatus: failure.planStatus, errorCode: failure.errorCode,
+            currentVersion: failure.currentVersion,
+            submittedVersion: failure.submittedVersion,
+            currentDraftVersion: failure.currentDraftVersion,
+            submittedDraftVersion: failure.submittedDraftVersion,
+            currentRev: failure.currentRev });
+        return;
+      }
+      sendJSON(res, 200, {
+        templateRev: permissionStore.templateRev,
+        plan: permissionTemplateCore.planView(out.plan),
+        template: publicTemplateNow(out.template)
+      });
+    });
+  });
+}
+
+// POST /api/permissions/request-templates/:id/rollback
+// body: {releaseVersion:number, reason?}：从发布历史产生一个新的发布版本。
+function handleRequestTemplateRollback(req, res, urlObj, id) {
+  const expectedRev = req.headers["if-match"];
+  const t0 = findRequestTemplate(id);
+  if (!t0) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body = {};
+    try { body = JSON.parse(raw) || {}; }
+    catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    const guard = guardTemplateOwner(req, res, urlObj, t0);
+    if (!guard) return;
+    mutatePermissions(function () {
+      const conflict = assertTemplateExpectedRev(expectedRev);
+      if (conflict) throw Object.assign(new Error(conflict.message), conflict);
+      const t = findRequestTemplate(id);
+      if (!t) throw { status: 404, code: "template_not_found", message: "申请模板不存在" };
+      if (t.status === "disabled") {
+        throw { status: 409, code: "template_disabled",
+          message: "模板已停用，不能回滚发布版本" };
+      }
+      if (permissionTemplateCore.pendingPlan(t)) {
+        throw { status: 409, code: "scheduled_publish_pending",
+          message: "请先取消尚未执行的计划发布，再回滚" };
+      }
+      if (!Number.isSafeInteger(body.releaseVersion) || body.releaseVersion <= 0) {
+        throw { status: 400, code: "invalid_release_version",
+          message: "releaseVersion 必须是正整数的已发布版本号" };
+      }
+      const target = permissionTemplateCore.findRelease(t, body.releaseVersion);
+      if (!target) {
+        throw { status: 404, code: "release_version_not_found",
+          message: "目标发布版本不存在，不能回滚" };
+      }
+      if (target.version === permissionTemplateCore.currentPublishedVersion(t)) {
+        throw { status: 409, code: "rollback_target_is_current",
+          message: "目标版本已经是当前已发布版本，无需产生回滚发布版本" };
+      }
+      const integrity = permissionTemplateCore.validateReleaseSnapshot(
+        target.snapshot, { scope: t.scope, resourceId: t.resourceId });
+      if (!integrity.ok) throw { status: 409, code: integrity.code, message: integrity.message };
+      if (t.draft) {
+        throw { status: 409, code: "draft_exists",
+          message: "仍有未发布草稿；请先发布或丢弃草稿后再回滚，避免覆盖负责人草稿",
+          draftVersion: t.draft.version };
+      }
+      const nowIso = new Date().toISOString();
+      const content = cloneTemplateContent(target.snapshot);
+      const snapshot = makeReleaseSnapshot(t, content, (t.releases || []).length + 1);
+      const release = addRelease(t, snapshot, guard.member, nowIso, {
+        source: "rollback", sourceReleaseVersion: target.version,
+        reason: typeof body.reason === "string" ? body.reason.trim() : ""
+      });
+      addTemplateHistory(t, "rollback", nowIso, guard.member, {
+        version: release.version, releaseId: release.id,
+        sourceReleaseVersion: target.version,
+        reason: release.reason,
+        snapshot: JSON.parse(JSON.stringify(release.snapshot))
+      });
+      addTemplateLog({
+        action: "template_rollback", templateId: t.id,
+        scope: t.scope, resourceId: t.resourceId,
+        actor: guard.member, version: release.version,
+        detail: { releaseId: release.id,
+          sourceReleaseVersion: target.version, reason: release.reason }
+      });
+      permissionStore.templateRev++;
+      return { release: release, target: target, template: t };
+    }, function (failure, out) {
+      if (failure) {
+        apiError(res, failure.status || 500, failure.code, failure.message,
+          { draftVersion: failure.draftVersion, currentRev: failure.currentRev });
+        return;
+      }
+      sendJSON(res, 200, {
+        templateRev: permissionStore.templateRev,
+        release: permissionTemplateCore.releaseView(out.release),
+        targetReleaseVersion: out.target.version,
+        template: publicTemplateNow(out.template)
+      });
+    });
+  });
+}
+
+// POST /api/permissions/request-templates/:id/disable（If-Match: templateRev）
+// 停用是终态：停用后不能再发起新申请，也不能再修改；历史与已提交申请不受影响。
+function handleRequestTemplateDisable(req, res, urlObj, id) {
+  const expectedRev = req.headers["if-match"];
+  const t0 = findRequestTemplate(id);
+  if (!t0) { apiError(res, 404, "template_not_found", "申请模板不存在"); return; }
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body = {};
+    if (raw) {
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    }
+    const guard = guardTemplateOwner(req, res, urlObj, t0);
+    if (!guard) return;
+    if (t0.status === "disabled") {
       apiError(res, 409, "template_disabled",
-        "模板已停用（" + (t.disabledAt || "") +
+        "模板已停用（" + (t0.disabledAt || "") +
         "），停用是终态，不能重复停用",
-        { templateId: t.id, disabledAt: t.disabledAt });
+        { templateId: t0.id, disabledAt: t0.disabledAt });
       return;
     }
     const nowIso = new Date().toISOString();
     mutatePermissions(function () {
+      const conflict = assertTemplateExpectedRev(expectedRev);
+      if (conflict) throw Object.assign(new Error(conflict.message), conflict);
+      const t = findRequestTemplate(id);
+      if (!t) throw { status: 404, code: "template_not_found", message: "申请模板不存在" };
+      if (t.status === "disabled") throw { status: 409, code: "template_disabled", message: "模板已停用" };
+      if (permissionTemplateCore.pendingPlan(t)) {
+        throw { status: 409, code: "scheduled_publish_pending",
+          message: "计划发布尚未执行或取消，不能停用模板" };
+      }
+      const published = permissionTemplateCore.publishedContent(t);
       t.status = "disabled";
       t.disabledAt = nowIso;
       t.disabledBy = guard.member;
-      // 停用事件进版本历史（停用不产生新内容版本，snapshot 仍指向当前版本）
+      // 停用事件进版本历史（停用不产生新发布版本，snapshot 指向当前发布版本）
       t.history.push(Object.assign(
-        permissionTemplateCore.contentSnapshot(t, t.currentVersion),
+        JSON.parse(JSON.stringify(published)),
         { action: "disable", at: nowIso, by: guard.member,
           reason: typeof body.reason === "string" ? body.reason.trim() : "" }));
       addTemplateLog({
@@ -10247,6 +10942,7 @@ function handleRequestTemplateSubmit(req, res, urlObj, id) {
     const actor = currentMember(req, urlObj);
     const owner = resourceOwner(t.scope, t.resourceId) || SUPER_OWNER;
     const nowIso = new Date().toISOString();
+    const submittedPublished = permissionTemplateCore.publishedContent(t);
     const checked = permissionTemplateCore.validateTemplateSubmit(t, body, {
       now: nowIso, member: actor,
       templateVersion: body.templateVersion, owner: owner,
@@ -10274,7 +10970,8 @@ function handleRequestTemplateSubmit(req, res, urlObj, id) {
         ? body.templateVersion : null;
       mutatePermissions(function () {
         recordTemplateDenial({
-          scope: t.scope, resourceId: t.resourceId, required: t.role,
+          scope: t.scope, resourceId: t.resourceId,
+          required: submittedPublished ? submittedPublished.role : t.role,
           member: actor, templateId: t.id,
           templateVersion: loggedVersion,
           code: checked.code, message: checked.message,
@@ -10284,7 +10981,8 @@ function handleRequestTemplateSubmit(req, res, urlObj, id) {
         addTemplateLog({
           action: "template_submit_rejected", templateId: t.id,
           scope: t.scope, resourceId: t.resourceId,
-          actor: actor, version: t.currentVersion,
+          actor: actor,
+          version: submittedPublished ? submittedPublished.version : t.currentVersion,
           detail: { code: checked.code, message: checked.message,
             submittedVersion: loggedVersion }
         });
@@ -10323,7 +11021,7 @@ function handleRequestTemplateSubmit(req, res, urlObj, id) {
       addTemplateLog({
         action: "template_submit", templateId: t.id,
         scope: t.scope, resourceId: t.resourceId,
-        actor: actor, version: t.currentVersion,
+        actor: actor, version: r.templateVersion,
         requestId: r.id, member: actor, role: r.role, kind: kind,
         detail: { requestId: r.id, effectiveAt: r.effectiveAt,
           expireAt: r.expireAt, delegationId: r.delegationId }
@@ -10435,6 +11133,27 @@ function handlePermissions(req, res, tail, urlObj) {
   if (tail.length === 2 && tail[0] === "request-templates" &&
       req.method === "PATCH") {
     handleRequestTemplateUpdate(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 3 && tail[0] === "request-templates" &&
+      tail[2] === "publish" && req.method === "POST") {
+    handleRequestTemplatePublish(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 3 && tail[0] === "request-templates" &&
+      tail[2] === "draft" && req.method === "DELETE") {
+    handleRequestTemplateDraftDelete(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 3 && tail[0] === "request-templates" &&
+      tail[2] === "rollback" && req.method === "POST") {
+    handleRequestTemplateRollback(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 5 && tail[0] === "request-templates" &&
+      tail[2] === "publish-plans" && tail[4] === "cancel" &&
+      req.method === "POST") {
+    handleRequestTemplatePublishCancel(req, res, urlObj, tail[1], tail[3]);
     return;
   }
   if (tail.length === 3 && tail[0] === "request-templates" &&

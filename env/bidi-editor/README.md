@@ -57,16 +57,17 @@ A/B）；归档被篡改、缺失引用或校验摘要不一致时明确标出�
 批量审批与截止提醒写入独立审计，分组、处理结果、失败原因与历史只读状态随权限文件
 持久化，重启后仍可查询。
 
-在申请流之上再提供**申请模板与条件校验**：资源负责人可为某个资源保存可复用的
-申请模板，模板包含**角色、申请类型（授予/撤销）、默认有效期、说明与适用成员范围
-（全体或白名单）**，支持新建、修改（每次保存生成新版本，旧版本完整留存在版本历史）、
-停用与查看版本历史；**停用模板与旧版本都不能继续创建新申请**。普通成员只能看到和
-使用“启用且适用范围含自己”的模板。用模板发起申请时，系统按提交瞬间的角色配置、
-已有正式委派与待处理申请重新校验——角色已存在、时间窗冲突、职责冲突、重复申请、
-成员不在适用范围或模板版本已变化都**明确拒绝并返回原因**。成功创建的申请记录模板
-id、版本与该版本完整快照（溯源），**后续模板修改/停用不改变任何已提交申请**。
-模板集合有第四套独立版本号 `X-Permission-Template-Rev`；模板变更、使用记录与
-拒绝原因写入独立审计（拒绝同时进入统一 denials），随权限文件持久化，重启后一致。
+在申请流之上再提供**申请模板、草稿发布、计划发布与回滚**：资源负责人可为某个资源
+保存可复用的申请模板，模板包含**角色、申请类型（授予/撤销）、默认有效期、说明与适用
+成员范围（全体或白名单）**。创建即发布；之后编辑先生成未发布草稿，可立即发布或指定
+未来时间发布，发布产生只增的独立发布版本，回滚也会复制历史版本并形成新发布版本。
+普通成员和申请分组只能看到/使用最近一次已发布版本；成功申请固化发布版本快照，
+**后续发布、回滚或停用不改变任何已提交申请**。用模板发起申请时，系统按提交瞬间的
+角色配置、已有正式委派、待处理申请与已发布版本重新校验——角色已存在、时间窗冲突、
+职责冲突、重复申请、成员不在适用范围或发布版本已变化都**明确拒绝并返回原因**。
+计划发布可在执行前取消；调度器和重启恢复均按计划锁定的模板发布版本、草稿版本幂等
+校验。模板集合有第四套独立版本号 `X-Permission-Template-Rev`；草稿、发布、取消、
+回滚、使用记录与拒绝原因写入独立审计（拒绝同时进入统一 denials），随权限文件持久化。
 
 ## 双向编辑的需求与实现对照
 
@@ -1027,18 +1028,24 @@ revoked。落盘失败整体回滚（申请终态与正式委派要么同时生�
   `description`（≤500 字，对成员可见）、**适用成员范围** `memberScope`
   （`{mode:"all"}` 全体，或 `{mode:"members",members:[...]}` 白名单，
   ≤200 人、自动去重）。角色仍受资源矩阵约束（space/session 仅 view/review）。
-- **生命周期**：新建（内容版本 v1）→ 修改（每次实际变更生成新版本，无变化不推进
-  版本）→ 停用（终态；停用后不能再发起、不能再修改，需要时由负责人新建）。
-  全部 create/update/disable 事件进入只增不改的**版本历史**（内容事件带该版本完整
-  快照），可 `GET …/request-templates/:id/versions` 查询。
+- **生命周期（草稿、发布、回滚）**：新建即生成已发布 v1；之后负责人 `PATCH`
+  只保存为**未发布草稿**（有独立 draftVersion），普通成员与申请分组仍只读取最近一次
+  已发布版本。负责人可立即 `POST …/publish`（必须带 draftVersion）发布，也可给
+  `scheduledAt` 创建未来计划；到点调度器校验计划锁定的 templateVersion/draftVersion
+  后执行，重启后自动恢复扫描。负责人可取消尚未执行的计划；可从发布历史回滚，回滚会
+  **复制目标快照并产生新的发布版本**，不覆盖或删除历史。发布/回滚前均校验目标版本仍
+  存在且资源范围、角色、申请类型、默认有效期（授予）和适用成员范围完整。
+  create/update/publish/schedule_publish/cancel_publish/rollback/disable 事件进入版本历史；
+  releases 为只增发布记录，publishPlans 记录 pending/cancelled/succeeded/failed。
 - **第四套独立版本**：模板集合有单调版本号 `templateRev`（响应头
   `X-Permission-Template-Rev`），与申请集合 `requestRev`、分组集合 `groupRev`、
   正式委派集合 `rev` 四者独立；建/改/停用必须 `If-Match` 等于 templateRev
   （缺省 428、旧页面 409 `version_conflict`）。模板自身的内容版本 `currentVersion`
   与集合版本互不影响。
-- **普通成员可见性**：成员只能看到“**启用中且适用范围包含自己**”的模板；成员视图
-  裁剪掉版本历史与完整白名单（只给 `memberCount`，不泄露他人名单）；停用模板、
-  范围外模板对成员不可见，直接取详情 403；版本历史仅负责人/系统负责人可查。
+- **普通成员可见性**：成员只能看到“**启用中、最近已发布且适用范围包含自己**”的模板；
+  成员视图裁剪掉草稿、计划、发布历史、版本历史与完整白名单（只给 `memberCount`，不泄露
+  他人名单）；未发布草稿、停用模板、范围外模板对成员不可见，直接取详情 403；
+  发布/计划/回滚记录和完整版本历史仅负责人/系统负责人可查。
 - **用模板发起申请**：`POST …/request-templates/:id/submit`，必须携带
   `If-Match=requestRev`（与直接申请同一集合版本）与 **`templateVersion`（发起所
   依据的模板内容版本，必须是正整数且严格相等；`"1abc"` 等非整数 400
@@ -1064,8 +1071,7 @@ revoked。落盘失败整体回滚（申请终态与正式委派要么同时生�
   templateSnapshot`（该版本完整内容快照）；后续模板修改、停用**不回溯改变任何已
   提交申请**——既有申请仍按原窗口/原说明正常审批（模板停用不影响在途申请）。申请
   列表与详情对外返回模板来源字段。
-- **独立审计**：`template_create/template_update/template_disable/template_submit/
-  template_submit_rejected` 写入只增不改的 `templateLogs`，可
+- **独立审计**：`template_create/template_update/template_publish/template_publish_scheduled/template_publish_cancelled/template_scheduled_publish_failed/template_rollback/template_draft_discarded/template_disable/template_submit/template_submit_rejected` 写入只增不改的 `templateLogs`，可
   `GET /api/permissions/request-templates/logs` 按时间/资源查询；普通成员只看到
   自己发起或自己被拒的记录，管理事件仅负责人可见。模板、版本历史、申请溯源、审计
   与四套版本号全部随 `./data/permissions.json` 原子落盘，旧文件缺字段启动自动补齐，
@@ -1103,11 +1109,19 @@ GET    /api/permissions/request-templates[?scope=&resourceId=]
                                                 模板列表（负责人含历史；成员只见启用且适用范围含自己的模板）
 POST   /api/permissions/request-templates       创建 {name,scope,resourceId,role,kind,defaultDurationMs?,description?,memberScope?}（If-Match: templateRev）
 GET    /api/permissions/request-templates/:id   模板详情（负责人含版本历史/白名单；成员为裁剪视图）
-PATCH  /api/permissions/request-templates/:id   修改生成新版本 {name?,role?,kind?,defaultDurationMs?,description?,memberScope?}（If-Match: templateRev）
+PATCH  /api/permissions/request-templates/:id   保存未发布草稿 {name?,role?,kind?,defaultDurationMs?,description?,memberScope?}（If-Match: templateRev）
+POST   /api/permissions/request-templates/:id/publish
+                                                发布草稿 {draftVersion,scheduledAt?}（无 scheduledAt 立即发布；有则创建计划；If-Match）
+DELETE /api/permissions/request-templates/:id/draft
+                                                丢弃草稿（If-Match: templateRev）
+POST   /api/permissions/request-templates/:id/publish-plans/:planId/cancel
+                                                取消未执行计划 {templateVersion,draftVersion,reason?}（If-Match）
+POST   /api/permissions/request-templates/:id/rollback
+                                                回滚 {releaseVersion,reason?}，产生新发布版本（If-Match）
 POST   /api/permissions/request-templates/:id/disable
                                                 停用（终态；{reason?}，If-Match: templateRev）
 GET    /api/permissions/request-templates/:id/versions
-                                                版本历史（仅资源/系统负责人）
+                                                版本历史、发布记录、计划记录（仅资源/系统负责人）
 POST   /api/permissions/request-templates/:id/submit
                                                 用模板发起申请 {templateVersion（必填）,effectiveAt?,expireAt?,note?,delegationId?(revoke)}（If-Match: requestRev）
 GET    /api/permissions/request-templates/logs[?from=&to=&scope=&resourceId=]
@@ -1121,7 +1135,8 @@ GET    /api/permissions/request-templates/logs[?from=&to=&scope=&resourceId=]
 `not_in_group`/`duplicate_in_batch`/`batch_conflict`（响应体 `results[]`
 逐条给出失败原因与 currentVersion）。处理截止提醒间隔
 `PERMISSION_GROUP_REMINDER_INTERVAL_MS`（默认 60s）、提前量
-`PERMISSION_GROUP_REMINDER_APPROACHING_MS`（默认 24h）。
+`PERMISSION_GROUP_REMINDER_APPROACHING_MS`（默认 24h）；计划模板发布扫描间隔
+`PERMISSION_TEMPLATE_PUBLISH_INTERVAL_MS`（默认 1s），重启后立即补扫到点计划。
 
 错误码补充：400 `invalid_kind`/`missing_delegation`；403 `self_approval`/
 `request_for_other_member`；404 `request_not_found`；
