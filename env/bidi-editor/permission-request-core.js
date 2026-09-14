@@ -620,8 +620,11 @@
     });
   }
 
-  /* 申请对外视图（附带按当前时间实时计算的 displayState） */
-  function publicRequest(r, nowIso) {
+  /* 申请对外视图（附带按当前时间实时计算的 displayState）
+   * groupInfo 可选：{name, deadlineState, pendingCount}，由服务端按分组实时组装，
+   * 使申请列表可直接显示“所属分组、截止状态、待处理数量”。
+   */
+  function publicRequest(r, nowIso, groupInfo) {
     var nowMs = Date.parse(nowIso || new Date().toISOString());
     var out = {
       id: r.id,
@@ -644,6 +647,12 @@
       delegationId: r.delegationId || null,
       effectiveAt: r.effectiveAt || null,
       expireAt: r.expireAt || null,
+      // 所属申请分组（未分组为 null）
+      groupId: r.groupId || null,
+      groupName: groupInfo && groupInfo.name ? groupInfo.name : null,
+      // 所属分组的处理截止状态（none/pending/overdue）与组内待处理数量
+      groupDeadlineState: groupInfo ? groupInfo.deadlineState : null,
+      groupPendingCount: groupInfo ? groupInfo.pendingCount : null,
       // 正式委派关联：批准授予时生成的委派 id
       generatedDelegationId: r.generatedDelegationId || null
     };

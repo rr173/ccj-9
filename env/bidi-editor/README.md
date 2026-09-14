@@ -48,6 +48,15 @@ A/B）；归档被篡改、缺失引用或校验摘要不一致时明确标出�
 即将失效、已批准撤销与待处理申请，预览纯只读、绝不修改正式权限；申请状态、
 处理人/时间/拒绝原因与预览依据时间点随权限文件持久化，服务重启后仍可查询。
 
+在申请流之上再提供**申请分组与批量处理**：负责人可按资源/申请类型/成员/状态把
+申请加入分组（分组锁定单一资源），设置分组名称、处理截止时间与备注；申请列表显示
+所属分组、截止状态与组内待处理数量，普通成员只能看到自己申请所在分组的摘要。
+负责人可对组内待处理申请逐项批准/拒绝，也可一次提交批量决定——批量同时校验申请
+集合版本与每条申请版本，任一条过期、已被处理或存在角色冲突时**整批不改变权限**
+并逐条返回失败原因。分组集合另有独立版本号 `X-Permission-Group-Rev`；分组变更、
+批量审批与截止提醒写入独立审计，分组、处理结果、失败原因与历史只读状态随权限文件
+持久化，重启后仍可查询。
+
 ## 双向编辑的需求与实现对照
 
 | 需求 | 实现方式 |
@@ -958,6 +967,45 @@ revoked。落盘失败整体回滚（申请终态与正式委派要么同时生�
 与处理记录全部恢复。已终态申请（approved/rejected/expired）永久只读，
 不能再次审批；正式委派保留 `grantedByRequestId` 等审计关联，不被改写。
 
+### 申请分组与批量处理
+
+负责人可把申请按**资源 / 申请类型 / 成员 / 状态**归组：分组锁定到单一资源
+（scope+resourceId，不能跨资源归组），可设置**分组名称、处理截止时间 deadline、
+备注**。申请记录冗余 `groupId`（一条申请至多属于一个分组，跨组移动需显式
+`reassign`），申请列表对外返回所属分组 `groupId/groupName`、分组处理截止状态
+`groupDeadlineState`（none 未设 / pending 未到 / overdue 已过）与组内待处理数量
+`groupPendingCount`。
+
+- **第三套独立版本**：分组集合有单调版本号 `groupRev`（响应头
+  `X-Permission-Group-Rev`），与申请集合 `requestRev`、正式委派集合 `rev`
+  三者独立；建/改/删组、加/移成员必须 `If-Match` 等于 groupRev。加入/移出成员、
+  删除分组同时推进 requestRev（申请列表的分组字段需要刷新）。
+- **逐项或批量**：负责人可对同一分组内的待处理申请逐项批准/拒绝，也可一次提交
+  批量决定 `POST …/request-groups/:id/batch-decide`。批量接口校验
+  `If-Match=requestRev`（申请集合版本）**且每条**携带申请 `version`
+  （X-Request-Version 等价的 item.version，严格相等）。
+- **整批原子**：任一条申请过期、已被处理（非 pending）、版本不符、不属于本组、
+  批内重复、负责人自审、拒绝缺原因，或批准瞬间复核出重复委派/职责角色冲突
+  （含**同一批批准授予项之间**的重复/approve-execute 窗口冲突），**整批不改变
+  任何权限**，响应对每条返回 `results[].ok/code/message/currentVersion`；失败整批
+  仍写独立审计 `batch_decide_failed` 与逐条拒绝留痕（重启后失败原因可查）。
+  全部通过时在同一内存修改 + 单次原子落盘事务内逐条落库，整批只推进一次
+  requestRev；批准授予即时生成正式委派、批准撤销即时撤销，下一个业务请求即生效。
+- **独立审计**：分组变更（`group_create/group_update/group_delete/
+  group_requests_add/group_requests_remove`）、批量审批（`batch_decide` /
+  `batch_decide_failed`）、截止提醒（`deadline_reminder`：approaching 临近 /
+  overdue 逾期）写入只增不改的 `groupLogs`，与申请流审计、委派操作审计相互独立，
+  可 `GET /api/permissions/request-groups/logs` 按时间/资源查询。
+- **截止提醒**：定时扫描（间隔 `PERMISSION_GROUP_REMINDER_INTERVAL_MS`，默认
+  60s；提前量 `PERMISSION_GROUP_REMINDER_APPROACHING_MS`，默认 24h；重启立即补
+  扫一次）。仅对仍有 pending 申请的分组，在进入临近窗口或越过处理截止时各产生一条
+  提醒，幂等标记随文件持久化，**重启后不重复提醒**。提醒是纯审计事件，不推进任何
+  对外版本，也不改变任何权限。
+- **普通成员可见性**：普通成员只能看到“自己申请所在分组”的摘要（组名/资源/截止/
+  `myPendingCount`/`myTotalCount`，不含他人工作量）；分组详情只返回本人那几条申请；
+  与本人无关的分组 403；分组的管理、批量审批、成员加移、删除与截止提醒审计仅资源
+  负责人/系统负责人可见。删除分组只解除申请归属，申请本身与正式权限均不变。
+
 ### 权限变更 HTTP API 摘要
 
 ```
@@ -970,7 +1018,31 @@ GET    /api/permissions/requests/logs[?from=&to=&scope=&resourceId=&member=]
                                                 申请流审计（submit/approve_*/reject/expire，时间倒序）
 GET    /api/permissions/preview?scope=&resourceId=&member=&at=<ISO>
                                                 指定未来时刻的有效角色与四组预览（纯只读）
+
+GET    /api/permissions/request-groups[?scope=&resourceId=]
+                                                分组列表（负责人见详情计数；普通成员只见本人所在组摘要）
+POST   /api/permissions/request-groups          创建 {name,scope,resourceId,deadline?,note?}（If-Match: groupRev）
+GET    /api/permissions/request-groups/:id      分组详情 + 组内申请（普通成员只见本人申请）
+PATCH  /api/permissions/request-groups/:id      改名/处理截止/备注（If-Match: groupRev）
+DELETE /api/permissions/request-groups/:id      删除分组（解除归属，申请与权限不变；If-Match: groupRev）
+POST   /api/permissions/request-groups/:id/requests
+                                                加入申请 {requestIds,reassign?}（If-Match: groupRev；原子）
+POST   /api/permissions/request-groups/:id/requests/remove
+                                                移出申请 {requestIds}（If-Match: groupRev）
+POST   /api/permissions/request-groups/:id/batch-decide
+                                                批量决定 {items:[{id,version,decision,reason?}]}（If-Match: requestRev；整批原子）
+GET    /api/permissions/request-groups/logs[?from=&to=&scope=&resourceId=]
+                                                分组独立审计（变更/批量/截止提醒；普通成员只见本人相关，提醒仅负责人）
 ```
+
+分组集合版本号为响应头 `X-Permission-Group-Rev`；错误码补充：400
+`missing_group_name`/`name_too_long`/`invalid_deadline`/`empty_batch`/
+`empty_members`/`batch_invalid`；404 `group_not_found`；409
+`group_members_conflict`/`request_already_grouped`/`request_scope_mismatch`/
+`not_in_group`/`duplicate_in_batch`/`batch_conflict`（响应体 `results[]`
+逐条给出失败原因与 currentVersion）。处理截止提醒间隔
+`PERMISSION_GROUP_REMINDER_INTERVAL_MS`（默认 60s）、提前量
+`PERMISSION_GROUP_REMINDER_APPROACHING_MS`（默认 24h）。
 
 错误码补充：400 `invalid_kind`/`missing_delegation`；403 `self_approval`/
 `request_for_other_member`；404 `request_not_found`；
@@ -1005,13 +1077,19 @@ node server.js          # http://localhost:8080
 （差异结果/纠错批次/审批记录/纠错归档/失败留痕）独立写到
 `./data/replay-reconcile.json`（`REPLAY_RECONCILE_FILE` 覆盖，集合版本号为
 响应头 `X-Reconcile-Rev`，两阶段写盘失败重启自动对账清理孤儿纠错空间），
-**角色委派与操作权限**（委派/有效期/撤销/拒绝原因/操作记录，以及权限变更申请的
-申请记录、独立 requestRev、逐条 version、审批处理记录与申请流审计）独立写到
-`./data/permissions.json`（`PERMISSIONS_FILE` 覆盖，正式委派集合版本号为响应头
-`X-Permission-Rev`，申请集合独立版本号为 `X-Permission-Request-Rev`，
+**角色委派与操作权限**（委派/有效期/撤销/拒绝原因/操作记录，权限变更申请的
+申请记录、独立 requestRev、逐条 version、审批处理记录与申请流审计，以及申请分组的
+分组记录、独立 groupRev、成员归属、批量决定逐条结果/失败原因、分组变更/批量/截止
+提醒独立审计）独立写到 `./data/permissions.json`（`PERMISSIONS_FILE` 覆盖，
+正式委派集合版本号为响应头 `X-Permission-Rev`，申请集合独立版本号为
+`X-Permission-Request-Rev`，申请分组集合独立版本号为 `X-Permission-Group-Rev`，
 授予/撤销/申请/审批必须 If-Match 严格相等、审批还须 X-Request-Version 等于
-申请 version，重启后有效期、申请状态与截止、拒绝原因与操作记录全部恢复；
-申请审批截止时长用 `PERMISSION_REQUEST_TTL_MS` 调整，默认 72 小时），
+申请 version，分组管理须 If-Match 等于 groupRev、批量审批须 If-Match 等于
+requestRev 且每条携带申请 version，重启后有效期、申请状态与截止、分组归属、
+批量处理结果与失败原因、操作记录全部恢复；申请审批截止时长用
+`PERMISSION_REQUEST_TTL_MS` 调整（默认 72 小时），分组截止提醒扫描间隔用
+`PERMISSION_GROUP_REMINDER_INTERVAL_MS`（默认 60 秒）、提醒提前量用
+`PERMISSION_GROUP_REMINDER_APPROACHING_MS`（默认 24 小时）），
 导入请求体上限可用 `REPLAY_BODY_LIMIT_BYTES` 调整（默认 32MB）；
 定时轮询间隔用 `DECISION_SCHEDULER_INTERVAL_MS` 调整（默认 1000 毫秒）。
 
@@ -1049,6 +1127,9 @@ node --test test/
 - `test/permissions-api.test.js`：真实起服务走完线上任务→导入→意见→会话→两个归档→差异→纠错批次，覆盖非负责人配置 403 并留拒绝记录、授予校验（缺失效时间/不存在资源/space 配 approve/缺 If-Match）、授予后陌生人立即 403 且列表不可见、view 角色只读不能写、空间 review 角色继承到会话（非参与人仍 403 not_participant、无角色参与人 403 unauthorized）、会话级单独委派后可提交结论、角色未生效/已过期拒绝、重复委派 409、旧 rev 并发提交 409 不覆盖新配置、撤销后立即失权/重复撤销 409、批次 approve+execute 冲突、负责人不能被授 approve、批次列表/详情可见性过滤、审批角色门槛、负责人自审 403、审批不足执行整批 failed 留痕、approve 角色不能执行、execute 执行成功且历史保留原执行人、操作记录/拒绝原因查询、重启后委派/有效期/撤销/拒绝原因/操作记录恢复且规则继续生效、历史结论保留原操作人与时间、重启后旧 rev 仍冲突
 - `test/permission-request-core.test.js`：申请/审批纯逻辑——授予申请（重复申请/已过期申请不阻挡/与正式委派重复/职责冲突窗口/负责人自审/非法输入）、撤销申请（非本人/角色不匹配/已撤销/已过期/重复撤销申请）、审批（缺版本/旧版本/非 pending/过期/非负责人/自审/非法决定/拒绝必填原因/批准时复核重复委派与撤销目标状态）、生效预览（即将生效/即将失效/已批准撤销/待处理不计入角色/非法时刻）
 - `test/permission-requests-api.test.js`：真实起服务走完空间→会话→两个归档→差异→纠错批次的准备链路后，覆盖跨资源申请（space/session/batch）、待处理申请不改变授权、重复申请/替人申请/越权查看明细拒绝、拒绝必填原因且拒绝不改变权限（正式委派 rev 不推进）、批准后下一个请求即时生效、非负责人审批 403、负责人审批自己的申请 403 self_approval、并发审批同一申请只成功一次（败者 version_conflict/request_version_conflict，串行旧 X-Request-Version 单独 409）、过期边界（截止后审批落 expired 终态且权限不变/终态只读）、过期后重新申请并批准、撤销申请批准即时失权/重复撤销申请拒绝、撤销后重新申请、未来生效委派 activating 预览、待处理申请只在 pending 组、即将失效与已批准撤销分组、预览不推 rev、普通成员不能预览他人/非法 at 400、申请审计链动作齐全且普通成员只见自己相关记录、旧 requestRev 提交 409、重启后申请状态/版本/拒绝原因/正式委派 rev/预览依据全部恢复、终态申请只读
+- `test/permission-request-group-core.test.js`：分组创建/更新校验（名称/截止未来/备注/数量上限/更新允许改过去标记逾期）、截止状态 none/pending/overdue、分组摘要按类型/状态/成员计数与待处理数量、截止提醒确定性与幂等（approaching/overdue、无 pending 不提醒、已提醒不重复、过截止补发 overdue）、批量决定原子前置校验（集合版本/批内重复/缺 id/不属于本组/每条版本/已处理/过期/自审/非负责人/拒绝缺原因、批准瞬间与正式委派重复、批内同角色重复与 approve-execute 窗口冲突整批拒绝、窗口错开或全部合法整批通过）
+- `test/permission-request-groups-api.test.js`：真实起服务覆盖仅资源负责人可建/改/删组与加移成员、独立 groupRev 旧版本 409、普通成员只见本人所在分组摘要且组详情只见本人申请、申请列表携带分组/截止状态/待处理数量、加入成员原子（跨资源/已在别组整批拒绝、reassign 移动）、批量决定双重版本校验（requestRev+每条 version）、自审/拒绝缺原因/非本组条目整批拒绝逐条返回、整批一次事务只推一次 requestRev、批准即时生效下一个请求放行、历史终态只读、批内批准瞬间冲突整批不改权限与版本、分组变更与批量成功/失败写独立 groupLogs、截止提醒经重启扫描产生 overdue 且重复扫描幂等、重启后分组/归属/批量结果/失败审计/待处理数量恢复、删除分组解除归属但申请与权限不变
+
 
 ## Docker 部署
 
@@ -1087,7 +1168,8 @@ replay-reconcile-core.js 归档差异与纠错对账中心纯逻辑（浏览器�
 replay-reconcile.js 归档差异与纠错对账中心 UI：新建差异比较（选两个归档）、差异详情（六维分组、A/B 对照、损坏原因展示）、创建纠错批次（逐差异选择保留 A/采用 B/人工复核、负责人/截止/审批人/基线）、批次提交/记名审批通过驳回/执行、失败原因与审批记录、纠错归档详情（校验摘要/裁决/新空间溯源）/下载、操作记录
 permission-core.js 角色委派纯逻辑（浏览器与 Node 共用）：资源×角色矩阵、授予校验（生效/失效时间、重复委派、approve/execute 职责冲突、负责人自审）、实时角色状态（active/pending/expired/revoked）、层级包含（高角色隐含查看）、授权判定（未授权/角色过期/角色未生效）、撤销校验
 permission-request-core.js 权限变更申请与生效预览纯逻辑（浏览器与 Node 共用）：授予/撤销申请校验（重复申请、与正式委派及待处理申请的时间窗冲突、职责冲突、负责人自审、只能申请撤销本人委派）、审批校验（X-Request-Version 旧版本拒绝、过期边界、负责人自审 self_approval、拒绝必填原因、批准瞬间重新校验）、未来时刻生效预览（即将生效/即将失效/已批准撤销/待处理申请四分组，pending 不臆测为角色）
-permissions.js   角色委派与操作权限 UI：当前成员身份切换（X-Member，持久化）、授予四类角色（成员/生效/失效时间/原因）、委派列表与撤销、当前生效角色查询、授予/撤销操作记录与拒绝原因查看、权限变更申请提交（授予/撤销）、申请清单逐项批准/拒绝（双重版本号）、申请审计记录、指定未来时刻的生效预览（四分组）
+permission-request-group-core.js 申请分组与批量处理纯逻辑（浏览器与 Node 共用）：分组创建/更新校验（名称/处理截止/备注/数量上限）、处理截止状态与分组摘要（按类型/成员/状态计数、待处理数量）、截止提醒确定性计算（approaching/overdue、幂等）、批量决定整批原子前置校验（申请集合版本 + 每条申请 version + 非 pending/过期/自审/非本组/批内重复/拒绝缺原因，以及批准瞬间对正式委派、其它待处理申请与批内批准授予项的成对重复/职责冲突复核，任一条失败整批拒绝并逐条返回原因）
+permissions.js   角色委派与操作权限 UI：当前成员身份切换（X-Member，持久化）、授予四类角色（成员/生效/失效时间/原因）、委派列表与撤销、当前生效角色查询、授予/撤销操作记录与拒绝原因查看、权限变更申请提交（授予/撤销）、申请清单逐项批准/拒绝（双重版本号）、申请审计记录、指定未来时刻的生效预览（四分组）、申请分组（命名/处理截止/备注/加移成员）、组内逐项或整批批量批准/拒绝（逐条展示失败原因）、分组独立审计与截止状态展示（普通成员只见本人所在分组摘要）
 server.js         零依赖服务：静态文件 + 快照、批注、审阅批次、审阅决策、执行队列（依赖/审批门控）JSON API（四集合乐观锁、原子落盘、定时执行调度器与门控对账）+ 执行回放（审计包只读导出、全量校验后导入独立回放空间、失败记录、筛选条件与校验结果持久化）+ 历史证据复核（空间 rev 与意见 version 双重乐观锁、引用存在性校验、终态保护、状态记录、清单纯只读导出、随回放空间原子持久化）+ 复核会话（创建锁定意见版本与引用摘要、空间 rev 与会话 version 双重乐观锁、结论冲突标记拒绝覆盖、过期拒绝、操作记录、报告纯只读导出、随回放空间原子持久化）+ 复核会话归档中心（独立存储与 X-Archive-Rev；会话状态与空间版本校验、内容寻址幂等/版本冲突、归档完整性校验、先预览后两阶段事务恢复到新回放空间、归档/预览/恢复/筛选操作记录、崩溃对账、重启恢复）+ 归档差异与纠错对账中心（独立存储与 X-Reconcile-Rev；两归档完整性预检、确定性六维差异、批次双重乐观锁、提交/执行前归档未替换与差异指纹重校验、记名审批轮次、审批不足/缺引用/目标标识冲突整批 failed 留痕、两阶段事务生成只读纠错归档与新回放空间、孤儿纠错空间崩溃对账、重启恢复）+ 角色委派与操作权限（独立存储与 X-Permission-Rev；space/session/batch × view/review/approve/execute 角色矩阵、生效/失效时间实时判定、重复委派/职责冲突/负责人自审拒绝、X-Member 身份、会话继承空间角色、审批/执行/查看接口角色守卫、拒绝原因与操作记录持久化、重启恢复）
 test/             node:test 单元与集成测试
 Dockerfile        node:20-alpine，EXPOSE 8080，数据卷 /app/data

@@ -98,6 +98,12 @@
     return { close: close, body: body, foot: foot, overlay: overlay };
   }
 
+  // 关闭最上层弹窗（批量详情内逐项处理后重开前先关掉旧弹窗，避免叠加）
+  function closeTopModal() {
+    var overlays = document.querySelectorAll(".modal-overlay");
+    if (overlays.length) overlays[overlays.length - 1].remove();
+  }
+
   // 当前成员身份（持久化到 localStorage）；缺省“负责人”
   function currentIdentity() { return window.PermissionIdentity.get(); }
   function setIdentity(name) { localStorage.setItem(IDENTITY_KEY, name); }
@@ -118,6 +124,7 @@
     return fetch(url, init).then(function (res) {
       var permRev = res.headers.get("X-Permission-Rev");
       var reqRev = res.headers.get("X-Permission-Request-Rev");
+      var grpRev = res.headers.get("X-Permission-Group-Rev");
       return res.text().then(function (text) {
         var data = null;
         try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
@@ -128,7 +135,7 @@
           err.data = data;
           throw err;
         }
-        return { data: data, permRev: permRev, reqRev: reqRev };
+        return { data: data, permRev: permRev, reqRev: reqRev, grpRev: grpRev };
       });
     });
   }
@@ -142,9 +149,11 @@
   var state = {
     rev: "0",
     requestRev: "0",
+    groupRev: "0",
     filter: { scope: "", resourceId: "", member: "" },
     delegations: [],
-    requests: []
+    requests: [],
+    groups: []
   };
 
   /* ================= 主面板 ================= */
@@ -434,6 +443,67 @@
     reqListSection.appendChild(reqLogsBtn);
     box.appendChild(reqListSection);
 
+    /* ---- ⑤b 申请分组与批量处理（负责人按资源/类型/成员/状态归组、整批审批） ---- */
+    var groupSection = el("div", "replay-section");
+    var groupHead = el("div", "replay-section-head");
+    groupHead.appendChild(el("h4", null,
+      "⑤b 申请分组与批量处理（命名 / 处理截止 / 备注；整批原子，任一条冲突全批不改）"));
+    groupHead.appendChild(button("刷新分组"));
+    groupHead.lastChild.addEventListener("click", loadGroups);
+    groupSection.appendChild(groupHead);
+
+    var gCreateBar = el("div", "perm-form");
+    var gcScope = el("select");
+    [["space", "回放空间"], ["session", "复核会话"], ["batch", "纠错批次"]]
+      .forEach(function (p) { gcScope.appendChild(new Option(p[1], p[0])); });
+    var gcResource = el("input");
+    gcResource.placeholder = "资源 id（分组锁定单一资源）";
+    var gcName = el("input");
+    gcName.placeholder = "分组名称（必填，≤100 字）";
+    var gcDeadline = el("input");
+    gcDeadline.type = "datetime-local"; gcDeadline.step = "1";
+    gcDeadline.title = "处理截止时间（可选）；到点/逾期写截止提醒审计";
+    var gcNote = el("input");
+    gcNote.placeholder = "分组备注（可选，≤500 字）";
+    function gcField(label, node) {
+      var wrap = el("label", "perm-field");
+      wrap.appendChild(el("span", null, label));
+      wrap.appendChild(node);
+      return wrap;
+    }
+    gCreateBar.appendChild(gcField("资源", gcScope));
+    gCreateBar.appendChild(gcField("资源 id", gcResource));
+    gCreateBar.appendChild(gcField("名称", gcName));
+    gCreateBar.appendChild(gcField("处理截止", gcDeadline));
+    gCreateBar.appendChild(gcField("备注", gcNote));
+    gCreateBar.appendChild(button("新建分组", "primary", function () {
+      var body = {
+        scope: gcScope.value,
+        resourceId: gcResource.value.trim(),
+        name: gcName.value.trim(),
+        note: gcNote.value.trim()
+      };
+      if (gcDeadline.value) body.deadline = new Date(gcDeadline.value).toISOString();
+      api("POST", "/api/permissions/request-groups",
+        { body: body, ifMatch: state.groupRev }).then(function (r) {
+          state.groupRev = r.grpRev;
+          toast("已创建分组：" + body.name);
+          gcName.value = ""; gcNote.value = ""; gcDeadline.value = "";
+          loadGroups();
+        }).catch(handleGroupError);
+    }));
+    groupSection.appendChild(gCreateBar);
+
+    var groupList = el("div", "perm-list");
+    groupSection.appendChild(groupList);
+    var groupLogsBtn = button("分组独立审计记录");
+    groupLogsBtn.addEventListener("click", function () {
+      openGroupLogs("分组审计（分组变更 / 批量审批 / 截止提醒）",
+        "/api/permissions/request-groups/logs");
+    });
+    groupSection.appendChild(groupLogsBtn);
+    box.appendChild(groupSection);
+
     /* ---- ⑥ 未来时刻生效预览（纯只读，不修改正式权限） ---- */
     var previewSection = el("div", "replay-section");
     previewSection.appendChild(el("h4", null,
@@ -502,6 +572,7 @@
       who.textContent = "（身份：" + currentIdentity() + "）";
       loadList();
       loadRequests();
+      loadGroups();
     }
 
     function loadList() {
@@ -610,6 +681,11 @@
           "（v" + q.version + "）"));
         card.appendChild(el("div", null, "申请人：" + q.member));
         card.appendChild(el("div", null, "资源：" + q.resourceId));
+        card.appendChild(el("div", null,
+          "所属分组：" + (q.groupName
+            ? q.groupName + "（" + groupDeadlineLabel(q.groupDeadlineState) +
+              " · 待处理 " + (q.groupPendingCount == null ? "—" : q.groupPendingCount) + "）"
+            : "未分组")));
         if (q.kind === "grant") {
           card.appendChild(el("div", null,
             "期望有效期：" + formatTime(q.effectiveAt) + " 至 " +
@@ -674,6 +750,276 @@
         }).catch(handleRequestError);
     }
 
+    /* ---------------- 申请分组 ---------------- */
+
+    function loadGroups() {
+      api("GET", "/api/permissions/request-groups").then(function (r) {
+        state.groupRev = r.grpRev;
+        state.groups = r.data.groups || [];
+        renderGroups(groupList, state.groups);
+      }).catch(function (e) {
+        groupList.innerHTML = "";
+        groupList.appendChild(el("div", "snap-empty",
+          "分组加载失败：" + e.message));
+      });
+    }
+
+    function isGroupOwnerView(g) {
+      // 负责人视图含 pendingCount；普通成员摘要只含 myPendingCount
+      return g.pendingCount !== undefined;
+    }
+
+    function renderGroups(container, groups) {
+      container.innerHTML = "";
+      if (!groups.length) {
+        container.appendChild(el("div", "snap-empty",
+          "暂无分组。负责人可新建分组并按资源/类型/成员/状态归组。"));
+        return;
+      }
+      groups.forEach(function (g) {
+        var card = el("div", "perm-card perm-group-card perm-dl-" +
+          (g.deadlineState || "none"));
+        var head = el("div", "perm-card-head");
+        head.appendChild(el("span", "perm-role",
+          "分组 · " + g.name + " · " + (SCOPE_LABELS[g.scope] || g.scope)));
+        head.appendChild(el("span",
+          "perm-badge perm-badge-group perm-dl-badge-" +
+          (g.deadlineState || "none"),
+          groupDeadlineLabel(g.deadlineState)));
+        card.appendChild(head);
+        card.appendChild(el("div", null, "资源：" + g.resourceId + "（v" + g.version + "）"));
+        card.appendChild(el("div", null,
+          "处理截止：" + (g.deadline ? formatTime(g.deadline) : "未设置")));
+        if (g.note) card.appendChild(el("div", "snap-note", "备注：" + g.note));
+        if (isGroupOwnerView(g)) {
+          card.appendChild(el("div", null,
+            "申请 " + g.totalCount + " 条 · 待处理 " + g.pendingCount +
+            "（授予 " + g.grantCount + " / 撤销 " + g.revokeCount + "）"));
+          var acts = el("div", "perm-rq-actions");
+          acts.appendChild(button("打开/批量处理", "primary", function () {
+            openGroupDetail(g.id);
+          }));
+          acts.appendChild(button("改名/截止/备注", null, function () {
+            editGroup(g.id);
+          }));
+          acts.appendChild(button("删除分组", "danger", function () {
+            deleteGroup(g.id);
+          }));
+          card.appendChild(acts);
+        } else {
+          // 普通成员摘要：只显示本人相关数量
+          card.appendChild(el("div", null,
+            "我的申请 " + (g.myTotalCount == null ? "—" : g.myTotalCount) +
+            " 条 · 我的待处理 " + (g.myPendingCount == null ? "—" : g.myPendingCount)));
+          card.appendChild(el("div", "snap-note",
+            "普通成员仅可见本人申请所在分组的摘要"));
+        }
+        container.appendChild(card);
+      });
+    }
+
+    function editGroup(id) {
+      var g = state.groups.find(function (x) { return x.id === id; });
+      if (!g) return;
+      var box = el("div", "perm-form");
+      var n = el("input"); n.value = g.name;
+      var d = el("input"); d.type = "datetime-local"; d.step = "1";
+      if (g.deadline) d.value = dtLocal(new Date(g.deadline));
+      var note = el("input"); note.value = g.note || "";
+      function f(label, node) {
+        var wrap = el("label", "perm-field");
+        wrap.appendChild(el("span", null, label)); wrap.appendChild(node);
+        return wrap;
+      }
+      box.appendChild(f("名称", n));
+      box.appendChild(f("处理截止（留空=取消截止；可改成过去以标记逾期）", d));
+      box.appendChild(f("备注", note));
+      var m = openModal("修改分组：" + g.name, box, { buttons: [] });
+      var save = button("保存", "primary", function () {
+        var body = { name: n.value.trim(), note: note.value.trim(),
+          deadline: d.value ? new Date(d.value).toISOString() : null };
+        api("PATCH", "/api/permissions/request-groups/" + id,
+          { body: body, ifMatch: state.groupRev }).then(function (r) {
+            state.groupRev = r.grpRev;
+            toast("分组已更新");
+            m.close(); loadGroups();
+          }).catch(function (e) { handleGroupError(e); });
+      });
+      var cancel = button("取消", null, function () { m.close(); });
+      m.foot.appendChild(save); m.foot.appendChild(cancel);
+    }
+
+    function deleteGroup(id) {
+      var g = state.groups.find(function (x) { return x.id === id; });
+      if (!g) return;
+      if (!window.confirm("确认删除分组 “" + g.name +
+          "”？分组内申请将解除归属（申请与权限不变）。")) return;
+      api("DELETE", "/api/permissions/request-groups/" + id,
+        { ifMatch: state.groupRev }).then(function (r) {
+          state.groupRev = r.grpRev;
+          state.requestRev = r.reqRev || state.requestRev;
+          toast("分组已删除，解除归属 " + r.data.detachedRequests + " 条申请");
+          loadGroups(); loadRequests();
+        }).catch(handleGroupError);
+    }
+
+    // 组详情：列出组内申请，支持勾选加入/移除与整批批量决定
+    function openGroupDetail(id) {
+      api("GET", "/api/permissions/request-groups/" + id).then(function (r) {
+        state.groupRev = r.grpRev || state.groupRev;
+        state.requestRev = r.reqRev || state.requestRev;
+        renderGroupDetail(id, r.data);
+      }).catch(handleGroupError);
+    }
+
+    function renderGroupDetail(id, data) {
+      var g = data.group;
+      var box = el("div", "perm-group-detail");
+      var info = el("div", "snap-note",
+        (SCOPE_LABELS[g.scope] || g.scope) + " " + g.resourceId +
+        " · 处理截止 " + (g.deadline ? formatTime(g.deadline) : "未设置") +
+        " · 待处理 " + g.pendingCount + " 条 · 集合 requestRev " +
+        state.requestRev + "（批量时双重校验集合版本与每条版本）");
+      box.appendChild(info);
+
+      // 加入申请：粘贴/勾选当前筛选中的 pending 申请 id
+      var addBar = el("div", "perm-filter-bar");
+      var addIds = el("input");
+      addIds.placeholder = "要加入本组的申请 id（逗号分隔，按资源/类型/成员/状态选取）";
+      addIds.style.flex = "1";
+      var reassignChk = el("input"); reassignChk.type = "checkbox";
+      var rl = el("label", null, " 允许移动已在别组的申请 ");
+      rl.appendChild(reassignChk);
+      addBar.appendChild(addIds); addBar.appendChild(rl);
+      addBar.appendChild(button("加入分组", null, function () {
+        var ids = addIds.value.split(/[,，\s]+/).filter(Boolean);
+        if (!ids.length) { toast("请填写至少一个申请 id", "error"); return; }
+        api("POST", "/api/permissions/request-groups/" + id + "/requests",
+          { body: { requestIds: ids, reassign: reassignChk.checked },
+            ifMatch: state.groupRev }).then(function (r) {
+            state.groupRev = r.grpRev;
+            state.requestRev = r.reqRev || state.requestRev;
+            toast("已加入 " + r.data.added.length + " 条申请");
+            m.close(); openGroupDetail(id); loadRequests(); loadGroups();
+          }).catch(handleGroupError);
+      }));
+      box.appendChild(addBar);
+
+      var checks = {};
+      var listBox = el("div", "perm-list");
+      data.requests.forEach(function (q) {
+        var card = el("div", "perm-card perm-rq-" + q.displayState);
+        var line = el("div");
+        var cb = el("input"); cb.type = "checkbox"; cb.checked = q.displayState === "pending";
+        checks[q.id] = { cb: cb, q: q };
+        line.appendChild(cb);
+        line.appendChild(el("span", null,
+          " " + (q.kind === "grant" ? "授予" : "撤销") + "申请 " + q.id +
+          "（v" + q.version + "）· " + (ROLE_LABELS[q.role] || q.role) +
+          " · " + q.member + " · " + requestStatusLabel(q.displayState)));
+        card.appendChild(line);
+        card.appendChild(el("div", "snap-note",
+          "审批截止 " + formatTime(q.expiresAt) +
+          (q.decisionReason ? "；处理原因：" + q.decisionReason : "")));
+        // 逐项批准/拒绝（同组内逐条处理）
+        if (q.displayState === "pending") {
+          var one = el("div", "perm-rq-actions");
+          one.appendChild(button("逐项批准", "primary", function () {
+            var reason = window.prompt("批准原因（可留空）", "");
+            if (reason === null) return;
+            decideInGroup(id, q, "approve", reason);
+          }));
+          one.appendChild(button("逐项拒绝", "danger", function () {
+            var reason = window.prompt("拒绝原因（必填，申请人可见）", "");
+            if (reason === null) return;
+            if (!reason.trim()) { toast("拒绝必须填写原因", "error"); return; }
+            decideInGroup(id, q, "reject", reason);
+          }));
+          card.appendChild(one);
+        }
+        listBox.appendChild(card);
+      });
+      box.appendChild(listBox);
+
+      var m = openModal("分组批量处理：" + g.name, box, { buttons: [] });
+
+      function collect(decision) {
+        return Object.keys(checks).map(function (rid) {
+          var it = checks[rid];
+          return it;
+        }).filter(function (it) {
+          return it.cb.checked && it.q.displayState === "pending";
+        }).map(function (it) {
+          return { id: it.q.id, version: it.q.version, decision: decision,
+            reason: decision === "reject" ? (rejectReason.value.trim()) : "" };
+        });
+      }
+      var rejectReason = el("input");
+      rejectReason.placeholder = "批量拒绝统一原因（勾选拒绝时必填，申请人可见）";
+
+      var footBar = el("div", "perm-filter-bar");
+      footBar.style.width = "100%";
+      footBar.appendChild(rejectReason);
+      m.foot.appendChild(footBar);
+      m.foot.appendChild(button("批量批准勾选项", "primary", function () {
+        var items = collect("approve");
+        if (!items.length) { toast("请勾选至少一条待处理申请", "error"); return; }
+        submitBatch(id, items, m);
+      }));
+      m.foot.appendChild(button("批量拒绝勾选项", "danger", function () {
+        var items = collect("reject");
+        if (!items.length) { toast("请勾选至少一条待处理申请", "error"); return; }
+        if (!rejectReason.value.trim()) {
+          toast("批量拒绝必须填写统一原因", "error"); return;
+        }
+        submitBatch(id, items, m);
+      }));
+      m.foot.appendChild(button("移出分组", null, function () {
+        var ids = Object.keys(checks).filter(function (rid) {
+          return checks[rid].cb.checked;
+        });
+        if (!ids.length) { toast("请勾选要移出的申请", "error"); return; }
+        api("POST", "/api/permissions/request-groups/" + id + "/requests/remove",
+          { body: { requestIds: ids }, ifMatch: state.groupRev }).then(function (r) {
+            state.groupRev = r.grpRev;
+            state.requestRev = r.reqRev || state.requestRev;
+            toast("已移出 " + r.data.removed.length + " 条");
+            m.close(); openGroupDetail(id); loadRequests(); loadGroups();
+          }).catch(handleGroupError);
+      }));
+      m.foot.appendChild(button("关闭", null, function () { m.close(); }));
+    }
+
+    function decideInGroup(groupId, q, decision, reason) {
+      api("POST", "/api/permissions/requests/" + q.id + "/decision",
+        { body: { decision: decision, reason: reason },
+          ifMatch: state.requestRev, requestVersion: q.version })
+        .then(function (r) {
+          state.requestRev = r.reqRev;
+          state.rev = r.permRev || state.rev;
+          toast(decision === "approve"
+            ? "已逐项批准 " + q.id + "，正式委派即时生效"
+            : "已逐项拒绝 " + q.id + "（不改变权限）");
+          closeTopModal();
+          loadRequests(); loadList(); loadGroups(); openGroupDetail(groupId);
+        }).catch(handleRequestError);
+    }
+
+    function submitBatch(groupId, items, modal) {
+      api("POST",
+        "/api/permissions/request-groups/" + groupId + "/batch-decide",
+        { body: { items: items }, ifMatch: state.requestRev })
+        .then(function (r) {
+          state.requestRev = r.reqRev;
+          state.rev = r.permRev || state.rev;
+          toast("批量处理完成：" + r.data.count + " 条（整批一次事务）");
+          modal.close();
+          loadRequests(); loadList(); loadGroups(); openGroupDetail(groupId);
+        }).catch(function (e) {
+          handleBatchError(e, groupId);
+        });
+    }
+
     refresh();
   }
 
@@ -682,6 +1028,140 @@
   function requestStatusLabel(s) {
     return { pending: "待处理", approved: "已批准", rejected: "已拒绝",
       expired: "已过期", failed: "已失败" }[s] || s;
+  }
+
+  function groupDeadlineLabel(s) {
+    return { none: "未设截止", pending: "未到截止", overdue: "已过截止" }[s] || s;
+  }
+
+  function openGroupLogs(title, url) {
+    var box = el("div", "perm-logs");
+    box.appendChild(el("div", "snap-note", "加载中…"));
+    var m = openModal(title, box, { buttons: [button("关闭", null, function () {})] });
+    api("GET", url).then(function (r) {
+      box.innerHTML = "";
+      state.groupRev = r.grpRev || state.groupRev;
+      var entries = r.data.logs || [];
+      box.appendChild(el("div", "snap-note", "共 " + entries.length +
+        " 条（时间倒序；分组变更/批量审批/截止提醒独立审计）"));
+      if (!entries.length) {
+        box.appendChild(el("div", "snap-empty", "暂无记录。"));
+        return;
+      }
+      var ACTIONS = {
+        group_create: "创建分组", group_update: "修改分组",
+        group_delete: "删除分组", group_requests_add: "加入申请",
+        group_requests_remove: "移出申请",
+        batch_decide: "批量审批成功", batch_decide_failed: "批量审批整批拒绝",
+        deadline_reminder: "截止提醒"
+      };
+      entries.slice(0, 500).forEach(function (x) {
+        var deny = x.action === "batch_decide_failed" ||
+          (x.action === "deadline_reminder" &&
+           x.detail && x.detail.kind === "overdue");
+        var line = el("div", "perm-logline perm-log-" + (deny ? "deny" : "ok"));
+        line.appendChild(el("span", null,
+          formatTime(x.at) + " · " + (ACTIONS[x.action] || x.action) +
+          " · " + (SCOPE_LABELS[x.scope] || x.scope) + " " + (x.resourceId || "") +
+          " · 操作人 " + (x.actor || "—") + " · " + x.groupId));
+        var d = x.detail || {};
+        if (d.name) line.appendChild(el("div", "perm-log-msg", "分组：" + d.name));
+        if (x.action === "deadline_reminder") {
+          line.appendChild(el("div", "perm-log-msg",
+            (d.kind === "overdue" ? "已过处理截止 " : "临近处理截止 ") +
+            formatTime(d.deadline) + "；组内待处理 " + d.pendingCount + " 条"));
+        }
+        if (x.action === "batch_decide") {
+          line.appendChild(el("div", "perm-log-msg",
+            "共 " + d.count + " 条（批准 " + d.approved + " / 拒绝 " +
+            d.rejected + "），整批一次事务"));
+        }
+        if (x.action === "batch_decide_failed") {
+          (d.results || []).forEach(function (row) {
+            if (row.ok) return;
+            line.appendChild(el("div", "perm-log-msg",
+              "· " + row.id + "：" + row.code + " — " + row.message));
+          });
+        }
+        if (x.action === "group_requests_add") {
+          line.appendChild(el("div", "perm-log-msg",
+            "加入 " + (d.added || []).length + " 条" +
+            (d.reassign ? "（允许跨组移动）" : "")));
+        }
+        if (x.action === "group_delete") {
+          line.appendChild(el("div", "perm-log-msg",
+            "解除归属 " + d.detachedRequests + " 条申请（申请与权限不变）"));
+        }
+        box.appendChild(line);
+      });
+    }).catch(function (e) {
+      box.innerHTML = "";
+      box.appendChild(el("div", "snap-empty", "加载失败：" + e.message));
+    });
+    return m;
+  }
+
+  function handleGroupError(e) {
+    if (e.code === "version_conflict") {
+      toast("分组集合已被其他页面更新（旧 groupRev 冲突），请刷新后重试，本次未写入",
+        "error");
+      loadGroups();
+    } else if (e.code === "group_members_conflict") {
+      var rows = (e.data && e.data.results) || [];
+      var msg = rows.map(function (x) {
+        return x.id + "：" + x.code;
+      }).join("；");
+      toast("加入分组整批失败（未改变归属）：" + msg, "error");
+    } else if (e.code === "deadline_in_past" || e.code === "invalid_deadline") {
+      toast("处理截止时间非法：创建时必须是未来时刻", "error");
+    } else if (e.code === "missing_group_name") {
+      toast("分组名称不能为空", "error");
+    } else if (e.code === "not_resource_owner") {
+      toast("只有资源负责人才能管理该申请分组", "error");
+    } else {
+      toast(e.message, "error");
+    }
+  }
+
+  function handleBatchError(e, groupId) {
+    if (e.code === "precondition_required") {
+      toast("批量审批必须携带申请集合版本（请刷新后重试）", "error");
+    } else if (e.code === "version_conflict") {
+      toast("申请集合已被其他页面更新，整批未改变任何权限，请刷新分组后重试",
+        "error");
+      state.requestRev = e.data && String(e.data.currentRev);
+      loadRequests(); loadGroups();
+      if (groupId) openGroupDetail(groupId);
+    } else if (e.code === "batch_conflict" || e.code === "batch_invalid") {
+      var rows = (e.data && e.data.results) || [];
+      var failed = rows.filter(function (x) { return !x.ok; });
+      var detail = failed.slice(0, 5).map(function (x) {
+        return x.id + "：" + batchRowReason(x.code);
+      }).join("\n");
+      toast("整批未改变任何权限（" + failed.length + " 条失败）：\n" + detail +
+        (failed.length > 5 ? "\n…" : ""), "error");
+      // 刷新版本与状态，再重开弹窗展示最新 version
+      loadRequests(); loadGroups();
+      if (groupId) openGroupDetail(groupId);
+    } else {
+      handleRequestError(e);
+    }
+  }
+
+  function batchRowReason(code) {
+    return {
+      request_version_conflict: "申请版本过期（已被其他处理推进）",
+      request_not_pending: "申请已被处理（历史只读）",
+      request_expired: "已过审批截止",
+      self_approval: "负责人不能审批自己的申请",
+      not_resource_owner: "非资源负责人",
+      reject_reason_required: "拒绝必须填写原因",
+      not_in_group: "申请不属于该分组",
+      duplicate_delegation: "与正式委派重复",
+      conflicting_roles: "职责角色冲突",
+      duplicate_in_batch: "批内重复提交",
+      request_not_found: "申请不存在"
+    }[code] || code;
   }
 
   function renderPreview(d) {

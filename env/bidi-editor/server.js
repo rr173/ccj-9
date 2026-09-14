@@ -46,6 +46,7 @@ const replayArchive = require("./replay-archive-core");
 const replayReconcile = require("./replay-reconcile-core");
 const permissionCore = require("./permission-core");
 const permissionRequestCore = require("./permission-request-core");
+const permissionRequestGroupCore = require("./permission-request-group-core");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
@@ -1073,10 +1074,14 @@ try {
 const permissionStore = {
   rev: 0,
   requestRev: 0, // 申请集合独立版本号（X-Permission-Request-Rev），与委派集合 rev 独立
+  groupRev: 0,   // 申请分组集合独立版本号（X-Permission-Group-Rev）
   delegations: [], // 全部资源的委派记录（active/revoked；过期由时间实时判定）
   requests: [],    // 权限变更申请（grant 授予 / revoke 撤销；含终态与版本）
+  requestGroups: [], // 申请分组（名称/处理截止/备注；groupId 冗余在申请上）
   logs: [],        // 授予/撤销操作记录
   requestLogs: [], // 申请流审计记录（提交/批准/拒绝/过期/批准时冲突），只增不改
+  groupLogs: [],   // 分组独立审计（分组变更/批量审批/截止提醒），只增不改
+  groupReminders: {}, // 截止提醒幂等标记 {groupId: {approaching:iso, overdue:iso}}
   denials: []      // 被权限校验拒绝的请求记录（含原因，只增不改）
 };
 
@@ -1112,6 +1117,16 @@ try {
     permissionStore.requests = Array.isArray(dataPerm.requests) ? dataPerm.requests : [];
     permissionStore.requestLogs = Array.isArray(dataPerm.requestLogs)
       ? dataPerm.requestLogs : [];
+    // 申请分组与批量处理（旧文件缺字段自动补齐为空集合）
+    permissionStore.groupRev =
+      Number.isInteger(dataPerm.groupRev) ? dataPerm.groupRev : 0;
+    permissionStore.requestGroups = Array.isArray(dataPerm.requestGroups)
+      ? dataPerm.requestGroups : [];
+    permissionStore.groupLogs = Array.isArray(dataPerm.groupLogs)
+      ? dataPerm.groupLogs : [];
+    permissionStore.groupReminders = dataPerm.groupReminders &&
+      typeof dataPerm.groupReminders === "object"
+      ? dataPerm.groupReminders : {};
   }
 } catch (e) {
   // 文件不存在/损坏：以空存储启动，损坏文件不覆盖
@@ -1163,10 +1178,14 @@ function mutatePermissions(mutator, cb) {
   const backup = JSON.parse(JSON.stringify({
     rev: permissionStore.rev,
     requestRev: permissionStore.requestRev,
+    groupRev: permissionStore.groupRev,
     delegations: permissionStore.delegations,
     requests: permissionStore.requests,
+    requestGroups: permissionStore.requestGroups,
     logs: permissionStore.logs,
     requestLogs: permissionStore.requestLogs,
+    groupLogs: permissionStore.groupLogs,
+    groupReminders: permissionStore.groupReminders,
     denials: permissionStore.denials
   }));
   let result;
@@ -1190,10 +1209,14 @@ function mutatePermissions(mutator, cb) {
 function restorePermissions(backup) {
   permissionStore.rev = backup.rev;
   permissionStore.requestRev = backup.requestRev;
+  permissionStore.groupRev = backup.groupRev;
   permissionStore.delegations = backup.delegations;
   permissionStore.requests = backup.requests;
+  permissionStore.requestGroups = backup.requestGroups;
   permissionStore.logs = backup.logs;
   permissionStore.requestLogs = backup.requestLogs;
+  permissionStore.groupLogs = backup.groupLogs;
+  permissionStore.groupReminders = backup.groupReminders;
   permissionStore.denials = backup.denials;
 }
 
@@ -4714,6 +4737,7 @@ function sendJSON(res, status, body, headers) {
     "X-Reconcile-Rev": String(reconcileStore.rev),
     "X-Permission-Rev": String(permissionStore.rev),
     "X-Permission-Request-Rev": String(permissionStore.requestRev),
+    "X-Permission-Group-Rev": String(permissionStore.groupRev),
     "Cache-Control": "no-store"
   }, headers || {});
   res.writeHead(status, h);
@@ -8151,11 +8175,21 @@ function recoverInterruptedTasks() {
   }
 }
 
+let groupReminderTimer = null;
+function startGroupReminderScheduler() {
+  if (groupReminderTimer) return;
+  sweepGroupReminders(); // 重启后立即补一次（幂等，已提醒的不重复）
+  groupReminderTimer = setInterval(sweepGroupReminders, groupReminderIntervalMs());
+  if (groupReminderTimer.unref) groupReminderTimer.unref();
+}
+
 function startScheduler() {
   if (schedulerTimer) return;
   recoverInterruptedTasks();
   schedulerTimer = setInterval(schedulerTick, SCHEDULER_INTERVAL_MS);
   if (schedulerTimer.unref) schedulerTimer.unref();
+  // 申请分组处理截止提醒（approaching/overdue，幂等，独立审计）
+  startGroupReminderScheduler();
 }
 
 /* ---------- 权限变更申请（申请/审批 -> 正式委派） ---------- */
@@ -8201,7 +8235,177 @@ function requestTtlMs() {
 }
 
 function publicRequestNow(r) {
-  return permissionRequestCore.publicRequest(r, new Date().toISOString());
+  const nowIso = new Date().toISOString();
+  let info = null;
+  if (r.groupId) {
+    const g = findRequestGroup(r.groupId);
+    if (g) {
+      const sum = permissionRequestGroupCore.groupSummary(
+        g, permissionStore.requests, nowIso);
+      info = { name: g.name, deadlineState: sum.deadlineState,
+        pendingCount: sum.pendingCount };
+    }
+  }
+  return permissionRequestCore.publicRequest(r, nowIso, info);
+}
+
+/* ================= 申请分组与批量处理 ================= */
+
+function findRequestGroup(id) {
+  return permissionStore.requestGroups.find(function (g) {
+    return g.id === id;
+  }) || null;
+}
+
+function groupsOf(scope, resourceId) {
+  return permissionStore.requestGroups.filter(function (g) {
+    return g.scope === scope && g.resourceId === resourceId;
+  });
+}
+
+// 分组独立审计日志（只增不改；随权限文件持久化，重启可查）
+function addGroupLog(entry) {
+  const e = Object.assign({
+    id: crypto.randomUUID(),
+    at: new Date().toISOString()
+  }, entry);
+  permissionStore.groupLogs.push(e);
+  if (permissionStore.groupLogs.length >
+      permissionRequestGroupCore.LIMITS.GROUP_LOGS_MAX) {
+    permissionStore.groupLogs.splice(0,
+      permissionStore.groupLogs.length -
+      permissionRequestGroupCore.LIMITS.GROUP_LOGS_MAX);
+  }
+  return e;
+}
+
+function publicGroupNow(g) {
+  const nowIso = new Date().toISOString();
+  const sum = permissionRequestGroupCore.groupSummary(
+    g, requestsOf(g.scope, g.resourceId), nowIso);
+  return {
+    id: g.id,
+    name: g.name,
+    scope: g.scope,
+    resourceId: g.resourceId,
+    deadline: g.deadline || null,
+    note: g.note || "",
+    version: g.version,
+    createdAt: g.createdAt,
+    createdBy: g.createdBy,
+    updatedAt: g.updatedAt || null,
+    updatedBy: g.updatedBy || null,
+    deadlineState: sum.deadlineState,
+    deadlineStateLabel: sum.deadlineStateLabel,
+    totalCount: sum.totalCount,
+    pendingCount: sum.pendingCount,
+    grantCount: sum.grantCount,
+    revokeCount: sum.revokeCount,
+    statusCounts: sum.statusCounts,
+    memberCounts: sum.memberCounts
+  };
+}
+
+// 普通成员视图：只返回“自己申请所在分组”的摘要，
+// 待处理数量等工作负载字段以本人申请口径给出（不泄露他人工作量）。
+function publicGroupForMember(g, member) {
+  const nowIso = new Date().toISOString();
+  const mine = requestsOf(g.scope, g.resourceId)
+    .filter(function (r) { return r.groupId === g.id && r.member === member; });
+  if (!mine.length) return null;
+  const sum = permissionRequestGroupCore.groupSummary(g, mine, nowIso);
+  return {
+    id: g.id,
+    name: g.name,
+    scope: g.scope,
+    resourceId: g.resourceId,
+    deadline: g.deadline || null,
+    note: g.note || "",
+    version: g.version,
+    deadlineState: sum.deadlineState,
+    deadlineStateLabel: sum.deadlineStateLabel,
+    myTotalCount: sum.totalCount,
+    myPendingCount: sum.pendingCount,
+    members: [member]
+  };
+}
+
+// 把一条审批决定落到内存（申请终态 + 正式委派/撤销），与逐条审批同口径；
+// 供逐项审批与批量审批共用，保证两条路径行为一致、审计链一致。
+function applyRequestDecision(r, decision, reason, actor, nowIso) {
+  r.version++;
+  r.decidedAt = nowIso;
+  r.decidedBy = actor;
+  r.decision = decision;
+  r.decisionReason = reason;
+
+  if (decision === "reject") {
+    r.status = "rejected";
+    addPermissionRequestLog({
+      action: "reject", requestId: r.id, kind: r.kind,
+      scope: r.scope, resourceId: r.resourceId, role: r.role,
+      member: r.member, actor: actor, version: r.version,
+      detail: { reason: reason, via: "group" }
+    });
+    return { request: r, delegation: null };
+  }
+
+  if (r.kind === "grant") {
+    const d = {
+      id: "del_" + crypto.randomUUID().replace(/-/g, ""),
+      scope: r.scope, resourceId: r.resourceId, role: r.role,
+      member: r.member, effectiveAt: r.effectiveAt, expireAt: r.expireAt,
+      reason: "申请 " + r.id + " 批准授予" + (r.note ? "：" + r.note : ""),
+      status: "active",
+      grantedBy: actor, grantedAt: nowIso,
+      grantedByRequestId: r.id,
+      revokedAt: null, revokedBy: null, revokeReason: null
+    };
+    permissionStore.delegations.push(d);
+    r.status = "approved";
+    r.generatedDelegationId = d.id;
+    addPermissionLog({
+      action: "grant", scope: d.scope, resourceId: d.resourceId,
+      role: d.role, member: d.member, actor: actor,
+      delegationId: d.id, requestId: r.id,
+      detail: { effectiveAt: d.effectiveAt, expireAt: d.expireAt,
+        reason: d.reason, viaRequest: r.id }
+    });
+    addPermissionRequestLog({
+      action: "approve_grant", requestId: r.id, kind: "grant",
+      scope: r.scope, resourceId: r.resourceId, role: r.role,
+      member: r.member, actor: actor, version: r.version,
+      delegationId: d.id,
+      detail: { reason: reason, generatedDelegationId: d.id, via: "group" }
+    });
+    permissionStore.rev++;
+    return { request: r, delegation: d };
+  }
+
+  const d = permissionStore.delegations.find(function (x) {
+    return x.id === r.delegationId;
+  });
+  if (!d) throw new Error("delegation missing at commit"); // 触发整批回滚
+  d.status = "revoked";
+  d.revokedAt = nowIso;
+  d.revokedBy = actor;
+  d.revokeReason = "撤销申请 " + r.id + " 批准" + (reason ? "：" + reason : "");
+  r.status = "approved";
+  addPermissionLog({
+    action: "revoke", scope: d.scope, resourceId: d.resourceId,
+    role: d.role, member: d.member, actor: actor,
+    delegationId: d.id, requestId: r.id,
+    detail: { reason: d.revokeReason, viaRequest: r.id }
+  });
+  addPermissionRequestLog({
+    action: "approve_revoke", requestId: r.id, kind: "revoke",
+    scope: r.scope, resourceId: r.resourceId, role: r.role,
+    member: r.member, actor: actor, version: r.version,
+    delegationId: d.id,
+    detail: { reason: reason, via: "group" }
+  });
+  permissionStore.rev++;
+  return { request: r, delegation: d };
 }
 
 /* ================= 角色委派与操作权限 API ================= */
@@ -8842,79 +9046,10 @@ function handlePermissionRequestDecision(req, res, urlObj, id) {
     mutatePermissions(function () {
       const decision = checked.value.decision;
       const reason = checked.value.reason;
-      r.version++;
-      r.decidedAt = nowIso;
-      r.decidedBy = actor;
-      r.decision = decision;
-      r.decisionReason = reason;
-
-      if (decision === "reject") {
-        r.status = "rejected";
-        addPermissionRequestLog({
-          action: "reject", requestId: r.id, kind: r.kind,
-          scope: r.scope, resourceId: r.resourceId, role: r.role,
-          member: r.member, actor: actor, version: r.version,
-          detail: { reason: reason }
-        });
-      } else if (r.kind === "grant") {
-        // 批准授予 -> 生成正式委派（申请批准后才生成正式委派）
-        const d = {
-          id: "del_" + crypto.randomUUID().replace(/-/g, ""),
-          scope: r.scope, resourceId: r.resourceId, role: r.role,
-          member: r.member, effectiveAt: r.effectiveAt, expireAt: r.expireAt,
-          reason: "申请 " + r.id + " 批准授予" + (r.note ? "：" + r.note : ""),
-          status: "active",
-          grantedBy: actor, grantedAt: nowIso,
-          grantedByRequestId: r.id,
-          revokedAt: null, revokedBy: null, revokeReason: null
-        };
-        permissionStore.delegations.push(d);
-        r.status = "approved";
-        r.generatedDelegationId = d.id;
-        addPermissionLog({
-          action: "grant", scope: d.scope, resourceId: d.resourceId,
-          role: d.role, member: d.member, actor: actor,
-          delegationId: d.id, requestId: r.id,
-          detail: { effectiveAt: d.effectiveAt, expireAt: d.expireAt,
-            reason: d.reason, viaRequest: r.id }
-        });
-        addPermissionRequestLog({
-          action: "approve_grant", requestId: r.id, kind: "grant",
-          scope: r.scope, resourceId: r.resourceId, role: r.role,
-          member: r.member, actor: actor, version: r.version,
-          delegationId: d.id,
-          detail: { reason: reason, generatedDelegationId: d.id }
-        });
-        permissionStore.rev++; // 正式委派集合独立推进
-      } else {
-        // 批准撤销 -> 对目标正式委派执行撤销
-        const d = permissionStore.delegations.find(function (x) {
-          return x.id === r.delegationId;
-        });
-        if (!d) throw new Error("delegation missing at commit"); // 触发回滚
-        d.status = "revoked";
-        d.revokedAt = nowIso;
-        d.revokedBy = actor;
-        d.revokeReason = "撤销申请 " + r.id + " 批准" +
-          (reason ? "：" + reason : "");
-        r.status = "approved";
-        addPermissionLog({
-          action: "revoke", scope: d.scope, resourceId: d.resourceId,
-          role: d.role, member: d.member, actor: actor,
-          delegationId: d.id, requestId: r.id,
-          detail: { reason: d.revokeReason, viaRequest: r.id }
-        });
-        addPermissionRequestLog({
-          action: "approve_revoke", requestId: r.id, kind: "revoke",
-          scope: r.scope, resourceId: r.resourceId, role: r.role,
-          member: r.member, actor: actor, version: r.version,
-          delegationId: d.id,
-          detail: { reason: reason }
-        });
-        permissionStore.rev++; // 正式委派集合独立推进
-      }
+      const applied = applyRequestDecision(r, decision, reason, actor, nowIso);
+      const out = applied.request;
       permissionStore.requestRev++;
-      return r;
+      return out;
     }, function (failure, out) {
       if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
       sendJSON(res, 200, {
@@ -9021,11 +9156,650 @@ function handlePermissionPreview(req, res, urlObj) {
   }));
 }
 
+/* ================= 申请分组：管理 / 成员 / 批量审批 / 审计 ================= */
+
+// 分组写操作统一的负责人校验（分组锁定单一资源）
+function guardGroupOwner(req, res, urlObj, g) {
+  const member = currentMember(req, urlObj);
+  const owner = resourceOwner(g.scope, g.resourceId) || SUPER_OWNER;
+  if (member !== owner && member !== SUPER_OWNER) {
+    recordPermissionDenial({
+      scope: g.scope, resourceId: g.resourceId, required: "owner",
+      member: member, action: "permission_request_group_manage",
+      code: "not_resource_owner",
+      message: "只有资源负责人（" + owner + "）才能管理申请分组 " + g.id,
+      path: urlObj.pathname, method: req.method
+    });
+    apiError(res, 403, "not_resource_owner",
+      "只有资源负责人（" + owner + "）才能管理该申请分组");
+    return null;
+  }
+  return { member: member, owner: owner };
+}
+
+// GET /api/permissions/request-groups[?scope=&resourceId=&mine=1]
+// 负责人看自己资源分组详情；普通成员只看“自己申请所在分组”的摘要。
+function handleRequestGroupList(req, res, urlObj) {
+  const params = urlObj.searchParams;
+  const scope = params.get("scope");
+  const resourceId = params.get("resourceId");
+  if (scope && permissionRequestGroupCore.SCOPES.indexOf(scope) === -1) {
+    apiError(res, 400, "invalid_scope", "资源类型必须是 space / session / batch");
+    return;
+  }
+  const member = currentMember(req, urlObj);
+  let list = permissionStore.requestGroups.slice();
+  if (scope) list = list.filter(function (g) { return g.scope === scope; });
+  if (resourceId) list = list.filter(function (g) { return g.resourceId === resourceId; });
+  const ordered = list.slice().sort(function (a, b) {
+    const d = Date.parse(b.createdAt) - Date.parse(a.createdAt);
+    if (d) return d;
+    return a.id < b.id ? 1 : -1;
+  });
+
+  // 判定当前身份是否对每个分组拥有资源负责人身份
+  let groups;
+  if (member === SUPER_OWNER) {
+    groups = ordered.map(publicGroupNow);
+  } else {
+    groups = [];
+    ordered.forEach(function (g) {
+      const owner = resourceOwner(g.scope, g.resourceId);
+      if (owner === member) {
+        groups.push(publicGroupNow(g));
+      } else {
+        const view = publicGroupForMember(g, member);
+        if (view) groups.push(view);
+      }
+    });
+  }
+  sendJSON(res, 200, {
+    groupRev: permissionStore.groupRev,
+    rev: permissionStore.groupRev,
+    requestRev: permissionStore.requestRev,
+    count: groups.length,
+    groups: groups
+  });
+}
+
+// GET /api/permissions/request-groups/:id
+// 负责人看详情（含分组内全部申请）；普通成员只看本人申请的摘要。
+function handleRequestGroupGet(req, res, urlObj, id) {
+  const g = findRequestGroup(id);
+  if (!g) { apiError(res, 404, "group_not_found", "申请分组不存在"); return; }
+  const member = currentMember(req, urlObj);
+  const owner = resourceOwner(g.scope, g.resourceId);
+  const isOwner = member === SUPER_OWNER || member === owner;
+  let reqs = requestsOf(g.scope, g.resourceId)
+    .filter(function (r) { return r.groupId === g.id; });
+  if (!isOwner) {
+    const before = reqs.length;
+    reqs = reqs.filter(function (r) { return r.member === member; });
+    if (!reqs.length) {
+      recordPermissionDenial({
+        scope: g.scope, resourceId: g.resourceId, required: "owner",
+        member: member, action: "permission_request_group_view",
+        code: "not_resource_owner",
+        message: "只能查看自己申请所在的分组摘要",
+        path: urlObj.pathname, method: req.method
+      });
+      apiError(res, 403, "not_resource_owner",
+        "只能查看自己申请所在的分组摘要");
+      return;
+    }
+    void before;
+    sendJSON(res, 200, {
+      groupRev: permissionStore.groupRev,
+      requestRev: permissionStore.requestRev,
+      group: publicGroupForMember(g, member),
+      requests: reqs.map(publicRequestNow)
+    });
+    return;
+  }
+  sendJSON(res, 200, {
+    groupRev: permissionStore.groupRev,
+    requestRev: permissionStore.requestRev,
+    group: publicGroupNow(g),
+    requests: reqs.map(publicRequestNow)
+  });
+}
+
+// POST /api/permissions/request-groups（If-Match: groupRev）
+// body: {name, scope, resourceId, deadline?, note?}
+function handleRequestGroupCreate(req, res, urlObj) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.groupRev,
+                "分组集合")) return;
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body;
+    try { body = JSON.parse(raw) || {}; }
+    catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    const scope = typeof body.scope === "string" ? body.scope : "";
+    const resourceId = typeof body.resourceId === "string" ? body.resourceId.trim() : "";
+    if (permissionRequestGroupCore.SCOPES.indexOf(scope) === -1) {
+      apiError(res, 400, "invalid_scope",
+        "资源类型必须是 space / session / batch 之一");
+      return;
+    }
+    if (!resourceExists(scope, resourceId)) {
+      apiError(res, 404,
+        scope === "space" ? "replay_space_not_found"
+        : scope === "session" ? "session_not_found" : "batch_not_found",
+        "资源不存在，无法对其创建申请分组");
+      return;
+    }
+    const guard = guardOwnerManagement(req, res, urlObj, scope, resourceId);
+    if (!guard) return;
+    const nowIso = new Date().toISOString();
+    const checked = permissionRequestGroupCore.validateGroupBody(body, {
+      now: nowIso, isCreate: true,
+      groupCount: groupsOf(scope, resourceId).length
+    });
+    if (!checked.ok) {
+      const status = ["missing_group_name", "name_too_long", "invalid_deadline",
+        "deadline_in_past", "invalid_note", "note_too_long",
+        "missing_resource"].indexOf(checked.code) !== -1 ? 400 : 409;
+      apiError(res, status, checked.code, checked.message);
+      return;
+    }
+    const v = checked.value;
+    mutatePermissions(function () {
+      const g = {
+        id: "pgrp_" + crypto.randomUUID().replace(/-/g, ""),
+        name: v.name,
+        scope: v.scope, resourceId: v.resourceId,
+        deadline: v.deadline || null,
+        note: v.note || "",
+        version: 1,
+        createdAt: nowIso, createdBy: guard.member,
+        updatedAt: null, updatedBy: null
+      };
+      permissionStore.requestGroups.push(g);
+      addGroupLog({
+        action: "group_create", groupId: g.id,
+        scope: g.scope, resourceId: g.resourceId,
+        actor: guard.member, version: 1,
+        detail: { name: g.name, deadline: g.deadline, note: g.note }
+      });
+      permissionStore.groupRev++;
+      return g;
+    }, function (failure, g) {
+      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      sendJSON(res, 201, {
+        groupRev: permissionStore.groupRev,
+        group: publicGroupNow(g)
+      });
+    });
+  });
+}
+
+// PATCH /api/permissions/request-groups/:id（If-Match: groupRev）
+// body: {name?, deadline?, note?}
+function handleRequestGroupUpdate(req, res, urlObj, id) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.groupRev,
+                "分组集合")) return;
+  const g = findRequestGroup(id);
+  if (!g) { apiError(res, 404, "group_not_found", "申请分组不存在"); return; }
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body;
+    try { body = JSON.parse(raw) || {}; }
+    catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    const guard = guardGroupOwner(req, res, urlObj, g);
+    if (!guard) return;
+    const nowIso = new Date().toISOString();
+    const checked = permissionRequestGroupCore.validateGroupBody(body, { now: nowIso });
+    if (!checked.ok) {
+      const status = ["missing_group_name", "name_too_long", "invalid_deadline",
+        "deadline_in_past", "invalid_note", "note_too_long"].indexOf(checked.code) !== -1
+        ? 400 : 409;
+      apiError(res, status, checked.code, checked.message);
+      return;
+    }
+    const v = checked.value;
+    mutatePermissions(function () {
+      const changes = {};
+      if (v.name !== undefined && v.name !== g.name) { changes.name = v.name; g.name = v.name; }
+      if (v.deadline !== undefined && v.deadline !== g.deadline) {
+        changes.deadline = v.deadline; g.deadline = v.deadline;
+      }
+      if (v.note !== undefined && v.note !== g.note) { changes.note = v.note; g.note = v.note; }
+      g.version++;
+      g.updatedAt = nowIso;
+      g.updatedBy = guard.member;
+      addGroupLog({
+        action: "group_update", groupId: g.id,
+        scope: g.scope, resourceId: g.resourceId,
+        actor: guard.member, version: g.version,
+        detail: changes
+      });
+      permissionStore.groupRev++;
+      return g;
+    }, function (failure, out) {
+      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      sendJSON(res, 200, {
+        groupRev: permissionStore.groupRev,
+        group: publicGroupNow(out)
+      });
+    });
+  });
+}
+
+// DELETE /api/permissions/request-groups/:id（If-Match: groupRev）
+// 删除分组只解除申请归属（申请本身不变、不改变任何权限）。
+function handleRequestGroupDelete(req, res, urlObj, id) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.groupRev,
+                "分组集合")) return;
+  const g = findRequestGroup(id);
+  if (!g) { apiError(res, 404, "group_not_found", "申请分组不存在"); return; }
+  const guard = guardGroupOwner(req, res, urlObj, g);
+  if (!guard) return;
+  mutatePermissions(function () {
+    let detached = 0;
+    permissionStore.requests.forEach(function (r) {
+      if (r.groupId === g.id) { r.groupId = null; detached++; }
+    });
+    permissionStore.requestGroups = permissionStore.requestGroups
+      .filter(function (x) { return x.id !== g.id; });
+    addGroupLog({
+      action: "group_delete", groupId: g.id,
+      scope: g.scope, resourceId: g.resourceId,
+      actor: guard.member,
+      detail: { name: g.name, detachedRequests: detached }
+    });
+    permissionStore.groupRev++;
+    // 归属变化需要申请列表（groupId 字段）同步刷新
+    permissionStore.requestRev++;
+    return { detached: detached };
+  }, function (failure, out) {
+    if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+    sendJSON(res, 200, {
+      groupRev: permissionStore.groupRev,
+      requestRev: permissionStore.requestRev,
+      deleted: id, detachedRequests: out.detached
+    });
+  });
+}
+
+// POST /api/permissions/request-groups/:id/requests（If-Match: groupRev）
+// body: {requestIds:[...], reassign?}  把申请加入分组（按资源/类型/成员/状态筛选后）
+function handleRequestGroupAdd(req, res, urlObj, id) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.groupRev,
+                "分组集合")) return;
+  const g = findRequestGroup(id);
+  if (!g) { apiError(res, 404, "group_not_found", "申请分组不存在"); return; }
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body;
+    try { body = JSON.parse(raw) || {}; }
+    catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    const guard = guardGroupOwner(req, res, urlObj, g);
+    if (!guard) return;
+    const ids = Array.isArray(body.requestIds) ? body.requestIds : [];
+    if (!ids.length) {
+      apiError(res, 400, "empty_members", "至少选择一条申请加入分组");
+      return;
+    }
+    const reassign = body.reassign === true;
+    const results = [];
+    let changed = false;
+    for (let i = 0; i < ids.length; i++) {
+      const rid = typeof ids[i] === "string" ? ids[i].trim() : "";
+      const r = rid ? findPermissionRequest(rid) : null;
+      if (!rid || !r) {
+        results.push({ id: rid || null, ok: false, code: "request_not_found",
+          message: "申请 " + rid + " 不存在" });
+        continue;
+      }
+      if (r.scope !== g.scope || r.resourceId !== g.resourceId) {
+        results.push({ id: rid, ok: false, code: "request_scope_mismatch",
+          message: "申请 " + rid + " 不属于该分组资源，不能跨资源分组" });
+        continue;
+      }
+      if (r.groupId && r.groupId !== g.id && !reassign) {
+        const other = findRequestGroup(r.groupId);
+        results.push({ id: rid, ok: false, code: "request_already_grouped",
+          message: "申请 " + rid + " 已在分组 “" +
+            (other ? other.name : r.groupId) + "”，如需移动请显式 reassign",
+          currentGroupId: r.groupId });
+        continue;
+      }
+      results.push({ id: rid, ok: true, previousGroupId: r.groupId || null });
+    }
+    const failed = results.filter(function (x) { return !x.ok; });
+    if (failed.length) {
+      // 整批不改：成员加入是原子操作，任一不合法整批取消
+      apiError(res, 409, "group_members_conflict",
+        "加入分组存在不合法申请，整批未改变任何归属", { results: results });
+      return;
+    }
+    mutatePermissions(function () {
+      const added = [];
+      results.forEach(function (x) {
+        const r = findPermissionRequest(x.id);
+        if (r.groupId !== g.id) {
+          r.groupId = g.id;
+          added.push({ id: r.id, kind: r.kind, member: r.member,
+            previousGroupId: x.previousGroupId });
+          changed = true;
+        }
+      });
+      g.version++;
+      g.updatedAt = new Date().toISOString();
+      g.updatedBy = guard.member;
+      addGroupLog({
+        action: "group_requests_add", groupId: g.id,
+        scope: g.scope, resourceId: g.resourceId,
+        actor: guard.member, version: g.version,
+        detail: { added: added, reassign: reassign }
+      });
+      permissionStore.groupRev++;
+      if (added.length) permissionStore.requestRev++;
+      return { added: added };
+    }, function (failure, out) {
+      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      sendJSON(res, 200, {
+        groupRev: permissionStore.groupRev,
+        requestRev: permissionStore.requestRev,
+        group: publicGroupNow(g),
+        added: out.added,
+        changed: changed
+      });
+    });
+  });
+}
+
+// POST /api/permissions/request-groups/:id/requests/remove（If-Match: groupRev）
+// body: {requestIds:[...]}  从分组移除（申请本身不变）
+function handleRequestGroupRemove(req, res, urlObj, id) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.groupRev,
+                "分组集合")) return;
+  const g = findRequestGroup(id);
+  if (!g) { apiError(res, 404, "group_not_found", "申请分组不存在"); return; }
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body;
+    try { body = JSON.parse(raw) || {}; }
+    catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    const guard = guardGroupOwner(req, res, urlObj, g);
+    if (!guard) return;
+    const ids = Array.isArray(body.requestIds) ? body.requestIds : [];
+    if (!ids.length) {
+      apiError(res, 400, "empty_members", "至少选择一条申请移出分组");
+      return;
+    }
+    mutatePermissions(function () {
+      const removed = [];
+      const missing = [];
+      ids.forEach(function (rid) {
+        const r = findPermissionRequest(typeof rid === "string" ? rid.trim() : "");
+        if (!r) { missing.push(rid); return; }
+        if (r.groupId === g.id) {
+          r.groupId = null;
+          removed.push({ id: r.id, kind: r.kind, member: r.member });
+        }
+      });
+      if (missing.length) throw new Error("group remove missing: " + missing.join(","));
+      g.version++;
+      g.updatedAt = new Date().toISOString();
+      g.updatedBy = guard.member;
+      addGroupLog({
+        action: "group_requests_remove", groupId: g.id,
+        scope: g.scope, resourceId: g.resourceId,
+        actor: guard.member, version: g.version,
+        detail: { removed: removed }
+      });
+      permissionStore.groupRev++;
+      if (removed.length) permissionStore.requestRev++;
+      return { removed: removed };
+    }, function (failure, out) {
+      if (failure) {
+        if (failure.code === "internal_error" &&
+            /^group remove missing/.test(failure.message)) {
+          apiError(res, 404, "request_not_found", "要移出的申请不存在");
+          return;
+        }
+        apiError(res, failure.status, failure.code, failure.message);
+        return;
+      }
+      sendJSON(res, 200, {
+        groupRev: permissionStore.groupRev,
+        requestRev: permissionStore.requestRev,
+        group: publicGroupNow(g),
+        removed: out.removed
+      });
+    });
+  });
+}
+
+// POST /api/permissions/request-groups/:id/batch-decide
+// If-Match: 申请集合 requestRev（与逐条审批一致）
+// body: {items:[{id, version, decision:"approve"|"reject", reason?}]}
+// 整批原子：任一条过期/已处理/版本冲突/角色冲突，整批不改变权限并逐条返回原因。
+function handleRequestGroupBatchDecide(req, res, urlObj, id) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.requestRev,
+                "申请集合")) return;
+  const g = findRequestGroup(id);
+  if (!g) { apiError(res, 404, "group_not_found", "申请分组不存在"); return; }
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body;
+    try { body = JSON.parse(raw) || {}; }
+    catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    const guard = guardGroupOwner(req, res, urlObj, g);
+    if (!guard) return;
+    const nowIso = new Date().toISOString();
+    const checked = permissionRequestGroupCore.validateBatchDecisions(
+      Array.isArray(body.items) ? body.items : [], {
+        now: nowIso, actor: guard.member,
+        owner: resourceOwner(g.scope, g.resourceId) || SUPER_OWNER,
+        requestRev: permissionStore.requestRev,
+        expectedRev: req.headers["if-match"],
+        group: g,
+        requests: requestsOf(g.scope, g.resourceId),
+        delegations: delegationsOf(g.scope, g.resourceId)
+      });
+
+    if (!checked.ok) {
+      // 整批不改任何权限；失败原因逐条落独立审计 + 拒绝留痕（持久化，重启可查）
+      const results = checked.results || [];
+      mutatePermissions(function () {
+        results.forEach(function (row) {
+          if (row.ok) return;
+          recordRequestDenial({
+            scope: g.scope, resourceId: g.resourceId, required: "",
+            member: guard.member, targetMember: null,
+            code: row.code, message: row.message,
+            requestId: row.id, groupId: g.id,
+            action: "permission_request_group_batch",
+            path: urlObj.pathname, method: req.method
+          }, true);
+        });
+        addGroupLog({
+          action: "batch_decide_failed", groupId: g.id,
+          scope: g.scope, resourceId: g.resourceId,
+          actor: guard.member,
+          detail: { code: checked.code, results: results }
+        });
+        return null;
+      }, function (failure) {
+        if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+        const httpStatus = checked.code === "precondition_required" ? 428
+          : checked.code === "version_conflict" ? 409
+          : checked.code === "batch_invalid" ? 400 : 409;
+        apiError(res, httpStatus, checked.code, checked.message,
+          { groupId: g.id, currentRev: permissionStore.requestRev,
+            results: results });
+      });
+      return;
+    }
+
+    // 全部前置校验通过：在同一事务内逐条落库（任一落库异常整体回滚）。
+    mutatePermissions(function () {
+      const applied = [];
+      checked.value.items.forEach(function (it) {
+        const out = applyRequestDecision(
+          it.request, it.decision, it.reason, guard.member, nowIso);
+        applied.push({
+          id: it.request.id, ok: true, decision: it.decision,
+          version: it.request.version, status: it.request.status,
+          generatedDelegationId: it.request.generatedDelegationId || null
+        });
+        void out;
+      });
+      addGroupLog({
+        action: "batch_decide", groupId: g.id,
+        scope: g.scope, resourceId: g.resourceId,
+        actor: guard.member,
+        detail: {
+          count: applied.length,
+          approved: applied.filter(function (x) { return x.decision === "approve"; }).length,
+          rejected: applied.filter(function (x) { return x.decision === "reject"; }).length,
+          results: applied
+        }
+      });
+      permissionStore.requestRev++;
+      return applied;
+    }, function (failure, applied) {
+      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      sendJSON(res, 200, {
+        requestRev: permissionStore.requestRev,
+        rev: permissionStore.rev,
+        groupRev: permissionStore.groupRev,
+        groupId: g.id,
+        count: applied.length,
+        results: applied,
+        requests: requestsOf(g.scope, g.resourceId)
+          .filter(function (r) { return r.groupId === g.id; })
+          .map(publicRequestNow)
+      });
+    });
+  });
+}
+
+// GET /api/permissions/request-groups/logs[?from=&to=&scope=&resourceId=]
+// 分组独立审计：系统负责人全量；资源负责人看本资源；
+// 普通成员只能看到与本人申请相关的成员变更/批量结果（截止提醒仅负责人可见）。
+function handleRequestGroupLogs(req, res, urlObj) {
+  const r = filterPermissionLogs(permissionStore.groupLogs, urlObj.searchParams);
+  if (r.error) { apiError(res, r.error.status, r.error.code, r.error.message); return; }
+  const member = currentMember(req, urlObj);
+  const scope = urlObj.searchParams.get("scope");
+  const resourceId = urlObj.searchParams.get("resourceId");
+  let entries = r.value;
+  if (member !== SUPER_OWNER) {
+    const owner = scope && resourceId && resourceExists(scope, resourceId)
+      ? resourceOwner(scope, resourceId) : null;
+    if (!(owner && member === owner)) {
+      // 普通成员：仅保留自己是受影响成员的记录；deadline_reminder 不下发。
+      const myRequestIds = {};
+      permissionStore.requests.forEach(function (x) {
+        if (x.member === member) myRequestIds[x.id] = true;
+      });
+      entries = entries.filter(function (e) {
+        if (e.action === "deadline_reminder") return false;
+        const d = e.detail || {};
+        const list = d.added || d.removed || d.results || [];
+        return list.some(function (x) {
+          return x && (myRequestIds[x.id] || x.member === member);
+        });
+      });
+    }
+  }
+  sendJSON(res, 200, {
+    groupRev: permissionStore.groupRev,
+    count: entries.length,
+    logs: entries
+  });
+}
+
+/* ================= 分组处理截止提醒（定时、幂等、重启不重复） ================= */
+
+function groupReminderIntervalMs() {
+  const v = Number(process.env.PERMISSION_GROUP_REMINDER_INTERVAL_MS);
+  if (Number.isFinite(v) && v > 0) return v;
+  return 60 * 1000;
+}
+function groupReminderApproachingMs() {
+  const v = Number(process.env.PERMISSION_GROUP_REMINDER_APPROACHING_MS);
+  if (Number.isFinite(v) && v >= 0) return v;
+  return 24 * 3600 * 1000;
+}
+
+function sweepGroupReminders() {
+  const nowIso = new Date().toISOString();
+  const due = permissionRequestGroupCore.dueReminders(
+    permissionStore.requestGroups, permissionStore.requests, {
+      now: nowIso,
+      approachingMs: groupReminderApproachingMs(),
+      reminded: permissionStore.groupReminders
+    });
+  if (!due.length) return;
+  mutatePermissions(function () {
+    due.forEach(function (item) {
+      const mark = permissionStore.groupReminders[item.groupId] ||
+        (permissionStore.groupReminders[item.groupId] = {});
+      mark[item.kind] = nowIso;
+      addGroupLog({
+        action: "deadline_reminder", groupId: item.groupId,
+        scope: item.scope, resourceId: item.resourceId,
+        actor: "系统",
+        detail: { kind: item.kind, name: item.name,
+          deadline: item.deadline, pendingCount: item.pendingCount }
+      });
+    });
+    // 提醒不推进任何对外版本（纯审计事件），但需持久化提醒标记
+    return due.length;
+  }, function (failure) {
+    if (failure) console.error("group reminder persist failed:", failure);
+  });
+}
+
 function handlePermissions(req, res, tail, urlObj) {
   // tail: ["delegations"] | ["delegations", ":id", "revoke"] |
   //       ["requests"] | ["requests", ":id"] | ["requests", ":id", "decision"] |
   //       ["requests", "logs"] | ["preview"] |
   //       ["logs"] | ["denials"] | ["effective"]
+  if (tail.length === 1 && tail[0] === "request-groups" && req.method === "GET") {
+    handleRequestGroupList(req, res, urlObj);
+    return;
+  }
+  if (tail.length === 1 && tail[0] === "request-groups" && req.method === "POST") {
+    handleRequestGroupCreate(req, res, urlObj);
+    return;
+  }
+  if (tail.length === 2 && tail[0] === "request-groups" &&
+      tail[1] === "logs" && req.method === "GET") {
+    handleRequestGroupLogs(req, res, urlObj);
+    return;
+  }
+  if (tail.length === 2 && tail[0] === "request-groups" && req.method === "GET") {
+    handleRequestGroupGet(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 2 && tail[0] === "request-groups" && req.method === "PATCH") {
+    handleRequestGroupUpdate(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 2 && tail[0] === "request-groups" && req.method === "DELETE") {
+    handleRequestGroupDelete(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 3 && tail[0] === "request-groups" &&
+      tail[2] === "requests" && req.method === "POST") {
+    handleRequestGroupAdd(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 4 && tail[0] === "request-groups" &&
+      tail[2] === "requests" && tail[3] === "remove" && req.method === "POST") {
+    handleRequestGroupRemove(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 3 && tail[0] === "request-groups" &&
+      tail[2] === "batch-decide" && req.method === "POST") {
+    handleRequestGroupBatchDecide(req, res, urlObj, tail[1]);
+    return;
+  }
   if (tail.length === 1 && tail[0] === "delegations" && req.method === "GET") {
     handlePermissionList(req, res, urlObj);
     return;
@@ -9139,7 +9913,7 @@ function handleAPI(req, res, pathname, urlObj) {
     handleReplay(req, res, parts, urlObj);
     return;
   }
-  if (parts[1] === "permissions" && parts.length <= 5) {
+  if (parts[1] === "permissions" && parts.length <= 7) {
     handlePermissions(req, res, parts.slice(2), urlObj);
     return;
   }

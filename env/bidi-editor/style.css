@@ -1736,7 +1736,17 @@ tr.rp-added { background: #f0fdf4; }
 .perm-badge-rejected { background: #fee2e2; color: #991b1b; }
 .perm-badge-expired { background: #f1f5f9; color: #64748b; }
 .perm-rq-reason { color: #991b1b; }
-.perm-rq-actions { display: flex; gap: 8px; margin-top: 6px; }
+.perm-rq-actions { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+
+/* 申请分组与批量处理 */
+.perm-group-card { border-left: 3px solid #6366f1; }
+.perm-group-card.perm-dl-overdue { border-left-color: #dc2626; background: #fef2f2; }
+.perm-group-card.perm-dl-pending { border-left-color: #6366f1; }
+.perm-badge-group { font-weight: 600; }
+.perm-dl-badge-none { background: #f1f5f9; color: #64748b; }
+.perm-dl-badge-pending { background: #e0e7ff; color: #3730a3; }
+.perm-dl-badge-overdue { background: #fee2e2; color: #991b1b; }
+.perm-group-detail .perm-list { max-height: 46vh; overflow-y: auto; }
 
 /* 生效预览 */
 .perm-preview { margin-top: 8px; }
