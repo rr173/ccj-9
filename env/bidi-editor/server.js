@@ -10099,12 +10099,14 @@ function handleRequestTemplateUpdate(req, res, urlObj, id) {
     const nowIso = new Date().toISOString();
     const checked = permissionTemplateCore.validateTemplateBody(body, {
       now: nowIso, isCreate: false,
-      currentScope: t.scope, currentKind: t.kind
+      currentScope: t.scope, currentKind: t.kind,
+      currentDefaultDurationMs: t.defaultDurationMs
     });
     if (!checked.ok) {
       const badRequest = ["missing_template_name", "name_too_long", "invalid_name",
         "invalid_kind", "invalid_role", "role_not_allowed_for_scope",
-        "invalid_default_duration", "invalid_description",
+        "missing_default_duration", "invalid_default_duration",
+        "invalid_description",
         "description_too_long", "invalid_member_scope",
         "missing_scope_members", "invalid_scope_member",
         "too_many_scope_members"].indexOf(checked.code) !== -1;
@@ -10123,16 +10125,17 @@ function handleRequestTemplateUpdate(req, res, urlObj, id) {
       if (v.kind !== undefined && v.kind !== t.kind) {
         changes.kind = { from: t.kind, to: v.kind }; t.kind = v.kind;
       }
-      // 切到撤销类型时清空默认有效期
+      // 默认有效期以校验层归一化结果为准：
+      // 切到撤销类型 -> null；切到授予类型必须带合法值（校验层已保证）；
+      // 显式 null 不清空既有授予模板的有效期（校验层回填原值）。
       let newDuration = t.defaultDurationMs;
       if (v.defaultDurationMs !== undefined) {
-        const nd = v.defaultDurationMs == null ? null : v.defaultDurationMs;
-        if (nd !== t.defaultDurationMs) {
-          changes.defaultDurationMs = { from: t.defaultDurationMs, to: nd };
-          newDuration = nd;
-        }
+        newDuration = v.defaultDurationMs == null ? null : v.defaultDurationMs;
       }
       if (t.kind === "revoke") newDuration = null;
+      if (newDuration !== t.defaultDurationMs) {
+        changes.defaultDurationMs = { from: t.defaultDurationMs, to: newDuration };
+      }
       t.defaultDurationMs = newDuration;
       if (v.description !== undefined && v.description !== t.description) {
         changes.description = { from: t.description, to: v.description };
@@ -10255,7 +10258,8 @@ function handleRequestTemplateSubmit(req, res, urlObj, id) {
         "invalid_effective", "invalid_expire", "missing_expire",
         "expire_in_past", "effective_after_expire",
         "missing_member", "member_too_long", "invalid_member",
-        "missing_delegation"].indexOf(checked.code) !== -1;
+        "missing_delegation", "invalid_template_version",
+        "invalid_default_duration"].indexOf(checked.code) !== -1;
       const status = checked.code === "precondition_required" ? 428
         : checked.code === "delegation_not_found" ? 404
         : (checked.code === "template_version_changed" ||
@@ -10263,13 +10267,16 @@ function handleRequestTemplateSubmit(req, res, urlObj, id) {
         : (checked.code === "member_not_in_template_scope" ||
            checked.code === "request_for_other_member") ? 403
         : badRequest ? 400 : 409;
-      // 拒绝原因与模板/版本上下文一起留痕（重启可查）
+      // 拒绝原因与模板/版本上下文一起留痕（重启可查）；
+      // 非法 templateVersion（如 "1abc"）不做 Number() 强转，统一记 null
+      const loggedVersion = Number.isSafeInteger(body.templateVersion) &&
+        body.templateVersion > 0
+        ? body.templateVersion : null;
       mutatePermissions(function () {
         recordTemplateDenial({
           scope: t.scope, resourceId: t.resourceId, required: t.role,
           member: actor, templateId: t.id,
-          templateVersion: body.templateVersion != null
-            ? Number(body.templateVersion) : null,
+          templateVersion: loggedVersion,
           code: checked.code, message: checked.message,
           delegationId: body.delegationId || null,
           path: urlObj.pathname, method: req.method
@@ -10279,8 +10286,7 @@ function handleRequestTemplateSubmit(req, res, urlObj, id) {
           scope: t.scope, resourceId: t.resourceId,
           actor: actor, version: t.currentVersion,
           detail: { code: checked.code, message: checked.message,
-            submittedVersion: body.templateVersion != null
-              ? Number(body.templateVersion) : null }
+            submittedVersion: loggedVersion }
         });
         return null;
       }, function (failure) {

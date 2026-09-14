@@ -1041,7 +1041,8 @@ revoked。落盘失败整体回滚（申请终态与正式委派要么同时生�
   范围外模板对成员不可见，直接取详情 403；版本历史仅负责人/系统负责人可查。
 - **用模板发起申请**：`POST …/request-templates/:id/submit`，必须携带
   `If-Match=requestRev`（与直接申请同一集合版本）与 **`templateVersion`（发起所
-  依据的模板内容版本，严格相等）**。授予模板默认窗口为提交瞬间
+  依据的模板内容版本，必须是正整数且严格相等；`"1abc"` 等非整数 400
+  `invalid_template_version`）**。授予模板默认窗口为提交瞬间
   `now ~ now+defaultDurationMs`，可显式给 `effectiveAt/expireAt` 覆盖；撤销模板
   需带本人正式委派 `delegationId`；`note` 可选。
 - **提交时重新校验（模板只提供默认值，不豁免任何硬规则）**：
@@ -1050,6 +1051,7 @@ revoked。落盘失败整体回滚（申请终态与正式委派要么同时生�
   |---|---|
   | 模板不存在 / 已停用 | 404 `template_not_found` / 409 `template_disabled` |
   | 不带 templateVersion | 428 `precondition_required` |
+  | templateVersion 不是正整数（如 `"1abc"`、`1.5`、`true`） | 400 `invalid_template_version`（不做 parseInt 截断） |
   | 模板在此期间被修改（版本不符） | 409 `template_version_changed`（带 currentVersion/submittedVersion），旧版本不能创建 |
   | 成员不在适用范围 | 403 `member_not_in_template_scope` |
   | 角色已存在 / 重复申请 / 时间窗冲突 / 职责冲突 / 负责人自审 | 复用申请流同一组错误：409 `duplicate_delegation`/`duplicate_request`/`conflicting_roles`/`conflicting_request_roles`/`approver_is_owner` |
@@ -1132,12 +1134,16 @@ GET    /api/permissions/request-templates/logs[?from=&to=&scope=&resourceId=]
 模板集合版本号为响应头 `X-Permission-Template-Rev`（建/改/停用携带
 `If-Match: templateRev`；发起申请携带 `If-Match: requestRev` 与请求体
 `templateVersion`）。模板错误码：400 `missing_template_name`/`name_too_long`/
-`invalid_default_duration`/`missing_default_duration`/`invalid_member_scope`/
+`invalid_default_duration`/`missing_default_duration`（含把撤销模板改成授予
+模板却不提供合法默认有效期的更新——更新被整体拒绝、原模板保留）/
+`invalid_template_version`/`invalid_member_scope`/
 `missing_scope_members`/`invalid_scope_member`/`too_many_scope_members`/
 `description_too_long`/`template_too_large`；403
 `member_not_in_template_scope`；404 `template_not_found`；409
 `template_disabled`/`template_version_changed`（带 `currentVersion`/
 `submittedVersion`）；428 缺 `If-Match` 或 `templateVersion`。
+`templateVersion` 只接受正整数（`"1abc"`、`"1"`、`1.5` 等一律
+400 `invalid_template_version`，不会被 parseInt 静默截断成版本 1）。
 
 ## 其他编辑器功能
 

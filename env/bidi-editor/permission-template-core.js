@@ -14,7 +14,8 @@
  *   - 每个模板自带单调内容版本 currentVersion：创建=1，每次内容修改 +1，
  *     停用不改内容版本；全部 create/update/disable 事件进入只增不改的
  *     history（版本历史），内容事件携带该版本的完整快照 snapshot；
- *   - 发起申请必须显式携带 templateVersion 且严格等于 currentVersion，
+ *   - 发起申请必须显式携带 templateVersion（正整数）且严格等于 currentVersion，
+ *     "1abc" 等非整数 -> invalid_template_version，
  *     模板在此期间被修改 -> template_version_changed 明确拒绝；
  *   - 停用模板与旧版本模板都不能继续创建新申请。
  *
@@ -139,9 +140,12 @@
   /* ================= 模板创建/更新内容校验 =================
    * body: {name?, scope?, resourceId?, role?, kind?,
    *         defaultDurationMs?, description?, memberScope?}
-   * ctx:  {isCreate, now, templateCount?}
+   * ctx:  {isCreate, now, templateCount?, currentScope?, currentKind?,
+   *         currentDefaultDurationMs?}
    * 创建时 scope/resourceId/name/role/kind 必填；授予模板 defaultDurationMs 必填。
-   * 更新时只校验给出的字段（调用方负责合并），不允许把必填字段改成空。
+   * 更新时只校验给出的字段（调用方负责合并），但必须保证合并后的模板自身合法：
+   * 不允许把必填字段改成空，尤其不允许把撤销模板改成授予模板却不提供默认有效期
+   * （否则会落库一个提交时必返 invalid_default_duration 的死模板）。
    */
   function validateTemplateBody(body, ctx) {
     body = body || {};
@@ -197,7 +201,9 @@
       out.role = role;
     }
 
-    // 默认有效期：只对授予模板有意义；撤销模板无论是否传值统一存 null
+    // 默认有效期：只对授予模板有意义；撤销模板无论是否传值统一存 null。
+    // 更新时还要校验“合并后的模板”：切到授予类型必须能得到一个合法有效期，
+    // 不能落库一个提交时必返 invalid_default_duration 的授予模板。
     var kindForDur = out.kind || ctx.currentKind;
     if (ctx.isCreate || body.defaultDurationMs !== undefined) {
       if (kindForDur === "revoke") {
@@ -209,13 +215,27 @@
             return fail("missing_default_duration",
               "授予申请模板必须设置默认有效期（毫秒）");
           }
-          out.defaultDurationMs = undefined;
+          if (Number.isInteger(ctx.currentDefaultDurationMs)) {
+            // 显式给 null：保留模板上既有的合法有效期（不静默清空）
+            out.defaultDurationMs = ctx.currentDefaultDurationMs;
+          } else {
+            return fail("missing_default_duration",
+              "改成授予申请模板时必须同时提供合法默认有效期（毫秒），" +
+              "否则该模板无法发起申请；本次修改已拒绝，原模板保持不变");
+          }
         } else {
           var dv = checkDuration(d);
           if (!dv.ok) return dv;
           out.defaultDurationMs = dv.value;
         }
       }
+    } else if (!ctx.isCreate && kindForDur === "grant" &&
+               !Number.isInteger(ctx.currentDefaultDurationMs)) {
+      // 未携带 defaultDurationMs 的更新（例如只改 kind/name）：
+      // 合并后若是授予模板且原模板没有合法有效期，明确拒绝，保留原模板
+      return fail("missing_default_duration",
+        "改成授予申请模板时必须同时提供合法默认有效期（毫秒），" +
+        "否则该模板无法发起申请；本次修改已拒绝，原模板保持不变");
     }
 
     if (ctx.isCreate || body.description !== undefined) {
@@ -286,7 +306,9 @@
    *
    * 规则顺序（任一失败即拒绝，不创建任何申请）：
    *   1. 模板必须处于 active（停用 -> template_disabled）；
-   *   2. templateVersion 严格等于 currentVersion（旧版本 -> template_version_changed）；
+   *   2. templateVersion 必须是正整数且严格等于 currentVersion
+   *      （缺失 -> precondition_required；"1abc" 等非整数 -> invalid_template_version；
+   *      旧版本 -> template_version_changed）；
    *   3. 发起人必须在适用成员范围内（member_not_in_template_scope）；
    *   4. 授予模板默认时间窗 = now ~ now+defaultDurationMs，可显式给
    *      effectiveAt/expireAt 覆盖；随后复用申请流全部硬规则按“当前正式委派 +
@@ -310,15 +332,24 @@
       return fail("precondition_required",
         "用模板发起申请必须携带 templateVersion（所依据的模板版本号）");
     }
-    var their = parseInt(ctx.templateVersion, 10);
-    if (!Number.isInteger(their) || their !== template.currentVersion) {
+    // 严格整数校验：只接受真正的整数（JSON 数字），不能用 parseInt 把
+    // "1abc"、" 1 "、1.5、true 之类静默当成版本 1。
+    var their = ctx.templateVersion;
+    if (typeof their !== "number" || !Number.isInteger(their) ||
+        !Number.isSafeInteger(their) || their <= 0) {
+      return fail("invalid_template_version",
+        "templateVersion 必须是正整数（所依据的模板内容版本号），" +
+        "收到：" + JSON.stringify(ctx.templateVersion),
+        { templateId: template.id, currentVersion: template.currentVersion });
+    }
+    if (their !== template.currentVersion) {
       return fail("template_version_changed",
         "模板 “" + template.name + "” 已被负责人修改到版本 " +
         template.currentVersion + "（提交依据版本 " + their +
         "），旧版本不能继续创建新申请，请刷新模板后重新发起",
         { templateId: template.id,
           currentVersion: template.currentVersion,
-          submittedVersion: Number.isInteger(their) ? their : null });
+          submittedVersion: their });
     }
 
     var member = typeof ctx.member === "string" ? ctx.member.trim() : "";

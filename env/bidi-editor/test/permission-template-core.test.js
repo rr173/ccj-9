@@ -165,6 +165,59 @@ describe("模板更新校验", function () {
       { kind: "grant", defaultDurationMs: DAY },
       { now: NOW, currentScope: "space", currentKind: "revoke" });
     assert.equal(r2.ok, true);
+    assert.equal(r2.value.defaultDurationMs, DAY);
+  });
+
+  it("撤销模板改成授予但不给有效期 -> 明确拒绝，不产生可提交的死模板", function () {
+    // 只改 kind，不带 defaultDurationMs（原撤销模板没有有效期）
+    let r = tc.validateTemplateBody(
+      { kind: "grant" },
+      { now: NOW, currentScope: "space", currentKind: "revoke",
+        currentDefaultDurationMs: null });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, "missing_default_duration");
+
+    // 只改别的字段（如名称）也不能让结果变成无有效期的授予模板
+    r = tc.validateTemplateBody(
+      { name: "新名称" },
+      { now: NOW, currentScope: "space", currentKind: "grant",
+        currentDefaultDurationMs: null });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, "missing_default_duration");
+
+    // 显式给 null 同样拒绝（不能静默清空）
+    r = tc.validateTemplateBody(
+      { kind: "grant", defaultDurationMs: null },
+      { now: NOW, currentScope: "space", currentKind: "revoke",
+        currentDefaultDurationMs: null });
+    assert.equal(r.ok, false);
+    assert.equal(r.code, "missing_default_duration");
+
+    // 给了有效期 -> 通过
+    r = tc.validateTemplateBody(
+      { kind: "grant", defaultDurationMs: DAY },
+      { now: NOW, currentScope: "space", currentKind: "revoke",
+        currentDefaultDurationMs: null });
+    assert.equal(r.ok, true);
+    assert.equal(r.value.defaultDurationMs, DAY);
+  });
+
+  it("授予模板更新时显式 null 保留既有合法有效期，不静默清空", function () {
+    const r = tc.validateTemplateBody(
+      { defaultDurationMs: null },
+      { now: NOW, currentScope: "space", currentKind: "grant",
+        currentDefaultDurationMs: DAY });
+    assert.equal(r.ok, true);
+    assert.equal(r.value.defaultDurationMs, DAY);
+  });
+
+  it("改成撤销类型时无论是否传有效期都归一为 null", function () {
+    const r = tc.validateTemplateBody(
+      { kind: "revoke", defaultDurationMs: DAY },
+      { now: NOW, currentScope: "space", currentKind: "grant",
+        currentDefaultDurationMs: DAY });
+    assert.equal(r.ok, true);
+    assert.equal(r.value.defaultDurationMs, null);
   });
 });
 
@@ -182,6 +235,25 @@ describe("用模板发起申请：停用/版本/范围", function () {
     assert.equal(r.code, "template_version_changed");
     assert.equal(r.currentVersion, 3);
     assert.equal(r.submittedVersion, 2);
+  });
+
+  it("templateVersion 严格整数校验：1abc/小数/布尔/字符串一律拒绝", function () {
+    const bad = ["1abc", "1", " 1 ", "1.0", 1.5, true, {}, [], -1, 0, NaN];
+    for (const v of bad) {
+      const r = tc.validateTemplateSubmit(tpl(), {}, ctx({ templateVersion: v }));
+      assert.equal(r.code, "invalid_template_version",
+        "templateVersion=" + JSON.stringify(v) + " 应被拒绝，实际：" +
+        JSON.stringify(r));
+      assert.equal("submittedVersion" in r, false);
+    }
+    // 合法正整数且匹配 -> 正常通过（不因严格校验误伤正常路径）
+    const ok = tc.validateTemplateSubmit(tpl(), {}, ctx({ templateVersion: 1 }));
+    assert.equal(ok.ok, true, JSON.stringify(ok));
+    // 数字形式但与当前版本不符 -> 仍按版本已变化处理
+    const changed = tc.validateTemplateSubmit(tpl({ currentVersion: 2 }), {},
+      ctx({ templateVersion: 1 }));
+    assert.equal(changed.code, "template_version_changed");
+    assert.equal(changed.submittedVersion, 1);
   });
 
   it("成员不在适用范围 member_not_in_template_scope", function () {

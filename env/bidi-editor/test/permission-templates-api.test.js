@@ -403,6 +403,89 @@ describe("申请模板与条件校验 API（顺序用例）", function () {
     assert.ok(Math.abs(span - 5 * HOUR) < 5000);
   });
 
+  /* ---------- 模板类型切换与版本号严格校验（边界） ---------- */
+
+  it("撤销模板改成授予但不给默认有效期：400 拒绝且原模板保持撤销", async function () {
+    // 专用撤销模板，避免污染共享的 ctx.tplRevoke
+    let r = await request("POST", "/api/permissions/request-templates", {
+      name: "待切换撤销模板", scope: "space", resourceId: ctx.spaceId,
+      role: "review", kind: "revoke"
+    }, { "If-Match": ctx.templateRev });
+    assert.equal(r.status, 201, JSON.stringify(r.data));
+    const revId = r.data.template.id;
+    ctx.templateRev = r.tplRev;
+
+    // 只改 kind，不带 defaultDurationMs -> 400 missing_default_duration
+    r = await request("PATCH",
+      "/api/permissions/request-templates/" + revId,
+      { kind: "grant" }, { "If-Match": ctx.templateRev });
+    assert.equal(r.status, 400);
+    assert.equal(r.data.error, "missing_default_duration");
+
+    // 显式 null 同样拒绝
+    r = await request("PATCH",
+      "/api/permissions/request-templates/" + revId,
+      { kind: "grant", defaultDurationMs: null },
+      { "If-Match": ctx.templateRev });
+    assert.equal(r.status, 400);
+    assert.equal(r.data.error, "missing_default_duration");
+
+    // 被拒不推进 templateRev，模板保持撤销类型与 v1
+    const unchanged = await request("GET",
+      "/api/permissions/request-templates/" + revId);
+    assert.equal(unchanged.status, 200);
+    assert.equal(unchanged.data.template.kind, "revoke");
+    assert.equal(unchanged.data.template.currentVersion, 1);
+    assert.equal(unchanged.data.template.defaultDurationMs, null);
+    assert.equal(unchanged.tplRev, ctx.templateRev);
+    assert.equal(unchanged.data.template.history.length, 1); // 无 update 事件
+
+    // 同时给出合法有效期 -> 切换成功，新模板可按默认窗口提交
+    r = await request("PATCH",
+      "/api/permissions/request-templates/" + revId,
+      { kind: "grant", defaultDurationMs: DAY },
+      { "If-Match": ctx.templateRev });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.template.kind, "grant");
+    assert.equal(r.data.template.defaultDurationMs, DAY);
+    assert.equal(r.data.template.currentVersion, 2);
+    ctx.templateRev = r.tplRev;
+
+    r = await as("张三")("POST",
+      "/api/permissions/request-templates/" + revId + "/submit",
+      { templateVersion: 2 }, { "If-Match": ctx.requestRev });
+    assert.equal(r.status, 201, JSON.stringify(r.data));
+    ctx.requestRev = r.reqRev;
+    assert.equal(r.data.request.templateVersion, 2);
+  });
+
+  it("templateVersion 严格整数：1abc 不能当成版本 1（400），合法数字不受影响", async function () {
+    for (const bad of ["1abc", "1", " 1 ", 1.5, true, 0, -1]) {
+      const r = await as("张三")("POST",
+        "/api/permissions/request-templates/" + ctx.tplReview + "/submit",
+        { templateVersion: bad }, { "If-Match": ctx.requestRev });
+      assert.equal(r.status, 400,
+        "templateVersion=" + JSON.stringify(bad) + " 应 400，实际 " + r.status);
+      assert.equal(r.data.error, "invalid_template_version");
+    }
+    // 非法版本不推进 requestRev、不创建申请
+    const list = await request("GET",
+      "/api/permissions/requests?scope=space&resourceId=" + ctx.spaceId);
+    const reviewReqs = list.data.requests.filter(function (q) {
+      return q.templateId === ctx.tplReview;
+    });
+    // 此前只有李四的 v2 申请一条
+    assert.equal(reviewReqs.length, 1);
+
+    // 合法整数 2 与当前版本匹配 -> 正常走到业务复核
+    const r = await as("李四")("POST",
+      "/api/permissions/request-templates/" + ctx.tplReview + "/submit",
+      { templateVersion: 2 }, { "If-Match": ctx.requestRev });
+    // 李四此前已用 v2 发起过同角色申请 -> duplicate_request（说明校验已通过）
+    assert.equal(r.status, 409);
+    assert.equal(r.data.error, "duplicate_request");
+  });
+
   it("与正式委派时间窗重叠 -> duplicate_delegation", async function () {
     // 负责人直接给赵六授予 view（窗口未来 10 小时），赵六再用模板申请 -> 拒绝
     let r = await request("POST", "/api/permissions/delegations",
