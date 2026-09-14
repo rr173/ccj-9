@@ -45,6 +45,7 @@ const replaySession = require("./replay-session-core");
 const replayArchive = require("./replay-archive-core");
 const replayReconcile = require("./replay-reconcile-core");
 const permissionCore = require("./permission-core");
+const permissionRequestCore = require("./permission-request-core");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
@@ -1071,8 +1072,11 @@ try {
 
 const permissionStore = {
   rev: 0,
+  requestRev: 0, // 申请集合独立版本号（X-Permission-Request-Rev），与委派集合 rev 独立
   delegations: [], // 全部资源的委派记录（active/revoked；过期由时间实时判定）
+  requests: [],    // 权限变更申请（grant 授予 / revoke 撤销；含终态与版本）
   logs: [],        // 授予/撤销操作记录
+  requestLogs: [], // 申请流审计记录（提交/批准/拒绝/过期/批准时冲突），只增不改
   denials: []      // 被权限校验拒绝的请求记录（含原因，只增不改）
 };
 
@@ -1102,6 +1106,12 @@ try {
     permissionStore.delegations = dataPerm.delegations;
     permissionStore.logs = Array.isArray(dataPerm.logs) ? dataPerm.logs : [];
     permissionStore.denials = Array.isArray(dataPerm.denials) ? dataPerm.denials : [];
+    // 申请流（旧文件缺字段时启动自动补齐为空集合，既有委派数据不受影响）
+    permissionStore.requestRev =
+      Number.isInteger(dataPerm.requestRev) ? dataPerm.requestRev : 0;
+    permissionStore.requests = Array.isArray(dataPerm.requests) ? dataPerm.requests : [];
+    permissionStore.requestLogs = Array.isArray(dataPerm.requestLogs)
+      ? dataPerm.requestLogs : [];
   }
 } catch (e) {
   // 文件不存在/损坏：以空存储启动，损坏文件不覆盖
@@ -1131,8 +1141,10 @@ function addPermissionLog(entry) {
   return e;
 }
 
-// 拒绝尝试留痕：best-effort 落盘，落盘失败只保留内存、不影响主拒绝响应
-function recordPermissionDenial(rec) {
+// 拒绝尝试留痕：best-effort 落盘，落盘失败只保留内存、不影响主拒绝响应。
+// defer=true 时只写入内存（调用方处于 mutatePermissions 事务内，由事务统一落盘，
+// 避免两条写队列竞争造成回滚后拒绝记录丢失）。
+function recordPermissionDenial(rec, defer) {
   const e = Object.assign({
     id: crypto.randomUUID(),
     at: new Date().toISOString()
@@ -1142,7 +1154,7 @@ function recordPermissionDenial(rec) {
     permissionStore.denials.splice(0,
       permissionStore.denials.length - permissionCore.LIMITS.LOGS_MAX);
   }
-  persistPermissions(function () {});
+  if (!defer) persistPermissions(function () {});
   return e;
 }
 
@@ -1150,32 +1162,39 @@ function recordPermissionDenial(rec) {
 function mutatePermissions(mutator, cb) {
   const backup = JSON.parse(JSON.stringify({
     rev: permissionStore.rev,
+    requestRev: permissionStore.requestRev,
     delegations: permissionStore.delegations,
+    requests: permissionStore.requests,
     logs: permissionStore.logs,
+    requestLogs: permissionStore.requestLogs,
     denials: permissionStore.denials
   }));
   let result;
   try { result = mutator(); }
   catch (e) {
-    permissionStore.rev = backup.rev;
-    permissionStore.delegations = backup.delegations;
-    permissionStore.logs = backup.logs;
-    permissionStore.denials = backup.denials;
+    restorePermissions(backup);
     cb({ status: 500, code: "internal_error", message: e.message });
     return;
   }
   persistPermissions(function (err) {
     if (err) {
-      permissionStore.rev = backup.rev;
-      permissionStore.delegations = backup.delegations;
-      permissionStore.logs = backup.logs;
-      permissionStore.denials = backup.denials;
+      restorePermissions(backup);
       cb({ status: 500, code: "persist_failed",
         message: "权限配置落盘失败，已回滚，任何委派均未被改动" });
       return;
     }
     cb(null, result);
   });
+}
+
+function restorePermissions(backup) {
+  permissionStore.rev = backup.rev;
+  permissionStore.requestRev = backup.requestRev;
+  permissionStore.delegations = backup.delegations;
+  permissionStore.requests = backup.requests;
+  permissionStore.logs = backup.logs;
+  permissionStore.requestLogs = backup.requestLogs;
+  permissionStore.denials = backup.denials;
 }
 
 /* ---------- 资源归属与成员身份 ---------- */
@@ -4694,6 +4713,7 @@ function sendJSON(res, status, body, headers) {
     "X-Archive-Rev": String(archiveStore.rev),
     "X-Reconcile-Rev": String(reconcileStore.rev),
     "X-Permission-Rev": String(permissionStore.rev),
+    "X-Permission-Request-Rev": String(permissionStore.requestRev),
     "Cache-Control": "no-store"
   }, headers || {});
   res.writeHead(status, h);
@@ -8138,6 +8158,52 @@ function startScheduler() {
   if (schedulerTimer.unref) schedulerTimer.unref();
 }
 
+/* ---------- 权限变更申请（申请/审批 -> 正式委派） ---------- */
+
+function requestsOf(scope, resourceId) {
+  return permissionStore.requests.filter(function (r) {
+    return r.scope === scope && r.resourceId === resourceId;
+  });
+}
+
+function findPermissionRequest(id) {
+  return permissionStore.requests.find(function (r) { return r.id === id; }) || null;
+}
+
+// 申请流审计日志（只增不改；随权限文件持久化，重启可查）
+function addPermissionRequestLog(entry) {
+  const e = Object.assign({
+    id: crypto.randomUUID(),
+    at: new Date().toISOString()
+  }, entry);
+  permissionStore.requestLogs.push(e);
+  if (permissionStore.requestLogs.length >
+      permissionRequestCore.LIMITS.REQUEST_LOGS_MAX) {
+    permissionStore.requestLogs.splice(0,
+      permissionStore.requestLogs.length -
+      permissionRequestCore.LIMITS.REQUEST_LOGS_MAX);
+  }
+  return e;
+}
+
+// 申请提交被拒（重复申请/自审/窗口冲突等）同样留痕，拒绝原因重启后可查。
+// defer=true 时只入内存，由调用方的 mutatePermissions 事务统一落盘。
+function recordRequestDenial(rec, defer) {
+  recordPermissionDenial(Object.assign({
+    action: "permission_request"
+  }, rec), defer);
+}
+
+function requestTtlMs() {
+  const v = Number(process.env.PERMISSION_REQUEST_TTL_MS);
+  if (Number.isFinite(v) && v > 0) return v;
+  return permissionRequestCore.LIMITS.DEFAULT_REQUEST_TTL_MS;
+}
+
+function publicRequestNow(r) {
+  return permissionRequestCore.publicRequest(r, new Date().toISOString());
+}
+
 /* ================= 角色委派与操作权限 API ================= */
 
 function publicDelegationNow(d) {
@@ -8449,8 +8515,516 @@ function handlePermissionEffective(req, res, urlObj) {
   });
 }
 
+/* ================= 权限变更申请与生效预览 API ================= */
+
+// GET /api/permissions/requests?scope=&resourceId=&member=&status=
+// 负责人可看本资源全部申请；普通成员只能看自己提交的申请（全量跨资源只对系统负责人）
+function handlePermissionRequestList(req, res, urlObj) {
+  const params = urlObj.searchParams;
+  const scope = params.get("scope");
+  const resourceId = params.get("resourceId");
+  const memberFilter = params.get("member");
+  const statusFilter = params.get("status");
+  if (scope && permissionRequestCore.SCOPES.indexOf(scope) === -1) {
+    apiError(res, 400, "invalid_scope", "资源类型必须是 space / session / batch");
+    return;
+  }
+  if (statusFilter &&
+      permissionRequestCore.STATUSES.indexOf(statusFilter) === -1) {
+    apiError(res, 400, "invalid_status",
+      "申请状态必须是 pending / approved / rejected / expired / failed");
+    return;
+  }
+  const member = currentMember(req, urlObj);
+  const isSuper = member === SUPER_OWNER;
+  let owner = null;
+  if (scope && resourceId && resourceExists(scope, resourceId)) {
+    owner = resourceOwner(scope, resourceId);
+  }
+  // 非系统负责人：必须定位到自己负责的资源，或只查自己的申请
+  if (!isSuper) {
+    const isOwnerOfTarget = !!(owner && member === owner);
+    const onlySelf = !memberFilter || memberFilter === member;
+    if (!isOwnerOfTarget && !(onlySelf)) {
+      recordPermissionDenial({
+        scope: scope || "", resourceId: resourceId || "",
+        required: "owner", member: member,
+        action: "permission_request_list_view", code: "not_resource_owner",
+        message: "只能查看自己提交的申请，或自己负责资源上的全部申请",
+        path: urlObj.pathname, method: req.method
+      });
+      apiError(res, 403, "not_resource_owner",
+        "只能查看自己提交的申请，或自己负责资源上的全部申请");
+      return;
+    }
+  }
+  let list = permissionStore.requests.slice();
+  if (scope) list = list.filter(function (r) { return r.scope === scope; });
+  if (resourceId) list = list.filter(function (r) { return r.resourceId === resourceId; });
+  if (memberFilter) list = list.filter(function (r) { return r.member === memberFilter; });
+  if (!isSuper && !(owner && member === owner)) {
+    // 普通成员：强制只能看到自己
+    list = list.filter(function (r) { return r.member === member; });
+  }
+  if (statusFilter) list = list.filter(function (r) { return r.status === statusFilter; });
+  list.sort(function (a, b) {
+    const d = Date.parse(b.createdAt) - Date.parse(a.createdAt);
+    if (d) return d;
+    return a.id < b.id ? 1 : -1;
+  });
+  sendJSON(res, 200, {
+    requestRev: permissionStore.requestRev,
+    rev: permissionStore.requestRev,
+    count: list.length,
+    requests: list.map(publicRequestNow)
+  });
+}
+
+// GET /api/permissions/requests/:id：申请人本人/资源负责人/系统负责人可查
+function handlePermissionRequestGet(req, res, urlObj, id) {
+  const r = findPermissionRequest(id);
+  if (!r) { apiError(res, 404, "request_not_found", "权限变更申请不存在"); return; }
+  const member = currentMember(req, urlObj);
+  const owner = resourceOwner(r.scope, r.resourceId);
+  if (member !== SUPER_OWNER && member !== r.member && member !== owner) {
+    recordPermissionDenial({
+      scope: r.scope, resourceId: r.resourceId, required: "owner",
+      member: member, action: "permission_request_view",
+      code: "not_resource_owner",
+      message: "只有申请人本人、资源负责人或系统负责人可以查看该申请",
+      path: urlObj.pathname, method: req.method
+    });
+    apiError(res, 403, "not_resource_owner",
+      "只有申请人本人、资源负责人或系统负责人可以查看该申请");
+    return;
+  }
+  sendJSON(res, 200, {
+    requestRev: permissionStore.requestRev,
+    request: publicRequestNow(r)
+  });
+}
+
+// POST /api/permissions/requests：普通成员提交授予/撤销申请
+// body: {kind:"grant"|"revoke", scope, resourceId, role, member(申请人),
+//        effectiveAt?, expireAt?, delegationId?(revoke), note?}
+// If-Match: X-Permission-Request-Rev（申请集合版本，旧页面提交被拒）
+function handlePermissionRequestCreate(req, res, urlObj) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.requestRev,
+                "申请集合")) return;
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body;
+    try { body = JSON.parse(raw) || {}; }
+    catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    const kind = body.kind;
+    if (["grant", "revoke"].indexOf(kind) === -1) {
+      apiError(res, 400, "invalid_kind",
+        "申请类型必须是 grant（授予申请）或 revoke（撤销申请）");
+      return;
+    }
+    const scope = typeof body.scope === "string" ? body.scope : "";
+    const resourceId = typeof body.resourceId === "string" ? body.resourceId : "";
+    if (permissionRequestCore.SCOPES.indexOf(scope) === -1) {
+      apiError(res, 400, "invalid_scope",
+        "资源类型必须是 space / session / batch 之一");
+      return;
+    }
+    if (!resourceExists(scope, resourceId)) {
+      apiError(res, 404,
+        scope === "space" ? "replay_space_not_found"
+        : scope === "session" ? "session_not_found" : "batch_not_found",
+        "资源不存在，无法对其提交权限变更申请");
+      return;
+    }
+    const actor = currentMember(req, urlObj);
+    const owner = resourceOwner(scope, resourceId) || SUPER_OWNER;
+    // 申请人以 X-Member 为准；body.member 缺省取当前身份，显式给了必须是本人，
+    // 禁止替别人申请（负责人直接授予即可，无需代申请）
+    let bodyMember = typeof body.member === "string" ? body.member.trim() : "";
+    if (bodyMember && bodyMember !== actor) {
+      recordRequestDenial({
+        scope: scope, resourceId: resourceId, required: body.role || "",
+        member: actor, targetMember: bodyMember,
+        code: "request_for_other_member",
+        message: "只能以自己的身份提交申请，不能替其他成员申请角色",
+        path: urlObj.pathname, method: req.method
+      });
+      apiError(res, 403, "request_for_other_member",
+        "只能以自己的身份提交申请，不能替其他成员申请角色");
+      return;
+    }
+    bodyMember = actor;
+    const nowIso = new Date().toISOString();
+    const reqBody = Object.assign({}, body, { member: bodyMember });
+
+    let checked;
+    if (kind === "grant") {
+      checked = permissionRequestCore.validateGrantRequest(reqBody, {
+        now: nowIso, owner: owner,
+        delegations: delegationsOf(scope, resourceId),
+        requests: requestsOf(scope, resourceId),
+        ttlMs: requestTtlMs()
+      });
+    } else {
+      checked = permissionRequestCore.validateRevokeRequest(reqBody, {
+        now: nowIso,
+        delegations: delegationsOf(scope, resourceId),
+        requests: requestsOf(scope, resourceId)
+      });
+    }
+    if (!checked.ok) {
+      const badRequest = ["invalid_kind", "invalid_scope", "missing_resource",
+        "invalid_role", "role_not_allowed_for_scope", "missing_member",
+        "member_too_long", "invalid_member", "missing_expire",
+        "invalid_expire", "expire_in_past", "invalid_effective",
+        "effective_after_expire", "invalid_note", "note_too_long",
+        "missing_delegation", "delegation_role_mismatch"].indexOf(checked.code) !== -1;
+      const status = checked.code === "delegation_not_found" ? 404
+        : badRequest ? 400 : 409;
+      // 申请被拒全部留痕（重复申请/窗口冲突/自审/已撤销等），重启可查
+      recordRequestDenial({
+        scope: scope, resourceId: resourceId, required: body.role || "",
+        member: actor, targetMember: bodyMember,
+        code: checked.code, message: checked.message,
+        delegationId: reqBody.delegationId || null,
+        path: urlObj.pathname, method: req.method
+      });
+      apiError(res, status, checked.code, checked.message,
+        checked.existingRequestId
+          ? { existingRequestId: checked.existingRequestId,
+              existingDelegationId: checked.existingDelegationId,
+              conflictingRole: checked.conflictingRole }
+          : (checked.existingDelegationId
+              ? { existingDelegationId: checked.existingDelegationId } : undefined));
+      return;
+    }
+    const v = checked.value;
+    mutatePermissions(function () {
+      const id = "preq_" + crypto.randomUUID().replace(/-/g, "");
+      const r = {
+        id: id,
+        kind: kind,
+        scope: v.scope,
+        resourceId: v.resourceId,
+        role: v.role,
+        member: v.member,
+        version: 1,
+        status: "pending",
+        note: v.note || "",
+        createdAt: nowIso,
+        createdBy: actor,
+        expiresAt: new Date(Date.parse(nowIso) + requestTtlMs()).toISOString(),
+        decidedAt: null, decidedBy: null, decision: null,
+        decisionReason: null,
+        delegationId: null,
+        effectiveAt: null, expireAt: null,
+        generatedDelegationId: null
+      };
+      if (kind === "grant") {
+        r.effectiveAt = v.effectiveAt;
+        r.expireAt = v.expireAt;
+      } else {
+        r.delegationId = v.delegationId;
+        // 冗余角色窗口，供审批时复核与预览使用
+        const target = permissionStore.delegations.find(function (d) {
+          return d.id === v.delegationId;
+        });
+        if (target) {
+          r.effectiveAt = target.effectiveAt;
+          r.expireAt = target.expireAt;
+        }
+      }
+      permissionStore.requests.push(r);
+      addPermissionRequestLog({
+        action: "submit", requestId: id, kind: kind,
+        scope: r.scope, resourceId: r.resourceId, role: r.role,
+        member: r.member, actor: actor, version: 1,
+        detail: { effectiveAt: r.effectiveAt, expireAt: r.expireAt,
+          delegationId: r.delegationId, note: r.note, expiresAt: r.expiresAt }
+      });
+      permissionStore.requestRev++;
+      return r;
+    }, function (failure, r) {
+      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      sendJSON(res, 201, {
+        requestRev: permissionStore.requestRev,
+        request: publicRequestNow(r)
+      });
+    });
+  });
+}
+
+// POST /api/permissions/requests/:id/decision
+// 负责人逐项批准/拒绝 {decision:"approve"|"reject", reason?}
+// 必须 If-Match: 申请集合 rev 且 X-Request-Version: 该申请 version（双重版本）
+function handlePermissionRequestDecision(req, res, urlObj, id) {
+  if (checkLock(res, req.headers["if-match"], permissionStore.requestRev,
+                "申请集合")) return;
+  const r = findPermissionRequest(id);
+  if (!r) { apiError(res, 404, "request_not_found", "权限变更申请不存在"); return; }
+  readBody(req, function (err, raw) {
+    if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+    let body = {};
+    if (raw) {
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+    }
+    const actor = currentMember(req, urlObj);
+    const owner = resourceOwner(r.scope, r.resourceId) || SUPER_OWNER;
+    const nowIso = new Date().toISOString();
+
+    // 过期申请：显式先判定，落 expired 终态并留痕，绝不产生权限变更
+    const live = permissionRequestCore.requestState(r, Date.parse(nowIso));
+    if (r.status === "pending" && live === "expired") {
+      mutatePermissions(function () {
+        recordRequestDenial({
+          scope: r.scope, resourceId: r.resourceId, required: r.role,
+          member: actor, targetMember: r.member, code: "request_expired",
+          message: "申请已过审批截止时间，本次审批被拒绝且不改变任何权限",
+          delegationId: r.delegationId || null, requestId: r.id,
+          path: urlObj.pathname, method: req.method
+        }, true);
+        r.status = "expired";
+        r.version++;
+        r.decidedAt = nowIso;
+        r.decidedBy = actor;
+        r.decision = "expired";
+        r.decisionReason = (body && body.reason) || "审批截止时间已过，系统自动过期";
+        addPermissionRequestLog({
+          action: "expire", requestId: r.id, kind: r.kind,
+          scope: r.scope, resourceId: r.resourceId, role: r.role,
+          member: r.member, actor: actor, version: r.version,
+          detail: { attemptedDecision: body.decision || null,
+            expiresAt: r.expiresAt, reason: r.decisionReason }
+        });
+        permissionStore.requestRev++;
+        return r;
+      }, function (failure) {
+        if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+        apiError(res, 409, "request_expired",
+          "申请已在审批截止时间后，过期审批明确拒绝，不改变任何权限",
+          { currentVersion: r.version, currentStatus: "expired",
+            expiredAt: r.expiresAt });
+      });
+      return;
+    }
+
+    const checked = permissionRequestCore.validateDecision(r, body, {
+      now: nowIso, version: req.headers["x-request-version"],
+      actor: actor, owner: owner,
+      delegations: delegationsOf(r.scope, r.resourceId),
+      requests: requestsOf(r.scope, r.resourceId)
+    });
+    if (!checked.ok) {
+      const status = checked.code === "request_not_found" ? 404
+        : (checked.code === "request_version_conflict" ||
+           checked.code === "request_not_pending") ? 409
+        : checked.code === "precondition_required" ? 428
+        : (checked.code === "not_resource_owner" ||
+           checked.code === "self_approval") ? 403 : 409;
+      recordRequestDenial({
+        scope: r.scope, resourceId: r.resourceId, required: r.role,
+        member: actor, targetMember: r.member,
+        code: checked.code, message: checked.message,
+        delegationId: r.delegationId || null, requestId: r.id,
+        action: "permission_request_decision",
+        path: urlObj.pathname, method: req.method
+      });
+      apiError(res, status, checked.code, checked.message, {
+        currentVersion: checked.currentVersion,
+        currentStatus: checked.currentStatus
+      });
+      return;
+    }
+
+    // 批准授予/拒绝：在同一个内存修改 + 单次原子落盘事务内完成，
+    // 失败整体回滚（要么正式委派与申请终态同时生效，要么都不变）。
+    mutatePermissions(function () {
+      const decision = checked.value.decision;
+      const reason = checked.value.reason;
+      r.version++;
+      r.decidedAt = nowIso;
+      r.decidedBy = actor;
+      r.decision = decision;
+      r.decisionReason = reason;
+
+      if (decision === "reject") {
+        r.status = "rejected";
+        addPermissionRequestLog({
+          action: "reject", requestId: r.id, kind: r.kind,
+          scope: r.scope, resourceId: r.resourceId, role: r.role,
+          member: r.member, actor: actor, version: r.version,
+          detail: { reason: reason }
+        });
+      } else if (r.kind === "grant") {
+        // 批准授予 -> 生成正式委派（申请批准后才生成正式委派）
+        const d = {
+          id: "del_" + crypto.randomUUID().replace(/-/g, ""),
+          scope: r.scope, resourceId: r.resourceId, role: r.role,
+          member: r.member, effectiveAt: r.effectiveAt, expireAt: r.expireAt,
+          reason: "申请 " + r.id + " 批准授予" + (r.note ? "：" + r.note : ""),
+          status: "active",
+          grantedBy: actor, grantedAt: nowIso,
+          grantedByRequestId: r.id,
+          revokedAt: null, revokedBy: null, revokeReason: null
+        };
+        permissionStore.delegations.push(d);
+        r.status = "approved";
+        r.generatedDelegationId = d.id;
+        addPermissionLog({
+          action: "grant", scope: d.scope, resourceId: d.resourceId,
+          role: d.role, member: d.member, actor: actor,
+          delegationId: d.id, requestId: r.id,
+          detail: { effectiveAt: d.effectiveAt, expireAt: d.expireAt,
+            reason: d.reason, viaRequest: r.id }
+        });
+        addPermissionRequestLog({
+          action: "approve_grant", requestId: r.id, kind: "grant",
+          scope: r.scope, resourceId: r.resourceId, role: r.role,
+          member: r.member, actor: actor, version: r.version,
+          delegationId: d.id,
+          detail: { reason: reason, generatedDelegationId: d.id }
+        });
+        permissionStore.rev++; // 正式委派集合独立推进
+      } else {
+        // 批准撤销 -> 对目标正式委派执行撤销
+        const d = permissionStore.delegations.find(function (x) {
+          return x.id === r.delegationId;
+        });
+        if (!d) throw new Error("delegation missing at commit"); // 触发回滚
+        d.status = "revoked";
+        d.revokedAt = nowIso;
+        d.revokedBy = actor;
+        d.revokeReason = "撤销申请 " + r.id + " 批准" +
+          (reason ? "：" + reason : "");
+        r.status = "approved";
+        addPermissionLog({
+          action: "revoke", scope: d.scope, resourceId: d.resourceId,
+          role: d.role, member: d.member, actor: actor,
+          delegationId: d.id, requestId: r.id,
+          detail: { reason: d.revokeReason, viaRequest: r.id }
+        });
+        addPermissionRequestLog({
+          action: "approve_revoke", requestId: r.id, kind: "revoke",
+          scope: r.scope, resourceId: r.resourceId, role: r.role,
+          member: r.member, actor: actor, version: r.version,
+          delegationId: d.id,
+          detail: { reason: reason }
+        });
+        permissionStore.rev++; // 正式委派集合独立推进
+      }
+      permissionStore.requestRev++;
+      return r;
+    }, function (failure, out) {
+      if (failure) { apiError(res, failure.status, failure.code, failure.message); return; }
+      sendJSON(res, 200, {
+        requestRev: permissionStore.requestRev,
+        rev: permissionStore.rev,
+        request: publicRequestNow(out),
+        delegation: out.generatedDelegationId
+          ? publicDelegationNow(findDelegation(out.generatedDelegationId)) : null
+      });
+    });
+  });
+}
+
+// GET /api/permissions/requests/logs?from=&to=&scope=&resourceId=&member=
+// 申请流审计：系统负责人全量；资源负责人可看本资源；申请人可看自己的
+function handlePermissionRequestLogs(req, res, urlObj) {
+  const r = filterPermissionLogs(permissionStore.requestLogs, urlObj.searchParams);
+  if (r.error) { apiError(res, r.error.status, r.error.code, r.error.message); return; }
+  const member = currentMember(req, urlObj);
+  const scope = urlObj.searchParams.get("scope");
+  const resourceId = urlObj.searchParams.get("resourceId");
+  let entries = r.value;
+  if (member !== SUPER_OWNER) {
+    const owner = scope && resourceId && resourceExists(scope, resourceId)
+      ? resourceOwner(scope, resourceId) : null;
+    if (!(owner && member === owner)) {
+      entries = entries.filter(function (e) { return e.member === member || e.actor === member; });
+    }
+  }
+  sendJSON(res, 200, {
+    requestRev: permissionStore.requestRev,
+    count: entries.length,
+    logs: entries
+  });
+}
+
+// GET /api/permissions/preview?scope=&resourceId=&member=&at=
+// 按指定未来时刻预览某成员的有效角色；纯只读计算，绝不修改正式权限。
+// 任何人都可以预览自己；预览他人需要资源负责人/系统负责人。
+function handlePermissionPreview(req, res, urlObj) {
+  const params = urlObj.searchParams;
+  const scope = params.get("scope") || "";
+  const resourceId = params.get("resourceId") || "";
+  if (permissionRequestCore.SCOPES.indexOf(scope) === -1 || !resourceId) {
+    apiError(res, 400, "invalid_target",
+      "必须指定 scope（space/session/batch）与 resourceId");
+    return;
+  }
+  if (!resourceExists(scope, resourceId)) {
+    apiError(res, 404,
+      scope === "space" ? "replay_space_not_found"
+      : scope === "session" ? "session_not_found" : "batch_not_found",
+      "资源不存在");
+    return;
+  }
+  const atRaw = params.get("at");
+  const nowIso = new Date().toISOString();
+  if (atRaw && !permissionRequestCore.isISODateString(atRaw)) {
+    apiError(res, 400, "invalid_at", "预览时刻不是合法 ISO 时间");
+    return;
+  }
+  const actor = currentMember(req, urlObj);
+  let targetMember = params.get("member");
+  if (targetMember === null || targetMember === "") targetMember = actor;
+  const owner = resourceOwner(scope, resourceId);
+  if (actor !== SUPER_OWNER && actor !== targetMember &&
+      !(owner && actor === owner)) {
+    recordPermissionDenial({
+      scope: scope, resourceId: resourceId, required: "owner",
+      member: actor, targetMember: targetMember,
+      action: "permission_preview", code: "not_resource_owner",
+      message: "只能预览自己的未来角色；预览他人需资源负责人身份",
+      path: urlObj.pathname, method: req.method
+    });
+    apiError(res, 403, "not_resource_owner",
+      "只能预览自己的未来角色；预览他人需资源负责人身份");
+    return;
+  }
+
+  // 会话继承所属空间委派（与 guardPermission/effective 同口径）
+  let delegations = delegationsOf(scope, resourceId);
+  if (scope === "session") {
+    const found = findSessionAnySpace(resourceId);
+    if (found) delegations = effectiveSessionDelegations(found.space, resourceId);
+  }
+  // 会话上的申请不继承空间申请（申请针对具体资源），保持申请归属清晰
+  const requests = requestsOf(scope, resourceId);
+  const result = permissionRequestCore.previewEffective({
+    scope: scope, resourceId: resourceId, member: targetMember,
+    at: atRaw || nowIso, now: nowIso, owner: owner,
+    delegations: delegations, requests: requests
+  });
+  if (!result.ok) { apiError(res, 400, result.code, result.message); return; }
+  sendJSON(res, 200, Object.assign({
+    rev: permissionStore.rev,
+    requestRev: permissionStore.requestRev
+  }, result.value, {
+    // 预览依据的时间点与数据版本随响应返回，重启后同一时刻结果一致
+    basedOn: {
+      permissionRev: permissionStore.rev,
+      requestRev: permissionStore.requestRev,
+      computedAt: nowIso
+    }
+  }));
+}
+
 function handlePermissions(req, res, tail, urlObj) {
   // tail: ["delegations"] | ["delegations", ":id", "revoke"] |
+  //       ["requests"] | ["requests", ":id"] | ["requests", ":id", "decision"] |
+  //       ["requests", "logs"] | ["preview"] |
   //       ["logs"] | ["denials"] | ["effective"]
   if (tail.length === 1 && tail[0] === "delegations" && req.method === "GET") {
     handlePermissionList(req, res, urlObj);
@@ -8463,6 +9037,33 @@ function handlePermissions(req, res, tail, urlObj) {
   if (tail.length === 3 && tail[0] === "delegations" &&
       tail[2] === "revoke" && req.method === "POST") {
     handlePermissionRevoke(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 1 && tail[0] === "requests" && req.method === "GET") {
+    handlePermissionRequestList(req, res, urlObj);
+    return;
+  }
+  if (tail.length === 1 && tail[0] === "requests" && req.method === "POST") {
+    handlePermissionRequestCreate(req, res, urlObj);
+    return;
+  }
+  if (tail.length === 2 && tail[0] === "requests" &&
+      tail[1] !== "logs" && req.method === "GET") {
+    handlePermissionRequestGet(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 3 && tail[0] === "requests" &&
+      tail[2] === "decision" && req.method === "POST") {
+    handlePermissionRequestDecision(req, res, urlObj, tail[1]);
+    return;
+  }
+  if (tail.length === 2 && tail[0] === "requests" &&
+      tail[1] === "logs" && req.method === "GET") {
+    handlePermissionRequestLogs(req, res, urlObj);
+    return;
+  }
+  if (tail.length === 1 && tail[0] === "preview" && req.method === "GET") {
+    handlePermissionPreview(req, res, urlObj);
     return;
   }
   if (tail.length === 1 && tail[0] === "effective" && req.method === "GET") {

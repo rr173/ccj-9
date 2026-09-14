@@ -40,6 +40,13 @@ A/B）；归档被篡改、缺失引用或校验摘要不一致时明确标出�
 任一差异项缺少引用、审批不足、目标标识冲突或写入失败时**整批拒绝**（批次 failed 并
 留下可查询的失败原因与操作记录）。差异结果、纠错批次、审批记录、纠错归档与失败原因
 独立持久化到 `data/replay-reconcile.json`，服务重启后仍可继续查看与处理。
+在角色委派之上再提供**权限变更申请与生效预览**：普通成员可对回放空间、复核
+会话或纠错批次提交授予/撤销角色申请，负责人逐项批准或拒绝（拒绝必须填原因、
+不能审批自己的申请、过期或旧版本审批明确拒绝），**只有批准才生成正式委派**；
+申请集合与正式委派集合各有独立版本号，申请还有逐条 version 与提交/批准/拒绝/
+过期完整审计链；页面和接口可按指定未来时刻预览某成员的有效角色，分列即将生效、
+即将失效、已批准撤销与待处理申请，预览纯只读、绝不修改正式权限；申请状态、
+处理人/时间/拒绝原因与预览依据时间点随权限文件持久化，服务重启后仍可查询。
 
 ## 双向编辑的需求与实现对照
 
@@ -871,6 +878,108 @@ GET    /api/permissions/denials[?from=&to=&scope=&resourceId=]     拒绝原因�
 403 `unauthorized`/`role_expired`/`role_not_active`/`not_resource_owner`/
 `owner_self_approval`/`missing_member`；404 资源或委派不存在；428 缺 `If-Match`。
 
+## 权限变更申请与生效预览
+
+在负责人直接授予/撤销之上增加**申请—审批**流程：普通成员可针对回放空间、
+复核会话或纠错批次提交**授予申请（grant）**或**撤销申请（revoke）**，
+负责人逐项**批准/拒绝**并填写原因；**只有批准才生成正式委派**（授予）或
+执行正式撤销，拒绝不改变任何权限。申请人和负责人都能看到当前状态、处理人、
+处理时间与拒绝原因。
+
+### 申请流与版本链
+
+- 申请集合有**独立单调版本号** `requestRev`（响应头 `X-Permission-Request-Rev`），
+  与正式委派集合 `X-Permission-Rev` 相互独立；申请提交/审批必须 `If-Match`
+  严格等于当前 requestRev（旧页面 409 `version_conflict`，缺省 428）。
+- 每条申请有独立单调 `version`：创建为 1，每次决定推进；审批还必须携带
+  `X-Request-Version: <version>`，旧版本审批 409 `request_version_conflict`。
+  因此并发审批同一申请时只可能有一次成功（胜出者写入，落败者收到
+  `version_conflict` 或 `request_version_conflict`，正式委派只生成一条）。
+- 申请创建时按 `PERMISSION_REQUEST_TTL_MS`（默认 72 小时）锁定审批截止
+  `expiresAt`；截止后审批一律 409 `request_expired`，申请落 `expired` 终态、
+  **不改变任何权限**；过期申请不阻止重新申请。
+- 申请记录：`id/kind/scope/resourceId/role/member/version/status`
+  （pending/approved/rejected/expired）、`note`、期望时间窗（grant）或目标
+  委派 id（revoke）、创建人/时间、审批截止、处理人/时间/决定/原因、批准授予
+  生成的正式委派 id（`generatedDelegationId`）。
+- `requestLogs` 只增不改：`submit`/`approve_grant`/`approve_revoke`/`reject`/
+  `expire`，均带 requestId、version、操作人、成员与正式委派 id；正式委派侧
+  的 grant/revoke 日志带 `requestId` 反查，申请、审批、正式委派、撤销形成
+  完整审计链。
+
+### 提交与审批规则（任一失败整次拒绝、不写盘）
+
+| 场景 | 结果 |
+|---|---|
+| 非法 kind/scope/role、缺成员/失效时间、时间窗非法 | 400（`invalid_kind`/`invalid_scope`/`missing_expire` 等） |
+| 资源不存在 | 404（`replay_space_not_found`/`session_not_found`/`batch_not_found`） |
+| 替别人申请（body.member 与当前身份不一致） | 403 `request_for_other_member` |
+| 同成员同角色已有未过期 pending 授予申请 | 409 `duplicate_request`（带 `existingRequestId`） |
+| approve/execute 与其它 pending 申请时间窗重叠 | 409 `conflicting_request_roles` |
+| 与正式委派时间窗重叠 / 职责冲突 / 负责人自审 | 409 `duplicate_delegation`/`conflicting_roles`/`approver_is_owner` |
+| 撤销不存在的委派 / 非本人委派 / 角色或资源不匹配 | 404 `delegation_not_found` / 409 `not_delegation_member`/`delegation_role_mismatch`/`delegation_scope_mismatch` |
+| 撤销已撤销/已过期委派、重复 pending 撤销申请 | 409 `duplicate_revoke`/`delegation_expired`/`duplicate_revoke_request` |
+| 非负责人审批 | 403 `not_resource_owner` |
+| 负责人审批自己提交的申请 | 403 `self_approval`（申请与审批职责分离） |
+| 拒绝未填原因 | 409 `reject_reason_required` |
+| 审批非 pending 申请（已批准/已拒绝/已过期终态） | 409 `request_not_pending`（历史只读） |
+| 过期审批 | 409 `request_expired`（落终态、权限不变） |
+| 批准瞬间重新校验失败（期间被直授/撤销/自然过期） | 409 `duplicate_delegation`/`duplicate_revoke`/`delegation_expired`，不生成正式委派 |
+
+**批准与正式委派同事务**：批准授予在同一次内存修改 + 单次原子落盘内生成
+正式委派、推进申请 version 与两个集合版本；批准撤销在同事务内把目标委派置
+revoked。落盘失败整体回滚（申请终态与正式委派要么同时生效，要么都不变）。
+批准后下一个业务请求立即按新角色判定（即时生效）。
+
+### 生效预览（指定未来时刻，纯只读）
+
+`GET /api/permissions/preview?scope=&resourceId=&member=&at=<ISO>` 计算该
+成员在 `at` 时刻（必须合法 ISO，允许未来或过去）持有的有效角色，并分四组：
+
+| 分组 | 含义 |
+|---|---|
+| `activating` | 已批准的正式委派当前未生效、`at` 时刻已生效（即将生效） |
+| `expiring` | 当前生效、`at` 时刻已自然到期（即将失效） |
+| `revoking` | 经已批准撤销申请在 `at` 前撤销的当前生效委派（撤销） |
+| `pending` | 本人 pending 授予/撤销申请的期望值（**待处理，不进入 roles**） |
+
+响应另含 `roles`（at 时刻有效角色）、`currentRoles`、`isFuture` 与
+`basedOn {permissionRev, requestRev, computedAt}`——预览结果所依据的数据版本
+与时间点随响应给出，重启后同一时刻结果一致。预览**不写盘、不推进任何版本、
+不修改正式权限**；pending 申请一律不计入 `roles`（绝不臆测申请会被批准）。
+普通成员只能预览自己；预览他人需资源负责人或系统负责人身份。会话预览同样
+继承所属空间委派。
+
+### 重启恢复与历史只读
+
+申请、申请 version、审批截止、处理记录、拒绝原因、生成的正式委派关联全部
+随 `./data/permissions.json` 原子落盘（旧文件缺字段时启动自动补齐为空集合，
+不影响既有委派）；重启后申请状态、过期判定、预览所依据的时间点、拒绝原因
+与处理记录全部恢复。已终态申请（approved/rejected/expired）永久只读，
+不能再次审批；正式委派保留 `grantedByRequestId` 等审计关联，不被改写。
+
+### 权限变更 HTTP API 摘要
+
+```
+GET    /api/permissions/requests[?scope=&resourceId=&member=&status=]
+                                                申请列表（成员只见自己；负责人见本资源全部）
+POST   /api/permissions/requests                提交 {kind,scope,resourceId,role,effectiveAt?,expireAt?,delegationId?,note?}（If-Match: requestRev）
+GET    /api/permissions/requests/:id            申请详情（申请人/资源负责人/系统负责人）
+POST   /api/permissions/requests/:id/decision   逐项审批 {decision:"approve"|"reject",reason?}（If-Match + X-Request-Version）
+GET    /api/permissions/requests/logs[?from=&to=&scope=&resourceId=&member=]
+                                                申请流审计（submit/approve_*/reject/expire，时间倒序）
+GET    /api/permissions/preview?scope=&resourceId=&member=&at=<ISO>
+                                                指定未来时刻的有效角色与四组预览（纯只读）
+```
+
+错误码补充：400 `invalid_kind`/`missing_delegation`；403 `self_approval`/
+`request_for_other_member`；404 `request_not_found`；
+409 `duplicate_request`/`duplicate_revoke_request`/`conflicting_request_roles`/
+`not_delegation_member`/`delegation_role_mismatch`/`delegation_scope_mismatch`/
+`reject_reason_required`/`request_expired`/`request_not_pending`/
+`request_version_conflict`；428 缺 `If-Match` 或 `X-Request-Version`。
+审批截止可用 `PERMISSION_REQUEST_TTL_MS` 调整（默认 72 小时）。
+
 ## 其他编辑器功能
 
 - 每段独立方向：`自动 / 从左到右 / 从右到左`（工具栏按钮或 `Ctrl/⌘+Shift+A/L/R`）；`自动` 按该段首个强方向字符判定基准方向
@@ -896,10 +1005,13 @@ node server.js          # http://localhost:8080
 （差异结果/纠错批次/审批记录/纠错归档/失败留痕）独立写到
 `./data/replay-reconcile.json`（`REPLAY_RECONCILE_FILE` 覆盖，集合版本号为
 响应头 `X-Reconcile-Rev`，两阶段写盘失败重启自动对账清理孤儿纠错空间），
-**角色委派与操作权限**（委派/有效期/撤销/拒绝原因/操作记录）独立写到
-`./data/permissions.json`（`PERMISSIONS_FILE` 覆盖，集合版本号为响应头
-`X-Permission-Rev`，授予/撤销必须 If-Match 严格相等，重启后有效期、拒绝原因
-与操作记录全部恢复），
+**角色委派与操作权限**（委派/有效期/撤销/拒绝原因/操作记录，以及权限变更申请的
+申请记录、独立 requestRev、逐条 version、审批处理记录与申请流审计）独立写到
+`./data/permissions.json`（`PERMISSIONS_FILE` 覆盖，正式委派集合版本号为响应头
+`X-Permission-Rev`，申请集合独立版本号为 `X-Permission-Request-Rev`，
+授予/撤销/申请/审批必须 If-Match 严格相等、审批还须 X-Request-Version 等于
+申请 version，重启后有效期、申请状态与截止、拒绝原因与操作记录全部恢复；
+申请审批截止时长用 `PERMISSION_REQUEST_TTL_MS` 调整，默认 72 小时），
 导入请求体上限可用 `REPLAY_BODY_LIMIT_BYTES` 调整（默认 32MB）；
 定时轮询间隔用 `DECISION_SCHEDULER_INTERVAL_MS` 调整（默认 1000 毫秒）。
 
@@ -935,6 +1047,8 @@ node --test test/
 - `test/replay-reconcile-api.test.js`：真实起服务走完线上任务→导入→归档→恢复空间再归档得到同内容两归档，覆盖差异比较（六维定位/交换顺序幂等/缺 If-Match 428/缺归档 404/同一归档 400/不推进归档与线上 rev）、批次校验与创建、X-Batch-Version 双重锁、提交重校验、审批（非审批人 403/非法 decision 400/本轮重复 409/驳回后修改重提/全员通过）、审批不足执行整批 failed 留痕不新增空间、审批通过执行（只读纠错归档+新包标识+新回放空间、内容指纹同基线、人工标记、纠错会话只读、可继续新建会话）、原归档/原空间/线上不变、归档恢复后旧差异 409 diff_conflict 与旧批次提交 failed、纠错归档下载只读、两阶段崩溃孤儿空间重启清理、差异/批次/审批/失败原因重启恢复、对账路径无线上动作接口
 - `test/permission-core.test.js`：角色矩阵、授予校验（缺字段/非法 scope/role/时间、space 不能 approve、立即生效缺省）、重复委派（窗重叠拒绝/相接允许/撤销与过期记录不阻挡）、approve+execute 同人窗冲突与不重叠允许、负责人自审（approve 拒绝/execute 允许）、委派状态按时间实时计算（active/pending/expired/revoked）、角色层级隐含、authorize（未管控放行/负责人放行/未授权/缺身份/过期/未生效/高角色满足低角色）、activeRoles、撤销校验、时间窗半开区间
 - `test/permissions-api.test.js`：真实起服务走完线上任务→导入→意见→会话→两个归档→差异→纠错批次，覆盖非负责人配置 403 并留拒绝记录、授予校验（缺失效时间/不存在资源/space 配 approve/缺 If-Match）、授予后陌生人立即 403 且列表不可见、view 角色只读不能写、空间 review 角色继承到会话（非参与人仍 403 not_participant、无角色参与人 403 unauthorized）、会话级单独委派后可提交结论、角色未生效/已过期拒绝、重复委派 409、旧 rev 并发提交 409 不覆盖新配置、撤销后立即失权/重复撤销 409、批次 approve+execute 冲突、负责人不能被授 approve、批次列表/详情可见性过滤、审批角色门槛、负责人自审 403、审批不足执行整批 failed 留痕、approve 角色不能执行、execute 执行成功且历史保留原执行人、操作记录/拒绝原因查询、重启后委派/有效期/撤销/拒绝原因/操作记录恢复且规则继续生效、历史结论保留原操作人与时间、重启后旧 rev 仍冲突
+- `test/permission-request-core.test.js`：申请/审批纯逻辑——授予申请（重复申请/已过期申请不阻挡/与正式委派重复/职责冲突窗口/负责人自审/非法输入）、撤销申请（非本人/角色不匹配/已撤销/已过期/重复撤销申请）、审批（缺版本/旧版本/非 pending/过期/非负责人/自审/非法决定/拒绝必填原因/批准时复核重复委派与撤销目标状态）、生效预览（即将生效/即将失效/已批准撤销/待处理不计入角色/非法时刻）
+- `test/permission-requests-api.test.js`：真实起服务走完空间→会话→两个归档→差异→纠错批次的准备链路后，覆盖跨资源申请（space/session/batch）、待处理申请不改变授权、重复申请/替人申请/越权查看明细拒绝、拒绝必填原因且拒绝不改变权限（正式委派 rev 不推进）、批准后下一个请求即时生效、非负责人审批 403、负责人审批自己的申请 403 self_approval、并发审批同一申请只成功一次（败者 version_conflict/request_version_conflict，串行旧 X-Request-Version 单独 409）、过期边界（截止后审批落 expired 终态且权限不变/终态只读）、过期后重新申请并批准、撤销申请批准即时失权/重复撤销申请拒绝、撤销后重新申请、未来生效委派 activating 预览、待处理申请只在 pending 组、即将失效与已批准撤销分组、预览不推 rev、普通成员不能预览他人/非法 at 400、申请审计链动作齐全且普通成员只见自己相关记录、旧 requestRev 提交 409、重启后申请状态/版本/拒绝原因/正式委派 rev/预览依据全部恢复、终态申请只读
 
 ## Docker 部署
 
@@ -972,7 +1086,8 @@ replay-archive.js 复核会话归档中心 UI：归档中心（按空间/参与�
 replay-reconcile-core.js 归档差异与纠错对账中心纯逻辑（浏览器与 Node 共用，依赖 replay-core/replay-review-core/replay-archive-core）：两归档完整性预检（损坏/缺引用/摘要不一致明确失败不合并）、按归档 id 归一化的确定性六维差异（锁定意见/逐条结论/冲突/时间线多重集/内容指纹/恢复状态，稳定差异 id 与定位器、交换顺序结果一致）、差异指纹、纠错批次输入校验（负责人/截止/审批人/基线归档/逐条 keep_a/keep_b/manual 裁决）、提交前重校验（归档未替换+差异指纹未变）、纠错合成（意见/条目/时间线合并、目标标识冲突、缺引用整批拒绝、内容寻址纠错归档与新标识审计包）、纠错归档完整性校验、新纠错空间构建
 replay-reconcile.js 归档差异与纠错对账中心 UI：新建差异比较（选两个归档）、差异详情（六维分组、A/B 对照、损坏原因展示）、创建纠错批次（逐差异选择保留 A/采用 B/人工复核、负责人/截止/审批人/基线）、批次提交/记名审批通过驳回/执行、失败原因与审批记录、纠错归档详情（校验摘要/裁决/新空间溯源）/下载、操作记录
 permission-core.js 角色委派纯逻辑（浏览器与 Node 共用）：资源×角色矩阵、授予校验（生效/失效时间、重复委派、approve/execute 职责冲突、负责人自审）、实时角色状态（active/pending/expired/revoked）、层级包含（高角色隐含查看）、授权判定（未授权/角色过期/角色未生效）、撤销校验
-permissions.js   角色委派与操作权限 UI：当前成员身份切换（X-Member，持久化）、授予四类角色（成员/生效/失效时间/原因）、委派列表与撤销、当前生效角色查询、授予/撤销操作记录与拒绝原因查看
+permission-request-core.js 权限变更申请与生效预览纯逻辑（浏览器与 Node 共用）：授予/撤销申请校验（重复申请、与正式委派及待处理申请的时间窗冲突、职责冲突、负责人自审、只能申请撤销本人委派）、审批校验（X-Request-Version 旧版本拒绝、过期边界、负责人自审 self_approval、拒绝必填原因、批准瞬间重新校验）、未来时刻生效预览（即将生效/即将失效/已批准撤销/待处理申请四分组，pending 不臆测为角色）
+permissions.js   角色委派与操作权限 UI：当前成员身份切换（X-Member，持久化）、授予四类角色（成员/生效/失效时间/原因）、委派列表与撤销、当前生效角色查询、授予/撤销操作记录与拒绝原因查看、权限变更申请提交（授予/撤销）、申请清单逐项批准/拒绝（双重版本号）、申请审计记录、指定未来时刻的生效预览（四分组）
 server.js         零依赖服务：静态文件 + 快照、批注、审阅批次、审阅决策、执行队列（依赖/审批门控）JSON API（四集合乐观锁、原子落盘、定时执行调度器与门控对账）+ 执行回放（审计包只读导出、全量校验后导入独立回放空间、失败记录、筛选条件与校验结果持久化）+ 历史证据复核（空间 rev 与意见 version 双重乐观锁、引用存在性校验、终态保护、状态记录、清单纯只读导出、随回放空间原子持久化）+ 复核会话（创建锁定意见版本与引用摘要、空间 rev 与会话 version 双重乐观锁、结论冲突标记拒绝覆盖、过期拒绝、操作记录、报告纯只读导出、随回放空间原子持久化）+ 复核会话归档中心（独立存储与 X-Archive-Rev；会话状态与空间版本校验、内容寻址幂等/版本冲突、归档完整性校验、先预览后两阶段事务恢复到新回放空间、归档/预览/恢复/筛选操作记录、崩溃对账、重启恢复）+ 归档差异与纠错对账中心（独立存储与 X-Reconcile-Rev；两归档完整性预检、确定性六维差异、批次双重乐观锁、提交/执行前归档未替换与差异指纹重校验、记名审批轮次、审批不足/缺引用/目标标识冲突整批 failed 留痕、两阶段事务生成只读纠错归档与新回放空间、孤儿纠错空间崩溃对账、重启恢复）+ 角色委派与操作权限（独立存储与 X-Permission-Rev；space/session/batch × view/review/approve/execute 角色矩阵、生效/失效时间实时判定、重复委派/职责冲突/负责人自审拒绝、X-Member 身份、会话继承空间角色、审批/执行/查看接口角色守卫、拒绝原因与操作记录持久化、重启恢复）
 test/             node:test 单元与集成测试
 Dockerfile        node:20-alpine，EXPOSE 8080，数据卷 /app/data
