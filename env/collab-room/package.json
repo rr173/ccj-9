@@ -1,0 +1,13 @@
+{
+  "name": "collab-room",
+  "version": "1.0.0",
+  "description": "双向文本多人协作编辑房间（字素簇边界 / RTL 光标 / 离线批次 / 冲突区 / 持久化）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/integration.test.js"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}
