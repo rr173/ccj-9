@@ -48,6 +48,7 @@ const permissionCore = require("./permission-core");
 const permissionRequestCore = require("./permission-request-core");
 const permissionRequestGroupCore = require("./permission-request-group-core");
 const permissionTemplateCore = require("./permission-template-core");
+const bidiLabCore = require("./bidi-lab-core");
 
 const ROOT = __dirname;
 const PORT = Number(process.argv[2] || process.env.PORT || 8080);
@@ -70,6 +71,9 @@ const RECONCILE_FILE = process.env.REPLAY_RECONCILE_FILE ||
 // 角色委派与操作权限：委派记录（授予/撤销/有效期/拒绝原因/操作记录）
 const PERMISSION_FILE = process.env.PERMISSIONS_FILE ||
   path.join(ROOT, "data", "permissions.json");
+// 双向安全实验室：诊断样例 / 报告 / 修复记录 / 撤销结果（与线上编辑正文完全隔离）
+const BIDI_LAB_FILE = process.env.BIDI_LAB_FILE ||
+  path.join(ROOT, "data", "bidi-lab.json");
 const REQUEST_BODY_LIMIT = 4 * 1024 * 1024; // 传输字节上限（校验逻辑另有字符上限）
 // 审计包内含锁定文本，允许更大的导入请求体（可用环境变量覆盖）
 const REPLAY_BODY_LIMIT = Number(process.env.REPLAY_BODY_LIMIT_BYTES) ||
@@ -4781,6 +4785,7 @@ function sendJSON(res, status, body, headers) {
     "X-Permission-Request-Rev": String(permissionStore.requestRev),
     "X-Permission-Group-Rev": String(permissionStore.groupRev),
     "X-Permission-Template-Rev": String(permissionStore.templateRev),
+    "X-Bidi-Lab-Rev": String(labStore.rev),
     "Cache-Control": "no-store"
   }, headers || {});
   res.writeHead(status, h);
@@ -11256,6 +11261,296 @@ function handlePermissions(req, res, tail, urlObj) {
   apiError(res, 404, "not_found", "权限接口不存在");
 }
 
+/* ================= 双向安全实验室（样例 / 报告 / 修复记录 / 撤销结果） =================
+ * 独立存储与独立集合版本号；与编辑器正文、快照、批注等数据完全隔离。
+ * 实验室的任何接口都不会回写编辑器正文——修复只在浏览器本地作用于编辑器。
+ */
+
+const labStore = { rev: 0, samples: [], records: [] };
+
+function persistLab(cb) {
+  const tmp = BIDI_LAB_FILE + ".tmp";
+  fs.mkdir(path.dirname(BIDI_LAB_FILE), { recursive: true }, function () {
+    fs.writeFile(tmp, JSON.stringify(labStore), function (err) {
+      if (err) { cb(err); return; }
+      fs.rename(tmp, BIDI_LAB_FILE, cb);
+    });
+  });
+}
+
+try {
+  const raw = fs.readFileSync(BIDI_LAB_FILE, "utf8");
+  const data = JSON.parse(raw);
+  if (Number.isInteger(data.rev) && Array.isArray(data.samples) &&
+      Array.isArray(data.records)) {
+    labStore.rev = data.rev;
+    labStore.samples = data.samples;
+    labStore.records = data.records;
+  }
+} catch (e) { /* 文件不存在/损坏：空存储启动，不覆盖旧文件 */ }
+
+function findLabSample(id) {
+  return labStore.samples.find(function (s) { return s.id === id; });
+}
+function findLabRecord(id) {
+  return labStore.records.find(function (r) { return r.id === id; });
+}
+
+function publicLabSample(s) {
+  return {
+    id: s.id, name: s.name, createdAt: s.createdAt, updatedAt: s.updatedAt,
+    paragraphs: s.paragraphs, expected: s.expected || [],
+    anchors: s.anchors || [], anchorFp: s.anchorFp != null ? s.anchorFp : null,
+    lastRecheck: s.lastRecheck || null
+  };
+}
+
+function publicLabRecord(r) {
+  return {
+    id: r.id, kind: r.kind, at: r.at, note: r.note || "",
+    paraCount: r.paraCount || 0, issueCount: r.issueCount || 0,
+    applied: r.applied || [],
+    contentFp: r.contentFp || null,
+    renderFp: r.renderFp || null,
+    // 报告类记录可携带完整问题清单（修复/撤销只存摘要）
+    report: r.report || null,
+    undoOf: r.undoOf || null,
+    undoResult: r.undoResult || null
+  };
+}
+
+function mutateLab(mutator, cb) {
+  let rollback = JSON.parse(JSON.stringify(labStore));
+  try {
+    const out = mutator();
+    persistLab(function (err) {
+      if (err) {
+        labStore.rev = rollback.rev;
+        labStore.samples = rollback.samples;
+        labStore.records = rollback.records;
+        cb(err);
+        return;
+      }
+      cb(null, out);
+    });
+  } catch (e) {
+    labStore.rev = rollback.rev;
+    labStore.samples = rollback.samples;
+    labStore.records = rollback.records;
+    cb(e);
+  }
+}
+
+// GET    /api/bidi-lab/samples
+// POST   /api/bidi-lab/samples
+// GET    /api/bidi-lab/samples/:id
+// PUT    /api/bidi-lab/samples/:id
+// DELETE /api/bidi-lab/samples/:id
+// POST   /api/bidi-lab/samples/recheck
+// GET    /api/bidi-lab/records
+// POST   /api/bidi-lab/records
+function handleBidiLab(req, res, tail, urlObj) {
+  if (tail.length === 1 && tail[0] === "samples" && req.method === "GET") {
+    sendJSON(res, 200, { rev: labStore.rev,
+      samples: labStore.samples.map(publicLabSample) });
+    return;
+  }
+
+  if (tail.length === 1 && tail[0] === "samples" && req.method === "POST") {
+    if (checkLock(res, req.headers["if-match"], labStore.rev, "实验室集合")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body;
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      const checked = bidiLabCore.validateSample(body);
+      if (!checked.ok) {
+        apiError(res, checked.status, checked.code, checked.message);
+        return;
+      }
+      if (labStore.samples.length >= bidiLabCore.LIMITS.SAMPLE_MAX_COUNT) {
+        apiError(res, 413, "too_many_samples",
+          "样例数量已达上限 " + bidiLabCore.LIMITS.SAMPLE_MAX_COUNT);
+        return;
+      }
+      const nameTaken = labStore.samples.some(function (s) {
+        return s.name === checked.value.name;
+      });
+      if (nameTaken) { apiError(res, 409, "duplicate_name", "已存在同名样例"); return; }
+
+      mutateLab(function () {
+        const now = new Date().toISOString();
+        const rec = Object.assign({
+          id: crypto.randomUUID(),
+          createdAt: now, updatedAt: now
+        }, checked.value);
+        rec.anchorFp = bidiLabCore.anchorFingerprint(checked.value);
+        rec.lastRecheck = null;
+        labStore.samples.push(rec);
+        labStore.rev++;
+        return rec;
+      }, function (perr, rec) {
+        if (perr) { apiError(res, 500, "persist_failed", "样例保存失败（写入存储失败），本次未保留任何内容"); return; }
+        sendJSON(res, 201, { rev: labStore.rev, sample: publicLabSample(rec) });
+      });
+    });
+    return;
+  }
+
+  if (tail.length === 2 && tail[0] === "samples" && req.method === "GET") {
+    const s = findLabSample(tail[1]);
+    if (!s) { apiError(res, 404, "sample_not_found", "样例不存在"); return; }
+    sendJSON(res, 200, { rev: labStore.rev, sample: publicLabSample(s) });
+    return;
+  }
+
+  if (tail.length === 2 && tail[0] === "samples" && req.method === "PUT") {
+    if (checkLock(res, req.headers["if-match"], labStore.rev, "实验室集合")) return;
+    const s = findLabSample(tail[1]);
+    if (!s) { apiError(res, 404, "sample_not_found", "样例不存在"); return; }
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body;
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      const checked = bidiLabCore.validateSample(body);
+      if (!checked.ok) {
+        apiError(res, checked.status, checked.code, checked.message);
+        return;
+      }
+      const nameTaken = labStore.samples.some(function (x) {
+        return x.id !== s.id && x.name === checked.value.name;
+      });
+      if (nameTaken) { apiError(res, 409, "duplicate_name", "已存在同名样例"); return; }
+
+      mutateLab(function () {
+        s.name = checked.value.name;
+        s.paragraphs = checked.value.paragraphs;
+        s.expected = checked.value.expected;
+        s.anchors = checked.value.anchors;
+        s.anchorFp = bidiLabCore.anchorFingerprint(checked.value);
+        s.updatedAt = new Date().toISOString();
+        labStore.rev++;
+        return s;
+      }, function (perr) {
+        if (perr) { apiError(res, 500, "persist_failed", "样例更新失败（写入存储失败），旧样例保持不变"); return; }
+        sendJSON(res, 200, { rev: labStore.rev, sample: publicLabSample(s) });
+      });
+    });
+    return;
+  }
+
+  if (tail.length === 2 && tail[0] === "samples" && req.method === "DELETE") {
+    if (checkLock(res, req.headers["if-match"], labStore.rev, "实验室集合")) return;
+    const s = findLabSample(tail[1]);
+    if (!s) { apiError(res, 404, "sample_not_found", "样例不存在"); return; }
+    mutateLab(function () {
+      const i = labStore.samples.indexOf(s);
+      labStore.samples.splice(i, 1);
+      labStore.rev++;
+    }, function (perr) {
+      if (perr) { apiError(res, 500, "persist_failed", "样例删除失败（写入存储失败）"); return; }
+      sendJSON(res, 200, { rev: labStore.rev });
+    });
+    return;
+  }
+
+  // 批量回归：纯只读，不改编辑器正文，也不改样例；结果可由前端选择存为记录。
+  if (tail.length === 2 && tail[0] === "samples" && tail[1] === "recheck" &&
+      req.method === "POST") {
+    readBody(req, function (err, raw) {
+      let body = {};
+      try { body = raw ? JSON.parse(raw) : {}; } catch (e) { body = {}; }
+      let targets = labStore.samples;
+      if (Array.isArray(body.ids) && body.ids.length) {
+        targets = body.ids.map(findLabSample).filter(Boolean);
+      }
+      const results = bidiLabCore.recheckAll(targets.map(function (s) {
+        return {
+          id: s.id, name: s.name, paragraphs: s.paragraphs,
+          expected: s.expected, anchors: s.anchors, anchorFp: s.anchorFp
+        };
+      }));
+      const summary = bidiLabCore.summarizeRecheck(results);
+      sendJSON(res, 200, { rev: labStore.rev, results: results, summary: summary });
+    });
+    return;
+  }
+
+  if (tail.length === 1 && tail[0] === "records" && req.method === "GET") {
+    const kind = urlObj.searchParams.get("kind");
+    let list = labStore.records.map(publicLabRecord);
+    if (kind) list = list.filter(function (r) { return r.kind === kind; });
+    list.sort(function (a, b) { return (b.at || "").localeCompare(a.at || ""); });
+    sendJSON(res, 200, { rev: labStore.rev,
+      count: list.length, records: list });
+    return;
+  }
+
+  if (tail.length === 1 && tail[0] === "records" && req.method === "POST") {
+    if (checkLock(res, req.headers["if-match"], labStore.rev, "实验室集合")) return;
+    readBody(req, function (err, raw) {
+      if (err) { apiError(res, 413, "body_too_large", "请求体超过大小上限"); return; }
+      let body;
+      try { body = JSON.parse(raw) || {}; }
+      catch (e) { apiError(res, 400, "invalid_json", "请求不是合法 JSON"); return; }
+      const v = bidiLabCore.validateRecord(body);
+      if (!v.ok) { apiError(res, v.status, v.code, v.message); return; }
+      if (labStore.records.length >= bidiLabCore.LIMITS.RECORD_MAX_COUNT) {
+        // 超出上限：淘汰最旧的一条（记录是追加型审计信息）
+        labStore.records.sort(function (a, b) {
+          return (a.at || "").localeCompare(b.at || "");
+        });
+        labStore.records.shift();
+      }
+      if (body.kind === "undo" && body.undoOf) {
+        const orig = findLabRecord(body.undoOf);
+        if (!orig || orig.kind !== "repair") {
+          apiError(res, 404, "repair_record_not_found",
+            "撤销必须对应一条已保存的修复记录");
+          return;
+        }
+        if (orig.undoRecordId) {
+          apiError(res, 409, "already_undone",
+            "该修复已经撤销过；一次性撤销记录不能重复使用");
+          return;
+        }
+      }
+      mutateLab(function () {
+        const rec = {
+          id: crypto.randomUUID(),
+          kind: body.kind,
+          at: new Date().toISOString(),
+          note: typeof body.note === "string" ? body.note.slice(0, 1000) : "",
+          paraCount: Number.isInteger(body.paraCount) ? body.paraCount : 0,
+          issueCount: Number.isInteger(body.issueCount) ? body.issueCount : 0,
+          applied: Array.isArray(body.applied) ? body.applied.slice(0, 500) : [],
+          contentFp: typeof body.contentFp === "string" ? body.contentFp : null,
+          renderFp: typeof body.renderFp === "string" ? body.renderFp : null,
+          report: body.kind === "report" && body.report && typeof body.report === "object"
+            ? body.report : null,
+          undoOf: body.kind === "undo" ? (body.undoOf || null) : null,
+          undoResult: body.undoResult && typeof body.undoResult === "object"
+            ? body.undoResult : null
+        };
+        labStore.records.push(rec);
+        if (rec.undoOf) {
+          const orig = findLabRecord(rec.undoOf);
+          if (orig) orig.undoRecordId = rec.id;
+        }
+        labStore.rev++;
+        return rec;
+      }, function (perr, rec) {
+        if (perr) { apiError(res, 500, "persist_failed", "记录保存失败（写入存储失败），请保留当前页面内容后重试"); return; }
+        sendJSON(res, 201, { rev: labStore.rev, record: publicLabRecord(rec) });
+      });
+    });
+    return;
+  }
+
+  apiError(res, 404, "not_found", "实验室接口不存在");
+}
+
 /* ================= 路由 ================= */
 
 function handleAPI(req, res, pathname, urlObj) {
@@ -11286,6 +11581,10 @@ function handleAPI(req, res, pathname, urlObj) {
   }
   if (parts[1] === "permissions" && parts.length <= 7) {
     handlePermissions(req, res, parts.slice(2), urlObj);
+    return;
+  }
+  if (parts[1] === "bidi-lab" && parts.length <= 4) {
+    handleBidiLab(req, res, parts.slice(2), urlObj);
     return;
   }
   apiError(res, 404, "not_found", "接口不存在");

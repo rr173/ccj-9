@@ -439,6 +439,117 @@
     return { ok: true, paragraphCount: editor.children.length };
   }
 
+  /* ---------- 双向实验室：事务状态捕获 / 原子应用 / 精确恢复 ----------
+   * 实验室只通过下面三个接口触碰编辑器，自身绝不直接改 DOM。
+   */
+
+  // 捕获完整可恢复状态：段落文本+方向、选区（码点逻辑范围）、滚动位置
+  function captureState() {
+    normalize();
+    var blocks = editor.children;
+    var paragraphs = Array.prototype.map.call(blocks, function (el) {
+      return {
+        dir: el.getAttribute("dir") || "auto",
+        text: el.textContent,
+        editedAt: el.getAttribute("data-edited-at") || new Date().toISOString()
+      };
+    });
+    var selection = null;
+    var sel = getSelection();
+    if (sel && sel.rangeCount && editor.contains(sel.anchorNode) &&
+        editor.contains(sel.focusNode)) {
+      var b1 = blockOf(sel.anchorNode), b2 = blockOf(sel.focusNode);
+      if (b1 === b2) {
+        var range = sel.getRangeAt(0);
+        var sOff = logicalCpOffset(b1, range.startContainer, range.startOffset);
+        var eOff = logicalCpOffset(b1, range.endContainer, range.endOffset);
+        selection = {
+          paraIndex: Array.prototype.indexOf.call(blocks, b1),
+          start: Math.min(sOff, eOff), end: Math.max(sOff, eOff)
+        };
+      }
+    }
+    return {
+      paragraphs: paragraphs,
+      selection: selection,
+      scrollX: window.scrollX, scrollY: window.scrollY
+    };
+  }
+
+  // 实验室应用修复：整份段落原子替换。
+  // nextParagraphs: [{dir, text}]，必须与 expectedCount 段数一致。
+  // 调用方（实验室）已做内容/渲染条件指纹校验；此处再做结构校验，
+  // 任何失败都绝不触碰现有 DOM。
+  function applyLabDocument(nextParagraphs) {
+    if (!Array.isArray(nextParagraphs) || nextParagraphs.length !== editor.children.length) {
+      return { ok: false, code: "paragraph_count_mismatch",
+               message: "修复文档段落数与当前正文不一致，已拒绝应用。" };
+    }
+    for (var i = 0; i < nextParagraphs.length; i++) {
+      var p = nextParagraphs[i];
+      if (!p || typeof p.text !== "string" ||
+          ["auto", "ltr", "rtl"].indexOf(p.dir) === -1) {
+        return { ok: false, code: "invalid_paragraph",
+                 message: "第 " + (i + 1) + " 段修复内容无效，已拒绝应用。" };
+      }
+    }
+
+    var frag = document.createDocumentFragment();
+    var now = new Date().toISOString();
+    nextParagraphs.forEach(function (p) {
+      var el = makePara(p.dir, p.text);
+      stampBlock(el, now);
+      frag.appendChild(el);
+    });
+    editor.innerHTML = "";
+    editor.appendChild(frag);
+    normalize();
+    Array.prototype.forEach.call(editor.children, function (el) {
+      textCache.set(el, el.textContent);
+    });
+    updateStatus();
+    emitChange();
+    return { ok: true, paragraphCount: editor.children.length };
+  }
+
+  // 精确恢复实验室捕获的状态（撤销用）：文本、段落方向、选区、滚动位置。
+  // 恢复前不做内容指纹假设——调用方保证这是同一编辑器会话的一次性撤销。
+  function restoreLabState(state) {
+    if (!state || !Array.isArray(state.paragraphs) || !state.paragraphs.length) {
+      return { ok: false, message: "撤销状态无效" };
+    }
+    var frag = document.createDocumentFragment();
+    state.paragraphs.forEach(function (p) {
+      frag.appendChild(makePara(p.dir, p.text));
+      stampBlock(frag.lastChild, p.editedAt);
+    });
+    editor.innerHTML = "";
+    editor.appendChild(frag);
+    normalize();
+    Array.prototype.forEach.call(editor.children, function (el) {
+      textCache.set(el, el.textContent);
+    });
+
+    if (state.selection) {
+      var range = rangeFor(state.selection.paraIndex,
+        state.selection.start, state.selection.end);
+      if (range) {
+        editor.focus();
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      }
+    } else {
+      editor.focus();
+    }
+    if (Number.isFinite(state.scrollX) && Number.isFinite(state.scrollY)) {
+      window.scrollTo(state.scrollX, state.scrollY);
+    }
+    updateStatus();
+    emitChange();
+    return { ok: true, paragraphCount: editor.children.length };
+  }
+
   window.Editor = {
     serialize: serialize,
     restore: restore,
@@ -450,7 +561,15 @@
     rangeFor: rangeFor,
     selectRange: selectRange,
     subscribe: subscribe,
-    cpLen: function (s) { return cpOf(s).length; }
+    cpLen: function (s) { return cpOf(s).length; },
+    // —— 双向安全实验室使用的事务接口 ——
+    captureState: captureState,
+    applyLabDocument: applyLabDocument,
+    restoreLabState: restoreLabState,
+    // 定位到指定段落某字素簇的码点逻辑范围（实验室双视图联动用）
+    locateGrapheme: function (paraIndex, start, end) {
+      return selectRange(paraIndex, start, end);
+    }
   };
 
   /* ---------- 启动 ---------- */

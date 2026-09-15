@@ -2,7 +2,7 @@
 FROM node:20-alpine
 
 WORKDIR /app
-COPY server.js snapshot-core.js review-core.js decision-core.js replay-core.js replay-review-core.js replay-session-core.js replay-archive-core.js replay-reconcile-core.js permission-core.js permission-request-core.js permission-request-group-core.js permission-template-core.js app.js snapshots.js annotations.js batches.js decisions.js replay.js replay-archive.js replay-reconcile.js permissions.js index.html style.css ./
+COPY server.js snapshot-core.js review-core.js decision-core.js replay-core.js replay-review-core.js replay-session-core.js replay-archive-core.js replay-reconcile-core.js permission-core.js permission-request-core.js permission-request-group-core.js permission-template-core.js bidi-lab-core.js app.js snapshots.js annotations.js batches.js decisions.js replay.js replay-archive.js replay-reconcile.js permissions.js bidi-lab-geometry.js bidi-lab.js index.html style.css ./
 
 # 快照、批注、审阅批次、审阅决策、执行回放/归档/对账与角色委派数据持久化目录（可挂卷覆盖：-v bidi-editor-data:/app/data）
 RUN mkdir -p /app/data
@@ -14,6 +14,7 @@ ENV REPLAY_SPACES_FILE=/app/data/replay-spaces.json
 ENV REPLAY_ARCHIVES_FILE=/app/data/replay-archives.json
 ENV REPLAY_RECONCILE_FILE=/app/data/replay-reconcile.json
 ENV PERMISSIONS_FILE=/app/data/permissions.json
+ENV BIDI_LAB_FILE=/app/data/bidi-lab.json
 ENV PORT=8080
 
 EXPOSE 8080
