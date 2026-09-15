@@ -63,6 +63,7 @@ class Page {
     this.ops = [];
     this.cursors = [];
     this.presence = [];
+    this.presentations = [];
     this.ws = null;
     this.latest = null; // {rev, text, conflicts}
   }
@@ -78,6 +79,7 @@ class Page {
       if (m.type === "op") { this.ops.push(m); this._absorb(m); }
       if (m.type === "cursor") this.cursors.push(m);
       if (m.type === "presence") this.presence.push(m);
+      if (m.type === "presentation_state" || m.type === "presentation_error") this.presentations.push(m);
     });
     this.send({ type: "hello", room: roomId, member: this.member });
     await this.waitFor(() => this.hello);
@@ -100,6 +102,9 @@ class Page {
   }
   cursor(anchor, selStart, selEnd) {
     this.send({ type: "cursor", anchor, selStart, selEnd });
+  }
+  presentation(type, values) {
+    this.send(Object.assign({ type: type }, values || {}));
   }
   waitFor(fn, timeout = 2000) {
     return new Promise((resolve, reject) => {
@@ -131,6 +136,7 @@ class Page {
       if (m.type === "op") { this.ops.push(m); this._absorb(m); }
       if (m.type === "cursor") this.cursors.push(m);
       if (m.type === "presence") this.presence.push(m);
+      if (m.type === "presentation_state" || m.type === "presentation_error") this.presentations.push(m);
     });
     this.send({ type: "hello", room: roomId, member: this.member });
     await newHello;
@@ -305,6 +311,62 @@ test("离线期间继续编辑，重连后以服务器文本收敛且不丢自�
   assert.equal(a.text, b.text);
 
   a.close(); b.close();
+});
+
+test("限时演示并发裁决、跟随更新、局部退出与发起人重连", async () => {
+  const created = await api("POST", "/api/rooms", { name: "演示房" });
+  const roomId = created.json.room.id;
+  const a = await new Page("pA", "甲", "#e6194b").open(roomId);
+  const b = await new Page("pB", "乙", "#3cb44b").open(roomId);
+  const f1 = await new Page("pF1", "丙", "#4363d8").open(roomId);
+  const f2 = await new Page("pF2", "丁", "#f58231").open(roomId);
+
+  a.presentation("presentation_start", { requestId: "start-a", durationMs: 60000 });
+  b.presentation("presentation_start", { requestId: "start-b", durationMs: 60000 });
+  await a.waitFor(() => a.presentations.filter(x =>
+    x.event === "started" || x.event === "start_rejected").length >= 2);
+  const verdicts = a.presentations.filter(x =>
+    x.event === "started" || x.event === "start_rejected");
+  assert.equal(verdicts.filter(x => x.result === "started").length, 1);
+  assert.equal(verdicts.filter(x => x.result === "rejected").length, 1);
+  assert.equal(verdicts[0].presentation.presenterId, "pA");
+  await f1.waitFor(() => f1.presentations.some(x => x.event === "start_rejected"));
+
+  f1.presentation("presentation_join");
+  f2.presentation("presentation_join");
+  await a.waitFor(() => {
+    const last = a.presentations[a.presentations.length - 1];
+    return last && last.presentation && last.presentation.followers.length === 2;
+  });
+  a.presentation("presentation_update", {
+    anchor: 0, selStart: 0, selEnd: 0, scrollTop: 120, scrollLeft: 4
+  });
+  const update = await f1.waitFor(() => f1.presentations.find(x =>
+    x.event === "view_updated" && x.presentation.view.scrollTop === 120));
+  assert.equal(update.presentation.view.scrollLeft, 4);
+
+  f1.presentation("presentation_leave", { reason: "manual_edit" });
+  const left = await f2.waitFor(() => f2.presentations.find(x =>
+    x.event === "follower_left" && x.requesterId === "pF1"));
+  assert.deepEqual(left.presentation.followers, ["pF2"]);
+
+  a.close();
+  const disconnected = await f2.waitFor(() => f2.presentations.find(x =>
+    x.event === "presenter_disconnected"));
+  assert.equal(disconnected.presentation.presenterConnected, false);
+  await a.reconnect(roomId);
+  const resumed = await f2.waitFor(() => f2.presentations.find(x =>
+    x.event === "presenter_reconnected"));
+  assert.equal(resumed.presentation.presenterConnected, true);
+  assert.equal(resumed.presentation.id, disconnected.presentation.id);
+
+  a.presentation("presentation_end");
+  const ended = await f2.waitFor(() => f2.presentations.find(x => x.event === "ended"));
+  assert.equal(ended.presentation, null);
+  const snap = (await api("GET", "/api/rooms/" + roomId)).json;
+  assert.equal(snap.presentation, null);
+
+  a.close(); b.close(); f1.close(); f2.close();
 });
 
 test("滞后基线的并发编辑经多跳折叠收敛", async () => {

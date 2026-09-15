@@ -29,6 +29,10 @@ const SEEN_LIMIT = 2000;
 const CHECKPOINT_EVERY = 25;     // 每 N 个 rev 持久化一个检查点
 const MAX_ROOMS = 200;
 const MAX_NAME = 100;
+const PRESENTATION_MIN_MS = 10 * 1000;
+const PRESENTATION_MAX_MS = 30 * 60 * 1000;
+const PRESENTATION_DEFAULT_MS = 5 * 60 * 1000;
+const PRESENTER_GRACE_MS = 15 * 1000;
 const PALETTE = ['#e6194b', '#3cb44b', '#4363d8', '#f58231', '#911eb4',
   '#42d4f4', '#f032e6', '#469990', '#9A6324', '#800000'];
 
@@ -63,6 +67,7 @@ class RoomManager {
       r.seenOps = r.seenOps || {};
       r.cursors = r.cursors || {};
       r.checkpoints = r.checkpoints || {};
+      r.presentation = this._normalizePresentation(r.presentation, Date.now());
       this.rooms.set(r.id, r);
     }
   }
@@ -78,7 +83,7 @@ class RoomManager {
       return {
         id: r.id, name: r.name, rev: r.rev, atoms: r.atoms,
         conflicts: r.conflicts, history: r.history, seenOps: r.seenOps,
-        cursors: r.cursors, checkpoints: cps,
+        cursors: r.cursors, checkpoints: cps, presentation: r.presentation || null,
         createdAt: r.createdAt, updatedAt: r.updatedAt
       };
     });
@@ -123,12 +128,14 @@ class RoomManager {
   get(id) { return this.rooms.get(id) || null; }
 
   snapshot(room) {
+    this.expirePresentation(room);
     return {
       id: room.id, name: room.name, rev: room.rev,
       text: core.atomsText(room.atoms),
       conflicts: room.conflicts
         .filter(c => c.status === 'open').map(c => this._publicConflict(room, c)),
       members: this._members(room),
+      presentation: this.publicPresentation(room),
       createdAt: room.createdAt, updatedAt: room.updatedAt
     };
   }
@@ -175,7 +182,7 @@ class RoomManager {
     const room = {
       id: rid(), name: name, rev: 0,
       atoms: [], conflicts: [], history: [], seenOps: {}, cursors: {},
-      checkpoints: { 0: [] },
+      checkpoints: { 0: [] }, presentation: null,
       createdAt: now, updatedAt: now
     };
     this.rooms.set(room.id, room);
@@ -222,6 +229,173 @@ class RoomManager {
     for (const mid of Object.keys(room.cursors)) {
       if (now - room.cursors[mid].updatedAt > 60000) delete room.cursors[mid];
     }
+  }
+
+  /* ---------------- 限时跟随演示 ---------------- */
+
+  _normalizePresentation(value, now) {
+    if (!value || typeof value !== 'object') return null;
+    const expiresAt = Number(value.expiresAt);
+    if (!Number.isFinite(expiresAt) || expiresAt <= now) return null;
+    const presenterId = String(value.presenterId || '').slice(0, 80);
+    if (!presenterId) return null;
+    const followers = {};
+    const source = value.followers && typeof value.followers === 'object'
+      ? value.followers : {};
+    for (const mid of Object.keys(source).slice(0, 500)) followers[String(mid).slice(0, 80)] = true;
+    const view = value.view && typeof value.view === 'object' ? value.view : {};
+    const hasGrace = value.graceUntil != null;
+    const graceUntil = Number(value.graceUntil);
+    if (hasGrace && Number.isFinite(graceUntil) && graceUntil <= now) return null;
+    return {
+      id: String(value.id || ('p' + crypto.randomBytes(6).toString('hex'))).slice(0, 80),
+      presenterId: presenterId,
+      presenterName: String(value.presenterName || '匿名成员').slice(0, 40),
+      startedAt: Number(value.startedAt) || now,
+      expiresAt: expiresAt,
+      graceUntil: hasGrace && Number.isFinite(graceUntil) ? graceUntil : null,
+      followers: followers,
+      view: {
+        anchor: Math.max(0, Number(view.anchor) || 0),
+        selStart: Math.max(0, Number(view.selStart) || 0),
+        selEnd: Math.max(0, Number(view.selEnd) || 0),
+        scrollTop: Math.max(0, Number(view.scrollTop) || 0),
+        scrollLeft: Math.max(0, Number(view.scrollLeft) || 0),
+        updatedAt: Number(view.updatedAt) || 0
+      }
+    };
+  }
+
+  publicPresentation(room, now) {
+    now = Number.isFinite(now) ? now : Date.now();
+    const p = room.presentation;
+    if (!p) return null;
+    return {
+      id: p.id,
+      presenterId: p.presenterId,
+      presenterName: p.presenterName,
+      startedAt: p.startedAt,
+      expiresAt: p.expiresAt,
+      remainingMs: Math.max(0, p.expiresAt - now),
+      graceUntil: p.graceUntil,
+      presenterConnected: !p.graceUntil,
+      followers: Object.keys(p.followers),
+      view: Object.assign({}, p.view)
+    };
+  }
+
+  expirePresentation(room, now) {
+    now = Number.isFinite(now) ? now : Date.now();
+    const p = room.presentation;
+    if (!p) return null;
+    let reason = '';
+    if (p.expiresAt <= now) reason = 'expired';
+    else if (p.graceUntil && p.graceUntil <= now) reason = 'presenter_timeout';
+    if (!reason) return null;
+    room.presentation = null;
+    room.updatedAt = new Date(now).toISOString();
+    this.scheduleSave();
+    return { id: p.id, reason: reason };
+  }
+
+  startPresentation(room, member, msg, now) {
+    now = Number.isFinite(now) ? now : Date.now();
+    this.expirePresentation(room, now);
+    if (room.presentation) {
+      return { result: 'rejected', error: 'presentation_already_active',
+        presentation: this.publicPresentation(room, now) };
+    }
+    let durationMs = Number(msg && msg.durationMs);
+    if (!Number.isFinite(durationMs)) durationMs = PRESENTATION_DEFAULT_MS;
+    durationMs = Math.max(PRESENTATION_MIN_MS, Math.min(PRESENTATION_MAX_MS, Math.round(durationMs)));
+    room.presentation = this._normalizePresentation({
+      id: 'p' + crypto.randomBytes(8).toString('hex'),
+      presenterId: member.memberId,
+      presenterName: member.name,
+      startedAt: now,
+      expiresAt: now + durationMs,
+      followers: {},
+      view: {}
+    }, now);
+    room.updatedAt = new Date(now).toISOString();
+    this.scheduleSave();
+    return { result: 'started', presentation: this.publicPresentation(room, now) };
+  }
+
+  joinPresentation(room, member, now) {
+    now = Number.isFinite(now) ? now : Date.now();
+    this.expirePresentation(room, now);
+    const p = room.presentation;
+    if (!p) return { result: 'error', error: 'presentation_not_active' };
+    if (p.presenterId === member.memberId) return { result: 'error', error: 'presenter_cannot_follow' };
+    p.followers[member.memberId] = true;
+    this.scheduleSave();
+    return { result: 'joined', presentation: this.publicPresentation(room, now) };
+  }
+
+  leavePresentation(room, memberId, reason, now) {
+    now = Number.isFinite(now) ? now : Date.now();
+    this.expirePresentation(room, now);
+    const p = room.presentation;
+    if (!p || !p.followers[memberId]) return { result: 'not_following', presentation: this.publicPresentation(room, now) };
+    delete p.followers[memberId];
+    this.scheduleSave();
+    return { result: 'left', reason: reason || 'manual', presentation: this.publicPresentation(room, now) };
+  }
+
+  updatePresentation(room, member, msg, now) {
+    now = Number.isFinite(now) ? now : Date.now();
+    this.expirePresentation(room, now);
+    const p = room.presentation;
+    if (!p) return { result: 'error', error: 'presentation_not_active' };
+    if (p.presenterId !== member.memberId) return { result: 'error', error: 'not_presenter' };
+    const n = room.atoms.length;
+    const clamp = v => Math.max(0, Math.min(Number(v) || 0, n));
+    let selStart = clamp(msg.selStart != null ? msg.selStart : msg.anchor);
+    let selEnd = clamp(msg.selEnd != null ? msg.selEnd : msg.anchor);
+    if (selStart > selEnd) { const tmp = selStart; selStart = selEnd; selEnd = tmp; }
+    p.view = {
+      anchor: clamp(msg.anchor), selStart: selStart, selEnd: selEnd,
+      scrollTop: Math.max(0, Number(msg.scrollTop) || 0),
+      scrollLeft: Math.max(0, Number(msg.scrollLeft) || 0),
+      updatedAt: now
+    };
+    this.scheduleSave();
+    return { result: 'updated', presentation: this.publicPresentation(room, now) };
+  }
+
+  presenterDisconnected(room, memberId, now) {
+    now = Number.isFinite(now) ? now : Date.now();
+    this.expirePresentation(room, now);
+    const p = room.presentation;
+    if (!p || p.presenterId !== memberId) return null;
+    p.graceUntil = Math.min(p.expiresAt, now + PRESENTER_GRACE_MS);
+    this.scheduleSave();
+    return this.publicPresentation(room, now);
+  }
+
+  presenterReconnected(room, memberId, now) {
+    now = Number.isFinite(now) ? now : Date.now();
+    this.expirePresentation(room, now);
+    const p = room.presentation;
+    if (!p || p.presenterId !== memberId) return null;
+    if (p.graceUntil) {
+      p.graceUntil = null;
+      this.scheduleSave();
+    }
+    return this.publicPresentation(room, now);
+  }
+
+  endPresentation(room, memberId, reason, now) {
+    now = Number.isFinite(now) ? now : Date.now();
+    this.expirePresentation(room, now);
+    const p = room.presentation;
+    if (!p) return { result: 'error', error: 'presentation_not_active' };
+    if (p.presenterId !== memberId) return { result: 'error', error: 'not_presenter' };
+    room.presentation = null;
+    room.updatedAt = new Date(now).toISOString();
+    this.scheduleSave();
+    return { result: 'ended', id: p.id, reason: reason || 'ended' };
   }
 
   /* ---------------- 旧版本重建 ---------------- */

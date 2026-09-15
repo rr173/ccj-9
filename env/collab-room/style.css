@@ -77,6 +77,19 @@ table.rooms { width: 100%; border-collapse: collapse; }
 .status.online { background: rgba(60,180,75,.14); color: var(--ok); }
 .status.offline { background: rgba(230,25,75,.12); color: var(--warn); }
 .spacer { flex: 1; }
+.presentation-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 14px; padding: 10px 12px;
+  border: 1px solid var(--line); border-left: 4px solid var(--accent);
+  background: var(--card); border-radius: 8px;
+}
+.presentation-bar.active { border-left-color: var(--ok); }
+.presentation-bar.following { background: #eef7ff; }
+.presentation-bar .meta-line { display: block; margin-top: 0; }
+.presentation-bar select {
+  padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--card); color: var(--ink);
+}
 .layout { display: grid; grid-template-columns: 1fr 240px; gap: 18px; align-items: start; }
 @media (max-width: 800px) { .layout { grid-template-columns: 1fr; } }
 .editor-wrap { position: relative; }

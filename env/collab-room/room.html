@@ -22,6 +22,23 @@
     <a class="btn small secondary" href="/">房间列表</a>
   </div>
 
+  <section id="presentation-bar" class="presentation-bar" aria-live="polite">
+    <div>
+      <strong>限时跟随演示</strong>
+      <span id="presentation-status" class="meta-line">当前没有进行中的演示</span>
+    </div>
+    <span class="spacer"></span>
+    <select id="presentation-duration" aria-label="演示时长">
+      <option value="300000">5 分钟</option>
+      <option value="600000">10 分钟</option>
+      <option value="900000">15 分钟</option>
+    </select>
+    <button id="presentation-start" class="small">开始演示</button>
+    <button id="presentation-join" class="small" hidden>加入跟随</button>
+    <button id="presentation-leave" class="small secondary" hidden>退出跟随</button>
+    <button id="presentation-end" class="small secondary" hidden>结束演示</button>
+  </section>
+
   <div class="layout" style="margin-top:16px">
     <div>
       <div class="card editor-wrap">

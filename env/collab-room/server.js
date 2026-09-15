@@ -174,6 +174,13 @@ function broadcastRoom(room, msg) {
 function broadcastPresence(room) {
   broadcastRoom(room, { type: "presence", members: manager.snapshot(room).members });
 }
+function broadcastPresentation(room, event, extra) {
+  broadcastRoom(room, Object.assign({
+    type: "presentation_state",
+    event: event,
+    presentation: manager.publicPresentation(room)
+  }, extra || {}));
+}
 
 ws.attachServer(server, {
   onConnection(sock) {
@@ -186,11 +193,23 @@ ws.attachServer(server, {
       if (!sess.room || !sess.member) return;
       if (msg.type === "commit") return handleCommit(sess, msg);
       if (msg.type === "cursor") return handleCursor(sess, msg);
+      if (msg.type === "presentation_start") return handlePresentationStart(sess, msg);
+      if (msg.type === "presentation_join") return handlePresentationJoin(sess);
+      if (msg.type === "presentation_leave") return handlePresentationLeave(sess, msg.reason);
+      if (msg.type === "presentation_update") return handlePresentationUpdate(sess, msg);
+      if (msg.type === "presentation_end") return handlePresentationEnd(sess);
     });
     sock.on("close", () => {
       if (sess.room) {
         const set = sessions.get(sess.room.id);
         if (set) set.delete(sess);
+        const stillConnected = set && Array.from(set).some(other =>
+          other.member && other.member.memberId === sess.member.memberId);
+        if (!stillConnected) {
+          const presentation = manager.presenterDisconnected(
+            sess.room, sess.member.memberId);
+          if (presentation) broadcastPresentation(sess.room, "presenter_disconnected");
+        }
         // 不立即删除成员（离线重连窗口）；只广播在线状态，60s 后 prune
         setTimeout(() => {
           if (sess.room) {
@@ -214,13 +233,16 @@ function handleHello(sess, sock, msg) {
   sess.room = room;
   sess.member = member;
   roomSessions(room.id).add(sess);
+  const resumedPresentation = manager.presenterReconnected(room, member.memberId);
   const snap = manager.snapshot(room);
   sock.send(JSON.stringify({
     type: "hello", you: member, room: { id: room.id, name: room.name },
     rev: snap.rev,
-    text: snap.text, conflicts: snap.conflicts, members: snap.members
+    text: snap.text, conflicts: snap.conflicts, members: snap.members,
+    presentation: snap.presentation
   }));
   broadcastPresence(room);
+  if (resumedPresentation) broadcastPresentation(room, "presenter_reconnected");
 }
 
 function handleCommit(sess, msg) {
@@ -257,14 +279,81 @@ function handleCursor(sess, msg) {
   });
 }
 
+function handlePresentationStart(sess, msg) {
+  const result = manager.startPresentation(sess.room, sess.member, msg);
+  manager.flushSync();
+  broadcastPresentation(sess.room,
+    result.result === "started" ? "started" : "start_rejected", {
+      requestId: msg.requestId || null,
+      requesterId: sess.member.memberId,
+      result: result.result,
+      error: result.error || null
+    });
+}
+
+function handlePresentationJoin(sess) {
+  const result = manager.joinPresentation(sess.room, sess.member);
+  if (result.result === "joined") manager.flushSync();
+  broadcastPresentation(sess.room,
+    result.result === "joined" ? "follower_joined" : "join_rejected", {
+      requesterId: sess.member.memberId,
+      result: result.result,
+      error: result.error || null
+    });
+}
+
+function handlePresentationLeave(sess, reason) {
+  const result = manager.leavePresentation(
+    sess.room, sess.member.memberId, reason || "manual");
+  if (result.result === "left") manager.flushSync();
+  broadcastPresentation(sess.room, "follower_left", {
+    requesterId: sess.member.memberId,
+    result: result.result,
+    reason: result.reason || reason || "manual"
+  });
+}
+
+function handlePresentationUpdate(sess, msg) {
+  const result = manager.updatePresentation(sess.room, sess.member, msg);
+  if (result.result !== "updated") {
+    sess.ws.send(JSON.stringify({ type: "presentation_error", error: result.error }));
+    return;
+  }
+  broadcastPresentation(sess.room, "view_updated", {
+    requesterId: sess.member.memberId,
+    result: result.result
+  });
+}
+
+function handlePresentationEnd(sess) {
+  const result = manager.endPresentation(sess.room, sess.member.memberId, "ended");
+  if (result.result === "ended") manager.flushSync();
+  broadcastPresentation(sess.room,
+    result.result === "ended" ? "ended" : "end_rejected", {
+      requesterId: sess.member.memberId,
+      result: result.result,
+      error: result.error || null,
+      endedPresentationId: result.id || null,
+      reason: result.reason || null
+    });
+}
+
 // 定期清理离线成员并广播
 setInterval(() => {
   for (const room of manager.rooms.values()) {
     const before = Object.keys(room.cursors).length;
     manager.pruneStale(room);
     if (Object.keys(room.cursors).length !== before) broadcastPresence(room);
+    const ended = manager.expirePresentation(room);
+    if (ended) {
+      manager.flushSync();
+      broadcastPresentation(room, "ended", {
+        endedPresentationId: ended.id,
+        reason: ended.reason
+      });
+    }
   }
-}, 30000).unref?.();
+}, 1000).unref?.();
 
 server.listen(PORT, () => {
   // eslint-disable-next-line no-console

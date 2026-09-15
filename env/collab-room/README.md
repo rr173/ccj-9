@@ -16,6 +16,7 @@
 | 离线重连 | 断网可继续输入，重连后以服务器快照收敛；未确认操作按原 opId 重放 |
 | 重复操作 | 每个编辑带客户端 opId，服务端按 opId 幂等应答，重复提交绝不产生重复内容 |
 | 重启恢复 | 房间、文本、版本、待裁决冲突、操作历史原子落盘 `data/rooms.json`，重启后完整恢复并可继续折叠旧基线 |
+| 限时跟随演示 | 单发起人并发裁决；跟随者同步光标、选区和滚动位置；手动编辑或滚动只退出自己；断线宽限和重启恢复沿用原到期时间 |
 
 ## 快速开始
 
@@ -85,9 +86,11 @@ WebSocket 客户端模拟多个浏览器页面，覆盖：同房间同步（阿�
 
 ### WebSocket 消息
 
-客户端：`hello` / `commit{opId,baseRev,ops}` / `cursor{anchor,selStart,selEnd}` / `ping`；
+客户端：`hello` / `commit{opId,baseRev,ops}` / `cursor{anchor,selStart,selEnd}` / `ping`，
+以及 `presentation_start` / `presentation_join` / `presentation_leave` /
+`presentation_update` / `presentation_end`；
 服务端：`hello`（快照）/ `ack`（ok|duplicate|resync|error）/ `op`（广播）/
-`presence`（成员存在）/ `cursor`（远程光标）。HTTP 另有
+`presence`（成员存在）/ `cursor`（远程光标）/ `presentation_state`（演示裁决与状态）。HTTP 另有
 `GET/POST /api/rooms`、`GET /api/rooms/:id`、`POST /api/rooms/:id/resolve`。
 
 ## 目录

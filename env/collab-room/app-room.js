@@ -27,6 +27,13 @@
   const toastEl = $("toast");
   const nameInput = $("my-name");
   const cursorsLayer = $("cursors");
+  const presentationBar = $("presentation-bar");
+  const presentationStatus = $("presentation-status");
+  const presentationDuration = $("presentation-duration");
+  const presentationStart = $("presentation-start");
+  const presentationJoin = $("presentation-join");
+  const presentationLeave = $("presentation-leave");
+  const presentationEnd = $("presentation-end");
 
   if (!roomId) { location.href = "/"; return; }
 
@@ -66,6 +73,8 @@
   let applyingRemote = false;
   let reconnectDelay = 300;
   let lastCursorSent = 0;
+  let presentation = null;
+  let applyingPresentationView = false;
 
   function send(obj) {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
@@ -138,12 +147,14 @@
         lastCursorSent = now;
         send({ type: "cursor", anchor: lastKnownCaret.cluster,
           selStart: lastKnownCaret.selStart, selEnd: lastKnownCaret.selEnd });
+        sendPresentationView();
       }
     }, 80);
   }
 
   editor.addEventListener("input", () => {
     if (applyingRemote) return;
+    if (isFollowing()) leavePresentation("manual_edit");
     const newText = editor.value;
     const baseForDiff = queue.length
       ? queue[queue.length - 1].newText
@@ -366,7 +377,69 @@
       }
     }
   }
-  editor.addEventListener("scroll", renderCursors);
+  function isPresenter() {
+    return !!presentation && presentation.presenterId === identity.memberId;
+  }
+  function isFollowing() {
+    return !!presentation && Array.isArray(presentation.followers) &&
+      presentation.followers.includes(identity.memberId);
+  }
+  function sendPresentationView() {
+    if (!isPresenter()) return;
+    captureCaret();
+    send({ type: "presentation_update",
+      anchor: lastKnownCaret.cluster,
+      selStart: lastKnownCaret.selStart,
+      selEnd: lastKnownCaret.selEnd,
+      scrollTop: editor.scrollTop,
+      scrollLeft: editor.scrollLeft });
+  }
+  function leavePresentation(reason) {
+    if (!isFollowing()) return;
+    send({ type: "presentation_leave", reason: reason || "manual" });
+    presentation.followers = presentation.followers.filter(id => id !== identity.memberId);
+    renderPresentation();
+  }
+  function applyPresentationView() {
+    if (!isFollowing() || !presentation.view) return;
+    const view = presentation.view;
+    const start = C.clusterToCodeUnit(editor.value, view.selStart || view.anchor || 0);
+    const end = C.clusterToCodeUnit(editor.value, view.selEnd || view.anchor || 0);
+    try { editor.setSelectionRange(start, end); } catch (e) {}
+    applyingPresentationView = true;
+    editor.scrollTop = Math.max(0, Number(view.scrollTop) || 0);
+    editor.scrollLeft = Math.max(0, Number(view.scrollLeft) || 0);
+    setTimeout(() => { applyingPresentationView = false; }, 0);
+  }
+  function renderPresentation() {
+    const active = !!presentation;
+    const presenter = isPresenter();
+    const following = isFollowing();
+    presentationBar.className = "presentation-bar" +
+      (active ? " active" : "") + (following ? " following" : "");
+    presentationStart.hidden = active;
+    presentationDuration.hidden = active;
+    presentationJoin.hidden = !active || presenter || following;
+    presentationLeave.hidden = !following;
+    presentationEnd.hidden = !presenter;
+    if (!active) {
+      presentationStatus.textContent = "当前没有进行中的演示";
+      return;
+    }
+    const remaining = Math.max(0, Number(presentation.expiresAt) - Date.now());
+    const seconds = Math.ceil(remaining / 1000);
+    const connection = presentation.presenterConnected === false ? "，等待发起人重连" : "";
+    presentationStatus.textContent = presentation.presenterName + " 正在演示，剩余 " +
+      Math.floor(seconds / 60) + ":" + String(seconds % 60).padStart(2, "0") +
+      connection + (following ? "，正在跟随" : "");
+  }
+  editor.addEventListener("scroll", () => {
+    renderCursors();
+    if (isPresenter()) sendPresentationView();
+    if (!isFollowing()) return;
+    if (applyingPresentationView) return;
+    leavePresentation("manual_scroll");
+  });
   window.addEventListener("resize", renderCursors);
 
   /* ---------- WebSocket ---------- */
@@ -383,6 +456,7 @@
           setConn(true, "已连接");
           rev = m.rev; serverText = m.text || ""; conflicts = m.conflicts || [];
           members = m.members || [];
+          presentation = m.presentation || null;
           const roomName = m.room && m.room.name;
           document.title = roomName ? (roomName + " · 协作房间") : document.title;
           $("room-name").textContent = roomName || "";
@@ -395,6 +469,8 @@
           inflight = null;
           converge(serverText, rev, conflicts);
           renderMembers();
+          renderPresentation();
+          applyPresentationView();
           pump();
           sendCursorSoon();
           break;
@@ -408,6 +484,17 @@
         case "cursor":
           remoteCursors[m.memberId] = m;
           if (m.memberId !== identity.memberId) renderCursors();
+          break;
+        case "presentation_state":
+          presentation = m.presentation || null;
+          renderPresentation();
+          if (m.event === "view_updated") applyPresentationView();
+          if (m.event === "start_rejected" && m.requesterId === identity.memberId) {
+            toast("已有成员正在演示", true);
+          }
+          break;
+        case "presentation_error":
+          toast("演示操作失败：" + (m.error || "unknown"), true);
           break;
         case "pong": break;
         case "error":
@@ -438,6 +525,18 @@
     toastTimer = setTimeout(() => { toastEl.className = "toast"; }, 2600);
   }
 
+  presentationStart.addEventListener("click", () => {
+    send({ type: "presentation_start",
+      requestId: "ps" + Date.now().toString(36) + identity.memberId,
+      durationMs: Number(presentationDuration.value) || 300000 });
+  });
+  presentationJoin.addEventListener("click", () =>
+    send({ type: "presentation_join" }));
+  presentationLeave.addEventListener("click", () =>
+    leavePresentation("manual"));
+  presentationEnd.addEventListener("click", () =>
+    send({ type: "presentation_end" }));
+
   /* ---------- 复制邀请链接 ---------- */
   $("copy-link").addEventListener("click", async () => {
     const url = location.origin + "/room.html?id=" + encodeURIComponent(roomId);
@@ -460,4 +559,5 @@
   setConn(false, "连接中…");
   connect();
   setInterval(renderCursors, 1000);
+  setInterval(renderPresentation, 1000);
 })();
