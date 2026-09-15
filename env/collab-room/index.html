@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>协作房间 · 双向文本多人编辑</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">📝 协作房间</a>
+  <span class="sub">双向文本多人实时编辑 · 字素簇光标 · 冲突可裁决</span>
+</header>
+
+<main class="container">
+  <section class="card">
+    <h1>创建或加入协作房间</h1>
+    <p class="hint">在两个浏览器标签（或两台设备）打开同一个房间链接，即可看到编辑与成员光标实时同步；
+      断网恢复后会自动重连并以服务器文本收敛，重复提交不会产生重复内容，硬冲突可在页面上手动裁决。</p>
+    <form id="create-form" class="create-row">
+      <input id="room-name" maxlength="100" placeholder="房间名称，例如：会议纪要（中/英/العربية 混排）" autocomplete="off">
+      <button type="submit">创建房间</button>
+    </form>
+    <div id="create-error" class="error" hidden></div>
+  </section>
+
+  <section class="card">
+    <h2>房间列表</h2>
+    <table class="rooms">
+      <thead>
+        <tr><th>房间</th><th>版本</th><th>在线/成员</th><th>待裁决冲突</th><th>更新时间</th><th></th></tr>
+      </thead>
+      <tbody id="room-list"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+    </table>
+  </section>
+</main>
+
+<script src="/app-index.js"></script>
+</body>
+</html>

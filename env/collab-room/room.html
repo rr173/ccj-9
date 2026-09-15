@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>协作编辑房间</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">📝 协作房间</a>
+  <span id="room-name" class="sub">房间…</span>
+</header>
+
+<main class="container">
+  <div class="room-head">
+    <span id="conn" class="status">连接中…</span>
+    <span class="meta-line">rev <b id="rev">0</b> · 字素簇 <b id="cluster-count">0</b></span>
+    <span class="spacer"></span>
+    <input id="my-name" type="text" maxlength="40" placeholder="你的名字" style="width:130px;padding:6px 8px;border:1px solid var(--line);border-radius:8px">
+    <button id="copy-link" class="secondary small">复制邀请链接</button>
+    <a class="btn small secondary" href="/">房间列表</a>
+  </div>
+
+  <div class="layout" style="margin-top:16px">
+    <div>
+      <div class="card editor-wrap">
+        <textarea id="editor" dir="auto" spellcheck="false"
+          placeholder="在这里输入内容——中文、English、العربية 与 emoji 👨‍👩‍👧 都可以，光标不会劈开 emoji 组合。"></textarea>
+        <div id="cursors" aria-hidden="true"></div>
+      </div>
+      <p class="meta-line">
+        编辑会自动提交。协作以服务器文本为权威收敛；断网期间可继续输入，重连后自动追赶，
+        重复提交按操作编号幂等去重。硬冲突（同位置双写 / 编辑撞上对方删除）会在右侧出现可裁决条目。
+      </p>
+      <div id="conflicts"></div>
+    </div>
+
+    <aside class="sidebar">
+      <div class="card">
+        <h2>成员 <span id="member-count" class="muted"></span></h2>
+        <div id="members"></div>
+      </div>
+    </aside>
+  </div>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script src="/core.js"></script>
+<script src="/app-room.js"></script>
+</body>
+</html>

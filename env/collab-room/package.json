@@ -1,13 +1,23 @@
 {
   "name": "collab-room",
   "version": "1.0.0",
-  "description": "双向文本多人协作编辑房间（字素簇边界 / RTL 光标 / 离线批次 / 冲突区 / 持久化）",
+  "description": "双向文本多人协作编辑房间：字素簇边界、实时编辑与成员光标、冲突区可裁决、离线重连、幂等提交、重启恢复（零运行时依赖）",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/integration.test.js"
+    "test": "node --test test/"
   },
-  "dependencies": {
-    "ws": "^8.21.3"
+  "keywords": [
+    "collaboration",
+    "ot",
+    "operational-transformation",
+    "websocket",
+    "grapheme",
+    "bidi",
+    "rtl"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
   }
 }
