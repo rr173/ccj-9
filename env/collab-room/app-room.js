@@ -386,7 +386,12 @@
           const roomName = m.room && m.room.name;
           document.title = roomName ? (roomName + " · 协作房间") : document.title;
           $("room-name").textContent = roomName || "";
-          // 重连：以快照重绘，未确认编辑重新排队（同 opId 幂等）
+          // 重连：以快照重绘，未确认编辑重新排队（同 opId 幂等）。
+          // inflight 是「已发送但 ack 未返回」的编辑：直接丢弃会把用户刚输入的
+          // 文字从页面抹掉且不再提交。重新排回队首，converge 会以最新 rev 为
+          // 基线重放它，pump 用原 opId 重发；若服务器其实已应用过该 op，
+          // seenOps 命中返回 duplicate，只生效一次，不会重复插入。
+          if (inflight) queue.unshift(inflight);
           inflight = null;
           converge(serverText, rev, conflicts);
           renderMembers();

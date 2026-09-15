@@ -252,6 +252,29 @@ test("重复提交同一 opId 幂等，不产生重复内容", async () => {
   a.close();
 });
 
+test("ack 丢失后断线重连，重发同一 opId 仍只生效一次", async () => {
+  const created = await api("POST", "/api/rooms", { name: "重发房" });
+  const roomId = created.json.room.id;
+  const a = await new Page("xA", "庚", "#e6194b").open(roomId);
+
+  a.commit("op-rx:xA", 0, [{ t: "ins", gap: 0, text: "once" }]);
+  await a.waitFor(() => a.acks.some(x => x.opId === "op-rx:xA" && x.result === "ok"));
+  const revAfter = a.rev;
+
+  // 模拟「ack 在途中丢失」：客户端断线重连后，用同一 opId 重放未确认操作
+  a.ws.close();
+  await a.reconnect(roomId);
+  a.commit("op-rx:xA", 0, [{ t: "ins", gap: 0, text: "once" }]);
+  await a.waitFor(() => a.acks.some(x => x.opId === "op-rx:xA" && x.result === "duplicate"));
+
+  assert.equal(a.text, "once");
+  assert.equal(a.rev, revAfter, "版本号不应因重发增长");
+  const snap = (await api("GET", "/api/rooms/" + roomId)).json;
+  assert.equal(snap.text, "once", "服务器文本不应重复插入");
+
+  a.close();
+});
+
 test("离线期间继续编辑，重连后以服务器文本收敛且不丢自己的新输入", async () => {
   const created = await api("POST", "/api/rooms", { name: "离线房" });
   const roomId = created.json.room.id;
