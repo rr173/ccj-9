@@ -1212,8 +1212,8 @@ GET    /api/permissions/request-templates/logs[?from=&to=&scope=&resourceId=]
 
 | 修复类型 | 内容 |
 |---|---|
-| 删除控制符 | 删除孤立 PDI/PDF、强制覆盖符、悬空连接符（可精确到簇内码点） |
-| 旧式嵌入改隔离 | LRE→LRI / RLE→RLI |
+| 删除控制符 | 删除孤立 PDI/PDF、强制覆盖符、悬空连接符（可精确到簇内码点）。删除 LRO/RLO 开符时若存在配对 PDF，则连同 PDF 一并删除，避免遗留孤立 PDF |
+| 旧式嵌入改隔离 | LRE→LRI / RLE→RLI；配对的 PDF 同步替换为 PDI（隔离只能由 PDI 结束）；旧式帧位于隔离内部由外层 PDI 隐式结束时，在该 PDI 前补一个 PDI。修复后重新诊断不新增孤立 PDF 或未闭合隔离 |
 | 隔离数字片段 | 用 FSI…PDI 包住歧义数字串 |
 | 删除孤立括号 | 未配对括号 |
 | 调整段落方向元数据 | 方向与段落内多数强字符明显不符时建议 |

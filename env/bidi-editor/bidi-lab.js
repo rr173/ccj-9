@@ -896,7 +896,12 @@
 
     var where = el("p", "blab-preview-where");
     where.setAttribute("dir", "ltr");
-    where.textContent = "段落 #" + s.para + " · 逻辑码点 [" + s.start + "," + s.end + ")" +
+    var ranges = "段落 #" + s.para + " · 逻辑码点 [" + s.start + "," + s.end + ")";
+    if (s.extraEdits && s.extraEdits.length) {
+      ranges += "（联动修改配对控制符 " +
+        s.extraEdits.map(function (e) { return "[" + e.start + "," + e.end + ")"; }).join("、") + "）";
+    }
+    where.textContent = ranges +
       (s.kind === core.FK.SET_DIR ? "（仅方向元数据，不改正文码点）" : "");
     body.appendChild(where);
 
@@ -968,8 +973,19 @@
     if (s.kind === core.FK.ISOLATE_NUMBER) {
       repl = String.fromCodePoint(0x2068) + s.clusterText + String.fromCodePoint(0x2069);
     }
+    // 主编辑之外，还要应用与配对闭符联动的附加编辑（降序，避免偏移漂移）
+    var edits = [{ start: s.start, end: s.end, repl: repl }]
+      .concat((s.extraEdits || []).map(function (e) {
+        return {
+          start: e.start, end: e.end,
+          repl: e.replacementCp
+            ? String.fromCodePoint(parseInt(e.replacementCp.slice(2), 16))
+            : ""
+        };
+      }))
+      .sort(function (a, b) { return b.start - a.start; });
     var cps = Array.from(para.text);
-    cps.splice(s.start, s.end - s.start, repl);
+    edits.forEach(function (e) { cps.splice(e.start, e.end - e.start, e.repl); });
     return { dir: para.dir, text: cps.join("") };
   }
 

@@ -803,6 +803,7 @@
             var lvl = nextLevel(top().level, dir);
             stack.push({
               kind: fm.kind,
+              openGi: u,
               level: lvl,
               override: fm.kind === "override" ? dir : "N",
               iso: fm.kind === "isolate"
@@ -822,8 +823,9 @@
           if (matchFrame === -1) {
             events.push({ gi: u, action: "stray_pop" });
           } else if (matchFrame === stack.length - 1) {
+            var popOpenGi = stack[matchFrame].openGi;
             stack.pop();
-            events.push({ gi: u, action: "pop", depth: stack.length + 1 });
+            events.push({ gi: u, action: "pop", openGi: popOpenGi, depth: stack.length + 1 });
           } else {
             // PDF 位于隔离帧之上：按 UAX X6b 忽略（隔离只能由 PDI 结束）
             events.push({ gi: u, action: "ignored_pdf" });
@@ -841,9 +843,17 @@
             events.push({ gi: u, action: "stray_pdi" });
             un.resolvedLevel = top().level;
           } else {
+            // PDI 按 X6a 同时结束隔离帧内部的嵌入/覆盖帧（它们由 PDI 隐式关闭，
+            // 不算未闭合，也不再需要各自的 PDF）。
+            for (var fi2 = found + 1; fi2 < stack.length; fi2++) {
+              if (!stack[fi2].iso) {
+                events.push({ gi: u, action: "close_implicit", openGi: stack[fi2].openGi });
+              }
+            }
+            var isoOpenGi = stack[found].openGi;
             stack.length = found; // 弹掉隔离帧及其内部的嵌入/覆盖帧
             un.resolvedLevel = top().level;
-            events.push({ gi: u, action: "pop_iso", depth: found + 1 });
+            events.push({ gi: u, action: "pop_iso", openGi: isoOpenGi, depth: found + 1 });
           }
           continue;
         }
@@ -1098,19 +1108,23 @@
     }
 
     // —— 1) 控制符栈事件：孤立 / 未关闭 / 旧式 / 覆盖 / 嵌套深度 ——
-    var stackDepthAt = {};
-    var openEmbeddings = []; // {gi, kind}
-    var openOverrides = [];  // {gi} 强制覆盖帧（单独统计，不算“嵌入未关闭”）
-    var openIsolates = [];
+    // 影子帧栈与 resolveParagraph 的显式控制栈保持同步：PDF/PDI 关闭帧时必须
+    // 同步弹出，否则已正确闭合的 LRE…PDF / RLO…PDF 也会被误报为“未关闭”。
+    var openFrames = []; // {gi, kind, iso}
     var reportedLegacy = {};
     var reportedOverride = {};
     var deepReported = false;
 
+    function frameIndexOf(gi) {
+      for (var fi = openFrames.length - 1; fi >= 0; fi--) {
+        if (openFrames[fi].gi === gi) return fi;
+      }
+      return -1;
+    }
+
     res.events.forEach(function (ev) {
       if (ev.action === "push") {
-        if (ev.kind === "isolate") openIsolates.push({ gi: ev.gi });
-        else if (ev.kind === "override") openOverrides.push({ gi: ev.gi });
-        else openEmbeddings.push({ gi: ev.gi, kind: ev.kind });
+        openFrames.push({ gi: ev.gi, kind: ev.kind, iso: ev.kind === "isolate" });
 
         var g = clusters[ev.gi];
         var cp0 = g.cps[0].cp;
@@ -1134,6 +1148,21 @@
             "方向控制嵌套深度达到 " + ev.depth + "，超过 " + LIMITS.MAX_NESTING_DEPTH +
             " 的预警阈值；配对排查困难，超出实现栈深后控制符会被静默忽略。");
         }
+      }
+      if (ev.action === "pop") {
+        // PDF 关闭最近的嵌入/覆盖帧（配对时该帧位于栈顶）
+        var pi2 = frameIndexOf(ev.openGi);
+        if (pi2 !== -1) openFrames.length = pi2;
+      }
+      if (ev.action === "pop_iso") {
+        // PDI 关闭隔离帧及其内部全部嵌入/覆盖帧（X6a）
+        var si2 = frameIndexOf(ev.openGi);
+        if (si2 !== -1) openFrames.length = si2;
+      }
+      if (ev.action === "close_implicit") {
+        // 隔离内部的嵌入/覆盖帧被 PDI 隐式结束
+        var ii = frameIndexOf(ev.openGi);
+        if (ii !== -1) openFrames.splice(ii, 1);
       }
       if (ev.action === "stray_pdi") {
         addIssue(IT.ORPHAN_CONTROL, SEV.HIGH, ev.gi, ev.gi,
@@ -1168,13 +1197,15 @@
           "若作者以为状态会跨段延续，两段交界处的屏幕顺序会被误读。");
       }
     }
-    if (openEmbeddings.length) {
-      reportUnclosed(openEmbeddings[openEmbeddings.length - 1].gi,
-        openEmbeddings.length, "旧式嵌入（LRE/RLE/LRO/RLO）");
+    var openLegacy = openFrames.filter(function (f) { return !f.iso; });
+    var openIsoOnly = openFrames.filter(function (f) { return f.iso; });
+    if (openLegacy.length) {
+      reportUnclosed(openLegacy[openLegacy.length - 1].gi,
+        openLegacy.length, "旧式嵌入/覆盖（LRE/RLE/LRO/RLO）");
     }
-    if (openIsolates.length) {
-      reportUnclosed(openIsolates[openIsolates.length - 1].gi,
-        openIsolates.length, "隔离序列（LRI/RLI/FSI）");
+    if (openIsoOnly.length) {
+      reportUnclosed(openIsoOnly[openIsoOnly.length - 1].gi,
+        openIsoOnly.length, "隔离序列（LRI/RLI/FSI）");
     }
 
     // —— 2) 数字体系混用、数字/标点歧义 ——
@@ -1478,16 +1509,44 @@
       suggestions.push(s);
     }
 
+    // 每段只解析一次；同时建立“开启符簇 gi → 配对闭符”映射。
+    // via: 'pdf'（由配对 PDF 结束）/ 'pdi'（隔离开启符由 PDI 结束）/
+    //      'implicit_pdi'（隔离内部的旧式帧被 PDI 按 X6a 隐式结束）。
+    var ctxCache = {};
+    function paraCtx(idx) {
+      if (ctxCache[idx]) return ctxCache[idx];
+      var res = resolveParagraph(paragraphs[idx].text, paragraphs[idx].dir);
+      var closerOf = {};
+      res.events.forEach(function (ev) {
+        if (!isInt(ev.openGi)) return;
+        if (ev.action === "pop") closerOf[ev.openGi] = { gi: ev.gi, via: "pdf" };
+        else if (ev.action === "pop_iso") closerOf[ev.openGi] = { gi: ev.gi, via: "pdi" };
+        else if (ev.action === "close_implicit") closerOf[ev.openGi] = { gi: ev.gi, via: "implicit_pdi" };
+      });
+      ctxCache[idx] = { res: res, clusters: res.clusters, closerOf: closerOf };
+      return ctxCache[idx];
+    }
+
+    // 一个码点范围编辑描述符；replCp 为 null/undefined 表示删除。
+    function rangeEdit(ctx, start, end, replCp) {
+      return {
+        start: start,
+        end: end,
+        before: cpListForRange(ctx.clusters, start, end),
+        after: replCp == null ? [] : [{ cp: "U+" + hex4(replCp), name: cpName(replCp) }],
+        replacementCp: replCp == null ? null : "U+" + hex4(replCp)
+      };
+    }
+
     report.issues.forEach(function (issue) {
       var paraIdx = issue.para - 1;
       var para = paragraphs[paraIdx];
       if (!para) return;
-      var res = resolveParagraph(para.text, para.dir);
-      var clusters = res.clusters;
+      var ctx = paraCtx(paraIdx);
+      var clusters = ctx.clusters;
       var giA = issue.graphemeStart, giB = issue.graphemeEnd;
 
       if (issue.type === IT.ORPHAN_CONTROL ||
-          issue.type === IT.OVERRIDE_CONTROL ||
           issue.type === IT.DANGLING_JOINER) {
         // 悬空连接符可精确到簇内的连接符码点；其余整簇删除
         var rStart = isInt(issue.fixStart) ? issue.fixStart : clusters[giA].start;
@@ -1509,19 +1568,77 @@
         });
       }
 
+      if (issue.type === IT.OVERRIDE_CONTROL) {
+        // 强制覆盖（LRO/RLO）整帧删除：若该帧由配对 PDF 结束，必须连同
+        // PDF 一起删——只删开符会留下孤立 PDF，重新诊断即报 orphan_control。
+        var oStart = clusters[giA].start, oEnd = clusters[giA].end;
+        var primary = rangeEdit(ctx, oStart, oEnd, null);
+        var extraEdits = [];
+        var closer = ctx.closerOf[giA];
+        var labelTail = "";
+        if (closer && closer.via === "pdf") {
+          var cg = clusters[closer.gi];
+          extraEdits.push(rangeEdit(ctx, cg.start, cg.end, null));
+          labelTail = "（连同配对的 POP DIRECTIONAL FORMATTING / PDF 一并删除，避免遗留孤立 PDF）";
+        }
+        var allBefore = primary.before.concat(extraEdits.reduce(function (acc, e) {
+          return acc.concat(e.before);
+        }, []));
+        push({
+          kind: FK.REMOVE_FORMATTING,
+          para: issue.para,
+          start: oStart,
+          end: oEnd,
+          label: FIX_LABELS_ZH[FK.REMOVE_FORMATTING] + "：" +
+            issue.codepoints.map(function (c) { return c.name; }).join("、") + labelTail,
+          before: allBefore,
+          primaryBefore: primary.before,
+          after: [],
+          extraEdits: extraEdits,
+          issueIds: [issue.id],
+          clusterText: issue.cluster
+        });
+      }
+
       if (issue.type === IT.LEGACY_EMBEDDING) {
         var c0 = clusters[giA].cps[0].cp;
         // LRE(U+202A)→LRI(U+2066) / RLE(U+202B)→RLI(U+2067)
         var replacement = c0 === 0x202A ? 0x2066 : 0x2067;
+        var primary2 = rangeEdit(ctx, clusters[giA].start, clusters[giA].end, replacement);
+
+        // 开符改成隔离开启符后，旧式闭符 PDF 不再与它配对：
+        //   - 由配对 PDF 结束：PDF 必须同步替换成 PDI，否则会留下孤立 PDF +
+        //     未闭合隔离（重新诊断会新增 orphan_control / unclosed_embedding）；
+        //   - 位于隔离内部、由外层 PDI 按 X6a 隐式结束：在该 PDI 前补一个 PDI，
+        //     显式关闭转换后的隔离开启符，保持原有帧结构；
+        //   - 段末未关闭：段落边界本就隐式结束，只转换开符即可。
+        var legacyExtraEdits = [];
+        var closer2 = ctx.closerOf[giA];
+        var legacyLabelTail = "";
+        if (closer2 && closer2.via === "pdf") {
+          var cg2 = clusters[closer2.gi];
+          legacyExtraEdits.push(rangeEdit(ctx, cg2.start, cg2.end, 0x2069));
+          legacyLabelTail = "（配对的 POP DIRECTIONAL FORMATTING / PDF 同步替换为 PDI）";
+        } else if (closer2 && closer2.via === "implicit_pdi") {
+          var pgi = clusters[closer2.gi];
+          legacyExtraEdits.push(rangeEdit(ctx, pgi.start, pgi.start, 0x2069));
+          legacyLabelTail = "（在结束外层隔离的 PDI 前补一个 PDI，显式关闭转换后的隔离）";
+        }
+        var legacyAfter = primary2.after.concat(legacyExtraEdits.reduce(function (acc, e) {
+          return acc.concat(e.after);
+        }, []));
         push({
           kind: FK.LEGACY_TO_ISOLATE,
           para: issue.para,
           start: clusters[giA].start,
           end: clusters[giA].end,
-          label: FIX_LABELS_ZH[FK.LEGACY_TO_ISOLATE] + "：" + cpName(c0) + " → " + cpName(replacement),
+          label: FIX_LABELS_ZH[FK.LEGACY_TO_ISOLATE] + "：" + cpName(c0) +
+            " → " + cpName(replacement) + legacyLabelTail,
           before: cpListAt(clusters, giA, giA),
-          after: [{ cp: "U+" + hex4(replacement), name: cpName(replacement) }],
+          primaryBefore: cpListAt(clusters, giA, giA),
+          after: legacyAfter,
           replacementCp: "U+" + hex4(replacement),
+          extraEdits: legacyExtraEdits,
           issueIds: [issue.id],
           clusterText: issue.cluster
         });
@@ -1648,6 +1765,30 @@
     return cps.join("");
   }
 
+  // 一条建议的全部码点编辑（主编辑 + 与配对闭符联动的附加编辑）。
+  // 返回 [{start,end,replacementText}]；replacementCp 形如 "U+2069"，null=删除。
+  function editsOfSuggestion(s) {
+    function replText(ed) {
+      return ed.replacementCp
+        ? String.fromCodePoint(parseInt(ed.replacementCp.slice(2), 16))
+        : "";
+    }
+    var list = [];
+    if (s.kind === FK.LEGACY_TO_ISOLATE) {
+      list.push({ start: s.start, end: s.end, replacementText:
+        String.fromCodePoint(parseInt(s.replacementCp.slice(2), 16)) });
+    } else if (s.kind === FK.ISOLATE_NUMBER) {
+      list.push({ start: s.start, end: s.end, replacementText:
+        String.fromCodePoint(0x2068) + s.clusterText + String.fromCodePoint(0x2069) });
+    } else {
+      list.push({ start: s.start, end: s.end, replacementText: "" });
+    }
+    (Array.isArray(s.extraEdits) ? s.extraEdits : []).forEach(function (ed) {
+      list.push({ start: ed.start, end: ed.end, replacementText: replText(ed) });
+    });
+    return list;
+  }
+
   // 校验并应用选中建议。
   // currentDoc: {paragraphs:[{dir,text}]}
   // currentConditions: {dirs,width,zoom,font}
@@ -1698,14 +1839,24 @@
     });
     var overlapError = null;
     Object.keys(byPara).forEach(function (n) {
+      if (overlapError) return;
       var list = byPara[n];
-      for (var a = 0; a < list.length; a++) {
-        for (var b = a + 1; b < list.length; b++) {
-          var x = list[a], y = list[b];
+      var ranges = [];
+      list.forEach(function (s) {
+        editsOfSuggestion(s).forEach(function (e) {
+          ranges.push({ s: s, start: e.start, end: e.end });
+        });
+      });
+      for (var a = 0; a < ranges.length; a++) {
+        for (var b = a + 1; b < ranges.length; b++) {
+          var x = ranges[a], y = ranges[b];
+          // 同一建议的插入式编辑（end===start）允许紧贴另一编辑边界
+          if (x.s === y.s) continue;
           if (x.start < y.end && y.start < x.end) {
             overlapError = err(409, "suggestions_overlap",
-              "第 " + n + " 段的两项建议作用范围重叠（" + x.label + " / " + y.label +
+              "第 " + n + " 段的两项建议作用范围重叠（" + x.s.label + " / " + y.s.label +
               "），无法安全组合；请只选其中一项后重新诊断。本次未改动任何文字。");
+            return;
           }
         }
       }
@@ -1737,12 +1888,20 @@
       selected.forEach(function (s) {
         if (s.kind === FK.SET_DIR) return;
         var pi0 = s.para - 1;
-        var actualCps = cpArray(cpSlice(originals[pi0].text, s.start, s.end))
-          .map(function (ch) { return "U+" + hex4(ch.codePointAt(0)); });
-        var expectedCps = (s.before || []).map(function (c) { return c.cp; });
-        if (actualCps.join(",") !== expectedCps.join(",")) {
-          throw { code: "range_contents_changed" };
-        }
+        // 主编辑与附加编辑逐一对照原始正文，任一不符即整次拒绝
+        var edits = editsOfSuggestion(s);
+        var beforeLists = [s.primaryBefore || s.before || []];
+        (Array.isArray(s.extraEdits) ? s.extraEdits : []).forEach(function (ed) {
+          beforeLists.push(ed.before || []);
+        });
+        edits.forEach(function (e, ei) {
+          var actualCps = cpArray(cpSlice(originals[pi0].text, e.start, e.end))
+            .map(function (ch) { return "U+" + hex4(ch.codePointAt(0)); });
+          var expectedCps = (beforeLists[ei] || []).map(function (c) { return c.cp; });
+          if (actualCps.join(",") !== expectedCps.join(",")) {
+            throw { code: "range_contents_changed" };
+          }
+        });
       });
 
       // 方向先改（与文本编辑互不影响偏移）
@@ -1750,20 +1909,12 @@
         if (s.kind === FK.SET_DIR) paragraphs[s.para - 1].dir = s.toDir;
       });
 
-      // 按段分组文本编辑，段内降序
+      // 按段分组文本编辑（含配对闭符的附加编辑），段内降序
       var editsByPara = {};
       selected.forEach(function (s) {
         if (s.kind === FK.SET_DIR) return;
-        var replacement = "";
-        if (s.kind === FK.LEGACY_TO_ISOLATE) {
-          replacement = String.fromCodePoint(parseInt(s.replacementCp.slice(2), 16));
-        }
-        if (s.kind === FK.ISOLATE_NUMBER) {
-          replacement = String.fromCodePoint(0x2068) + s.clusterText +
-            String.fromCodePoint(0x2069);
-        }
-        (editsByPara[s.para] = editsByPara[s.para] || []).push({
-          start: s.start, end: s.end, replacementText: replacement
+        editsOfSuggestion(s).forEach(function (e) {
+          (editsByPara[s.para] = editsByPara[s.para] || []).push(e);
         });
       });
       Object.keys(editsByPara).forEach(function (n) {
@@ -1803,14 +1954,7 @@
     try {
       if (suggestion.kind === FK.SET_DIR) afterDir = suggestion.toDir;
       else {
-        var repl = "";
-        if (suggestion.kind === FK.LEGACY_TO_ISOLATE) repl = String.fromCodePoint(parseInt(suggestion.replacementCp.slice(2), 16));
-        if (suggestion.kind === FK.ISOLATE_NUMBER) {
-          repl = String.fromCodePoint(0x2068) + suggestion.clusterText +
-            String.fromCodePoint(0x2069);
-        }
-        afterText = applyEditsToText(para.text,
-          [{ start: suggestion.start, end: suggestion.end, replacementText: repl }]);
+        afterText = applyEditsToText(para.text, editsOfSuggestion(suggestion));
       }
     } catch (e) { return null; }
     var after = span(afterText, afterDir);

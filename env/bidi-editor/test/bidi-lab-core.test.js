@@ -305,6 +305,139 @@ test("isolate_number 修复后问题可被重新诊断清除", function () {
   assert.ok(r.paragraphs[0].text.indexOf("\u2069") !== -1);
 });
 
+/* ---------- 成对方向控制符修复（开符必须与配对闭符联动处理） ---------- */
+
+// 应用某段文本中除 set_dir 外的全部修复建议，并重新诊断
+function repairAndRediagnose(text) {
+  const doc = { paragraphs: [{ dir: "auto", text: text }] };
+  const rep = C.diagnose(doc.paragraphs);
+  const plan = C.buildPlan(doc, rep);
+  const meta = { contentFp: rep.contentFp,
+    renderFp: C.renderFingerprint({ dirs: ["auto"], width: 800, zoom: 1, font: "" }) };
+  const ids = plan.suggestions
+    .filter(function (s) { return s.kind !== C.FK.SET_DIR; })
+    .map(function (s) { return s.id; });
+  const r = C.applySuggestions(doc, { dirs: ["auto"], width: 800, zoom: 1, font: "" },
+    ids, plan, meta);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  return { plan: plan, result: r, after: C.diagnose(r.paragraphs) };
+}
+
+// 控制符配对类问题：修复后不允许出现任何一个
+function pairingIssueTypes(report) {
+  const pairing = {};
+  [C.IT.ORPHAN_CONTROL, C.IT.UNCLOSED_EMBEDDING,
+   C.IT.CROSS_PARAGRAPH_STATE, C.IT.LEGACY_EMBEDDING,
+   C.IT.OVERRIDE_CONTROL].forEach(function (t) { pairing[t] = true; });
+  return report.issues.filter(function (i) { return pairing[i.type]; });
+}
+
+test("已闭合的 LRE…PDF / RLO…PDF 不再被误报为未关闭", function () {
+  const LRE = "‪", PDF = "‬", RLO = "‮";
+  const lre = C.diagnose([{ dir: "auto", text: "a" + LRE + "b" + PDF + "c" }]);
+  assert.ok(!lre.issues.some(function (i) {
+    return i.type === C.IT.UNCLOSED_EMBEDDING || i.type === C.IT.CROSS_PARAGRAPH_STATE;
+  }));
+  const rlo = C.diagnose([{ dir: "auto", text: "x" + RLO + "abc" + PDF + "y" }]);
+  assert.ok(!rlo.issues.some(function (i) {
+    return i.type === C.IT.UNCLOSED_EMBEDDING || i.type === C.IT.CROSS_PARAGRAPH_STATE;
+  }));
+});
+
+test("RLO…PDF：修复建议同时删除开符与配对 PDF，重新诊断无孤立 PDF", function () {
+  const out = repairAndRediagnose("x‮abc‬y");
+  // 建议必须带一个删除型附加编辑，且落在 PDF（U+202C）位置
+  const ov = out.plan.suggestions.find(function (s) {
+    return s.kind === C.FK.REMOVE_FORMATTING && s.start === 1;
+  });
+  assert.ok(ov && Array.isArray(ov.extraEdits) && ov.extraEdits.length === 1);
+  assert.equal(ov.extraEdits[0].start, 5);
+  assert.equal(ov.extraEdits[0].replacementCp, null);
+  // 两个控制符都被删掉
+  assert.equal(Array.from(out.result.paragraphs[0].text)
+    .some(function (c) { return c.codePointAt(0) === 0x202E; }), false);
+  assert.equal(Array.from(out.result.paragraphs[0].text)
+    .some(function (c) { return c.codePointAt(0) === 0x202C; }), false);
+  // 重新诊断：无任何配对问题
+  assert.equal(pairingIssueTypes(out.after).length, 0,
+    out.after.issues.map(function (i) { return i.type; }).join(","));
+});
+
+test("LRE…PDF：开符转 LRI 的同时把配对 PDF 替换为 PDI，重新诊断配对有效", function () {
+  const out = repairAndRediagnose("a‪b‬c");
+  const fix = out.plan.suggestions.find(function (s) {
+    return s.kind === C.FK.LEGACY_TO_ISOLATE;
+  });
+  assert.ok(fix);
+  assert.equal(fix.start, 1);
+  assert.ok(Array.isArray(fix.extraEdits) && fix.extraEdits.length === 1);
+  assert.equal(fix.extraEdits[0].start, 3);
+  assert.equal(fix.extraEdits[0].replacementCp, "U+2069"); // PDF → PDI
+  // 修复后为 a + LRI + b + PDI + c
+  const cps = Array.from(out.result.paragraphs[0].text).map(function (c) {
+    return c.codePointAt(0);
+  });
+  assert.deepEqual(cps, [0x61, 0x2066, 0x62, 0x2069, 0x63]);
+  // 重新诊断：无孤立 PDF、无未闭合隔离、无旧式/覆盖控制符
+  assert.equal(pairingIssueTypes(out.after).length, 0,
+    out.after.issues.map(function (i) { return i.type; }).join(","));
+});
+
+test("RLE…PDF：RLE→RLI 且 PDF→PDI，重新诊断配对有效", function () {
+  const text = ["a", "‫", "b", "‬", "c"].join("");
+  const out = repairAndRediagnose(text);
+  const cps = Array.from(out.result.paragraphs[0].text).map(function (c) {
+    return c.codePointAt(0);
+  });
+  assert.deepEqual(cps, [0x61, 0x2067, 0x62, 0x2069, 0x63]);
+  assert.equal(pairingIssueTypes(out.after).length, 0);
+});
+
+test("未闭合的 RLO 只删开符即可，不产生孤立 PDF；未闭合 LRE 转 LRI 不新增问题类型", function () {
+  const rlo = repairAndRediagnose("x‮abc");
+  const ov = rlo.plan.suggestions.find(function (s) { return s.start === 1; });
+  assert.ok(!ov.extraEdits || ov.extraEdits.length === 0);
+  assert.equal(rlo.after.issues.filter(function (i) {
+    return [C.IT.ORPHAN_CONTROL, C.IT.OVERRIDE_CONTROL].indexOf(i.type) !== -1;
+  }).length, 0);
+
+  const lre = repairAndRediagnose("a‪b");
+  // 转隔离后至多保留“未关闭”这一修复前就存在的问题类型，且绝不出现孤立 PDF
+  assert.ok(!lre.after.issues.some(function (i) { return i.type === C.IT.ORPHAN_CONTROL; }));
+  assert.ok(!lre.after.issues.some(function (i) { return i.type === C.IT.LEGACY_EMBEDDING; }));
+});
+
+test("隔离内部无配对 PDF、由外层 PDI 隐式结束的 RLE：转换时在 PDI 前补 PDI", function () {
+  // a + LRI + RLE + b + PDI + c（无 PDF；RLE 帧被 PDI 按 X6a 隐式结束）
+  const text = ["a", "⁦", "‫", "b", "⁩", "c"].join("");
+  const rep = C.diagnose([{ dir: "auto", text: text }]);
+  assert.ok(rep.issues.some(function (i) { return i.type === C.IT.LEGACY_EMBEDDING; }));
+  const out = repairAndRediagnose(text);
+  const fix = out.plan.suggestions.find(function (s) {
+    return s.kind === C.FK.LEGACY_TO_ISOLATE;
+  });
+  assert.ok(fix.extraEdits.length === 1);
+  // 插入型编辑：start===end，在 PDI（gi 4）前插入 PDI
+  assert.equal(fix.extraEdits[0].start, fix.extraEdits[0].end);
+  assert.equal(fix.extraEdits[0].start, 4);
+  assert.equal(fix.extraEdits[0].replacementCp, "U+2069");
+  const cps = Array.from(out.result.paragraphs[0].text).map(function (c) {
+    return c.codePointAt(0);
+  });
+  assert.deepEqual(cps, [0x61, 0x2066, 0x2067, 0x62, 0x2069, 0x2069, 0x63]);
+  assert.equal(pairingIssueTypes(out.after).length, 0);
+});
+
+test("嵌套 LRE…RLE…PDF…PDF：两条建议各自只改自己的配对 PDF", function () {
+  const text = ["a", "‪", "b", "‫", "x", "‬", "y", "‬", "z"].join("");
+  const out = repairAndRediagnose(text);
+  const cps = Array.from(out.result.paragraphs[0].text).map(function (c) {
+    return c.codePointAt(0);
+  });
+  assert.deepEqual(cps, [0x61, 0x2066, 0x62, 0x2067, 0x78, 0x2069, 0x79, 0x2069, 0x7A]);
+  assert.equal(pairingIssueTypes(out.after).length, 0);
+});
+
 /* ---------- 指纹 ---------- */
 
 test("内容指纹对文本与方向敏感、对重复计算稳定", function () {
